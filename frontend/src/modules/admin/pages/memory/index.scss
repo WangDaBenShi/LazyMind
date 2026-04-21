@@ -498,6 +498,91 @@
   }
 }
 
+.memory-glossary-inbox-merge {
+  display: grid;
+  grid-template-columns: 80px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+
+  > strong {
+    color: #344054;
+    font-size: 12px;
+    line-height: 1.7;
+  }
+}
+
+.memory-glossary-merge-flow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 30px minmax(0, 1fr) 36px minmax(0, 1.18fr);
+  gap: 8px;
+  align-items: stretch;
+}
+
+.memory-glossary-merge-node {
+  border: 1px solid #d0d5dd;
+  border-radius: 10px;
+  background: #fff;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.memory-glossary-merge-node.is-result {
+  border-color: #91caff;
+  background: linear-gradient(180deg, #ffffff 0%, #f0f7ff 100%);
+}
+
+.memory-glossary-merge-node-label {
+  color: #475467;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.memory-glossary-merge-term {
+  color: #101828;
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+.memory-glossary-merge-tags {
+  gap: 4px;
+}
+
+.memory-glossary-merge-content {
+  color: #667085;
+  font-size: 12px;
+  line-height: 1.6;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+
+.memory-glossary-merge-operator,
+.memory-glossary-merge-arrow {
+  align-self: center;
+  justify-self: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 999px;
+  border: 1px solid #d0d5dd;
+  background: #f8fafc;
+  color: #344054;
+  font-size: 12px;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.memory-glossary-merge-arrow {
+  width: 32px;
+}
+
 .memory-glossary-inbox-card-actions {
   display: flex;
   justify-content: flex-end;
@@ -1192,6 +1277,14 @@
   }
 
   .memory-glossary-inbox-card-line {
+    grid-template-columns: 1fr;
+  }
+
+  .memory-glossary-inbox-merge {
+    grid-template-columns: 1fr;
+  }
+
+  .memory-glossary-merge-flow {
     grid-template-columns: 1fr;
   }
 

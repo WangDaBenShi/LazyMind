@@ -1,12 +1,14 @@
 import {
   BulbOutlined,
   DatabaseOutlined,
+  ExperimentOutlined,
   LeftCircleOutlined,
   UserOutlined,
   UsergroupAddOutlined,
 } from "@ant-design/icons";
 import { Avatar, Layout, Menu } from "antd";
 import type { MenuProps } from "antd";
+import { useEffect, useState } from "react";
 import { Navigate, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { AgentAppsAuth } from "@/components/auth";
@@ -34,14 +36,18 @@ export default function AdminLayout() {
   const userInfo = AgentAppsAuth.getUserInfo();
   const isLoggedIn = Boolean(userInfo?.token);
   const isAdminUser = isAdminRole(userInfo?.role);
+  const [isSelfEvolutionMenuCollapsed, setIsSelfEvolutionMenuCollapsed] = useState(false);
 
   const pathname = location.pathname;
+  const isSelfEvolutionRoute = pathname.startsWith("/admin/self-evolution");
   const selectedKey = pathname.startsWith("/admin/users")
     ? "/admin/users"
     : pathname.startsWith("/admin/data-sources")
       ? "/admin/data-sources"
     : pathname.startsWith("/admin/memory-management")
       ? "/admin/memory-management"
+    : pathname.startsWith("/admin/self-evolution")
+      ? "/admin/self-evolution"
     : "/admin/groups";
 
   const menuChildren: MenuItem[] = [
@@ -52,15 +58,24 @@ export default function AdminLayout() {
             label: t("layout.userManagement"),
             icon: <UserOutlined />,
           },
+        ]
+      : []),
+    {
+      key: "/admin/data-sources",
+      label: t("layout.dataSourceManagement"),
+      icon: <DatabaseOutlined />,
+    },
+    {
+      key: "/admin/memory-management",
+      label: t("layout.memoryManagement"),
+      icon: <BulbOutlined />,
+    },
+    ...(isAdminUser
+      ? [
           {
-            key: "/admin/data-sources",
-            label: t("layout.dataSourceManagement"),
-            icon: <DatabaseOutlined />,
-          },
-          {
-            key: "/admin/memory-management",
-            label: t("layout.memoryManagement"),
-            icon: <BulbOutlined />,
+            key: "/admin/self-evolution",
+            label: t("layout.selfEvolution"),
+            icon: <ExperimentOutlined />,
           },
         ]
       : []),
@@ -89,6 +104,14 @@ export default function AdminLayout() {
     }
   };
 
+  useEffect(() => {
+    if (isSelfEvolutionRoute) {
+      setIsSelfEvolutionMenuCollapsed(true);
+      return;
+    }
+    setIsSelfEvolutionMenuCollapsed(false);
+  }, [isSelfEvolutionRoute]);
+
   if (!isLoggedIn) {
     return <Navigate to="/login" replace />;
   }
@@ -96,15 +119,21 @@ export default function AdminLayout() {
   if (
     !isAdminUser &&
     (pathname.startsWith("/admin/users") ||
-      pathname.startsWith("/admin/data-sources") ||
-      pathname.startsWith("/admin/memory-management"))
+      pathname.startsWith("/admin/self-evolution"))
   ) {
     return <Navigate to="/admin/groups" replace />;
   }
 
   return (
     <Layout className="admin-layout">
-      <Sider width={232} className="admin-layout-sider">
+      <Sider
+        width={232}
+        className="admin-layout-sider"
+        collapsible={isSelfEvolutionRoute}
+        collapsed={isSelfEvolutionRoute ? isSelfEvolutionMenuCollapsed : false}
+        collapsedWidth={0}
+        trigger={null}
+      >
         <div className="admin-layout-brand">
           <img
             src={logoSrc || logoImage}
@@ -135,10 +164,21 @@ export default function AdminLayout() {
         </div>
       </Sider>
       <Layout className="admin-layout-content">
-        <Content className="admin-layout-body">
-          <div className="admin-layout-panel">
-            <Outlet />
-          </div>
+        <Content
+          className={`admin-layout-body${isSelfEvolutionRoute ? " admin-layout-body-full" : ""}`}
+        >
+          {isSelfEvolutionRoute ? (
+            <Outlet
+              context={{
+                isMenuCollapsed: isSelfEvolutionMenuCollapsed,
+                toggleMenu: () => setIsSelfEvolutionMenuCollapsed((prev) => !prev),
+              }}
+            />
+          ) : (
+            <div className="admin-layout-panel">
+              <Outlet />
+            </div>
+          )}
         </Content>
       </Layout>
     </Layout>

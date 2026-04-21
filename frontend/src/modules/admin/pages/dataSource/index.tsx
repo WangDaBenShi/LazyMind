@@ -2,7 +2,6 @@ import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import {
   Alert,
-  Badge,
   Button,
   Card,
   Col,
@@ -44,6 +43,17 @@ import {
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 import { useNavigate } from "react-router-dom";
+import {
+  Configuration as ScanConfiguration,
+  DefaultApi as ScanDefaultApi,
+  type Agent as ScanAgent,
+  type Source as ScanSource,
+} from "@/api/generated/scan-client";
+import {
+  Configuration as CoreConfiguration,
+  DefaultApi as CoreDefaultApi,
+} from "@/api/generated/core-client";
+import { BASE_URL, axiosInstance, getLocalizedErrorMessage } from "@/components/request";
 
 import "./index.scss";
 import {
@@ -120,6 +130,26 @@ interface DataSourceItem {
   logs: SyncLogItem[];
   warning?: string;
   oauthConnection?: FeishuDataSourceConnection | null;
+  agentId?: string;
+  tenantId?: string;
+  scanManaged?: boolean;
+  storageUsed?: string;
+  detailDocuments?: DetailDocumentItem[];
+}
+
+type DetailParseStatus = "parsed" | "reindexing" | "duplicate" | "deleted" | "failed";
+
+interface DetailDocumentItem {
+  id: string;
+  name: string;
+  path: string;
+  size: string;
+  tags: string[];
+  updateState: FileUpdateState;
+  syncDetail: string;
+  parseStatus: DetailParseStatus;
+  sourceUpdatedAt: string;
+  updatedAt: string;
 }
 
 interface SourceFormValues {
@@ -322,15 +352,15 @@ function getSourceTypeDescription(type: SourceType, t: TFunction) {
 
 function getStatusMeta(status: SourceStatus, t: TFunction) {
   if (status === "active") {
-    return { color: "success", text: t("admin.dataSourceStatusActive") as const };
+    return { color: "success", text: t("admin.dataSourceStatusActive") };
   }
   if (status === "expired") {
-    return { color: "warning", text: t("admin.dataSourceStatusExpired") as const };
+    return { color: "warning", text: t("admin.dataSourceStatusExpired") };
   }
   if (status === "error") {
-    return { color: "error", text: t("admin.dataSourceStatusError") as const };
+    return { color: "error", text: t("admin.dataSourceStatusError") };
   }
-  return { color: "default", text: t("admin.dataSourceStatusPaused") as const };
+  return { color: "default", text: t("admin.dataSourceStatusPaused") };
 }
 
 function getConnectionMeta(state: ConnectionState | OAuthState, t: TFunction) {
@@ -387,6 +417,125 @@ function nowString() {
   return `${current.getFullYear()}-${pad(current.getMonth() + 1)}-${pad(
     current.getDate(),
   )} ${pad(current.getHours())}:${pad(current.getMinutes())}`;
+}
+
+function createScanApiClient() {
+  const baseUrl = BASE_URL || window.location.origin;
+  return new ScanDefaultApi(
+    new ScanConfiguration({
+      basePath: baseUrl,
+      baseOptions: {
+        headers: { "Content-Type": "application/json" },
+      },
+    }),
+    baseUrl,
+    axiosInstance,
+  );
+}
+
+function createCoreApiClient() {
+  const baseUrl = BASE_URL || window.location.origin;
+  return new CoreDefaultApi(
+    new CoreConfiguration({
+      basePath: baseUrl,
+      baseOptions: {
+        headers: { "Content-Type": "application/json" },
+      },
+    }),
+    baseUrl,
+    axiosInstance,
+  );
+}
+
+function formatDateTime(value?: string) {
+  if (!value) {
+    return "-";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  const pad = (input: number) => `${input}`.padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
+    date.getDate(),
+  )} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function mapScanSourceStatus(
+  status?: string,
+  watchEnabled?: boolean,
+): SourceStatus {
+  const normalized = (status || "").toLowerCase();
+  if (
+    normalized.includes("error") ||
+    normalized.includes("failed") ||
+    normalized.includes("invalid")
+  ) {
+    return "error";
+  }
+  if (
+    normalized.includes("disabled") ||
+    normalized.includes("pause") ||
+    normalized.includes("stopped") ||
+    watchEnabled === false
+  ) {
+    return "paused";
+  }
+  return "active";
+}
+
+function mapScanConnectionState(status?: string): ConnectionState {
+  const normalized = (status || "").toLowerCase();
+  if (normalized.includes("expired")) {
+    return "expired";
+  }
+  if (normalized.includes("error") || normalized.includes("failed")) {
+    return "error";
+  }
+  return "connected";
+}
+
+function mapScanSyncDetail(updateState: FileUpdateState) {
+  if (updateState === "new") {
+    return "新文件待入库";
+  }
+  if (updateState === "changed") {
+    return "内容变化待重解析";
+  }
+  if (updateState === "deleted") {
+    return "源端删除待清理";
+  }
+  return "当前文件已是最新";
+}
+
+function getReconcileSeconds(scheduleCycle?: string) {
+  if (scheduleCycle === "twoDays") {
+    return 2 * 24 * 60 * 60;
+  }
+  if (scheduleCycle === "weekly") {
+    return 7 * 24 * 60 * 60;
+  }
+  return 24 * 60 * 60;
+}
+
+function pickScanAgent(agents: ScanAgent[], preferredAgentId?: string) {
+  if (preferredAgentId) {
+    const preferred = agents.find((item) => item.agent_id === preferredAgentId);
+    if (preferred) {
+      return preferred;
+    }
+  }
+
+  const onlineAgent = agents.find((item) => {
+    const status = (item.status || "").toLowerCase();
+    return (
+      status.includes("online") ||
+      status.includes("active") ||
+      status.includes("running")
+    );
+  });
+
+  return onlineAgent || agents[0];
 }
 
 function loadFeishuAppSetup(): FeishuAppSetup | null {
@@ -532,6 +681,9 @@ export default function DataSourceManagement() {
   const [pendingSelectFeishu, setPendingSelectFeishu] = useState(false);
   const [feishuSetupForm] = Form.useForm<FeishuAppSetup>();
   const oauthAttemptRef = useRef<PendingOAuthAttempt | null>(null);
+  const [scanAgents, setScanAgents] = useState<ScanAgent[]>([]);
+  const [scanLoading, setScanLoading] = useState(false);
+  const [validatedAgentId, setValidatedAgentId] = useState<string | null>(null);
 
   const syncMode = Form.useWatch("syncMode", form) || "scheduled";
   const isFeishuSetupReady = Boolean(
@@ -545,6 +697,140 @@ export default function DataSourceManagement() {
     ["expired", "error"].includes(item.status),
   ).length;
   const scheduledCount = sources.filter((item) => item.syncMode === "scheduled").length;
+
+  const buildScanScheduleLabel = (source: ScanSource) => {
+    if (!source.watch_enabled) {
+      return t("admin.dataSourceSyncModeManual");
+    }
+
+    const reconcileSeconds = source.reconcile_seconds || 0;
+    if (reconcileSeconds === 7 * 24 * 60 * 60) {
+      return `${t("admin.dataSourceCycleWeekly")} (${reconcileSeconds}s)`;
+    }
+    if (reconcileSeconds === 2 * 24 * 60 * 60) {
+      return `${t("admin.dataSourceCycleTwoDays")} (${reconcileSeconds}s)`;
+    }
+    if (reconcileSeconds === 24 * 60 * 60) {
+      return `${t("admin.dataSourceCycleDaily")} (${reconcileSeconds}s)`;
+    }
+    return `${t("admin.dataSourceSyncModeScheduled")} (${reconcileSeconds}s)`;
+  };
+
+  const buildScanNextSyncLabel = (source: ScanSource) => {
+    if (!source.watch_enabled) {
+      return t("admin.dataSourceNextSyncManual");
+    }
+    const reconcileSeconds = source.reconcile_seconds || 0;
+    const hourEstimate = Math.max(1, Math.round(reconcileSeconds / 3600));
+    return t("admin.dataSourceNextSyncPlanned", {
+      time: `${hourEstimate}h`,
+    });
+  };
+
+  const mapScanSourceToDataSource = (
+    source: ScanSource,
+    fallback?: DataSourceItem,
+  ): DataSourceItem => {
+    const sourceStatus = mapScanSourceStatus(source.status, source.watch_enabled);
+    const connectionState = mapScanConnectionState(source.status);
+    const currentTime = formatDateTime(source.updated_at);
+    const fallbackDetailDocuments = fallback?.detailDocuments || [];
+    const fallbackFileCandidates = fallback?.fileCandidates || [];
+
+    return {
+      id: source.id,
+      name: source.name,
+      type: "local",
+      knowledgeBase: source.name,
+      description: t("admin.dataSourceTypeLocalDesc"),
+      target: source.root_path,
+      syncMode: source.watch_enabled ? "scheduled" : "manual",
+      scheduleLabel: buildScanScheduleLabel(source),
+      status: sourceStatus,
+      connectionState,
+      lastSync: currentTime,
+      nextSync: buildScanNextSyncLabel(source),
+      documentCount: fallback?.documentCount || 0,
+      addCount: fallback?.addCount || 0,
+      deleteCount: fallback?.deleteCount || 0,
+      changeCount: fallback?.changeCount || 0,
+      permissions: [t("admin.dataSourcePermissionReadOnly")],
+      conflictPolicy: "overwrite",
+      enabled: sourceStatus === "active",
+      scopeMode: "all",
+      selectedFiles: [],
+      fileCandidates: fallbackFileCandidates,
+      logs: [
+        {
+          id: `scan-log-${source.id}-${source.updated_at}`,
+          time: currentTime,
+          result:
+            sourceStatus === "error"
+              ? "failed"
+              : sourceStatus === "paused"
+                ? "warning"
+                : "success",
+          title:
+            sourceStatus === "error"
+              ? t("admin.dataSourceStatusError")
+              : t("admin.dataSourceConnectionConnected"),
+          description: source.watch_enabled
+            ? t("admin.dataSourceSyncModeScheduledDesc")
+            : t("admin.dataSourceSyncModeManualDesc"),
+        },
+      ],
+      warning: t("admin.dataSourceReadonlyPermissionHint"),
+      oauthConnection: null,
+      agentId: source.agent_id,
+      tenantId: source.tenant_id,
+      scanManaged: true,
+      storageUsed: fallback?.storageUsed || "0 B",
+      detailDocuments: fallbackDetailDocuments,
+    };
+  };
+
+  const refreshLocalSources = async (showSuccessMessage = false) => {
+    const client = createScanApiClient();
+    setScanLoading(true);
+    try {
+      const [agentsResponse, sourcesResponse] = await Promise.all([
+        client.apiScanAgentsGet(),
+        client.apiScanSourcesGet(),
+      ]);
+      const nextAgents = agentsResponse.data.items || [];
+      setScanAgents(nextAgents);
+
+      const sourceList = sourcesResponse.data.items || [];
+      setSources((prev) => {
+        const localSourceMap = new Map(
+          prev.filter((item) => item.type === "local").map((item) => [item.id, item]),
+        );
+        const nextLocalSources = sourceList.map((source) =>
+          mapScanSourceToDataSource(source, localSourceMap.get(source.id)),
+        );
+
+        return [
+          ...nextLocalSources,
+          ...prev.filter((item) => item.type !== "local"),
+        ];
+      });
+
+      if (showSuccessMessage) {
+        message.success(t("admin.dataSourceListRefreshed"));
+      }
+    } catch (error) {
+      if (showSuccessMessage) {
+        message.error(
+          getLocalizedErrorMessage(error, t("common.requestFailed")) ||
+            t("common.requestFailed"),
+        );
+      } else {
+        console.error("Failed to refresh local sources", error);
+      }
+    } finally {
+      setScanLoading(false);
+    }
+  };
 
   const clearOauthAttempt = () => {
     if (oauthAttemptRef.current?.timerId) {
@@ -658,6 +944,10 @@ export default function DataSourceManagement() {
     };
   }, [form]);
 
+  useEffect(() => {
+    void refreshLocalSources(false);
+  }, []);
+
   const resetWizard = () => {
     form.resetFields();
     setWizardMode("create");
@@ -667,6 +957,7 @@ export default function DataSourceManagement() {
     setOauthState("pending");
     setConnectionVerified(false);
     setOauthConnection(null);
+    setValidatedAgentId(null);
   };
 
   const openCreateWizard = () => {
@@ -700,6 +991,7 @@ export default function DataSourceManagement() {
               : "pending",
     );
     setConnectionVerified(record.connectionState === "connected");
+    setValidatedAgentId(record.type === "local" ? record.agentId || null : null);
     form.setFieldsValue({
       knowledgeBase: record.knowledgeBase,
       syncMode: record.syncMode,
@@ -736,6 +1028,7 @@ export default function DataSourceManagement() {
     setConnectionVerified(false);
     setOauthState("pending");
     setOauthConnection(null);
+    setValidatedAgentId(null);
     form.setFieldsValue({
       syncMode: "scheduled",
       scheduleCycle: "daily",
@@ -774,14 +1067,24 @@ export default function DataSourceManagement() {
   };
 
   const handleResetFeishuSetup = () => {
-    clearOauthAttempt();
-    clearFeishuAppSetup();
-    setFeishuAppSetup(null);
-    setSelectedType((current) => (current === "feishu" ? null : current));
-    setOauthState("pending");
-    setConnectionVerified(false);
-    setOauthConnection(null);
-    message.success(t("admin.dataSourceFeishuCredentialReset"));
+    Modal.confirm({
+      title: t("admin.dataSourceFeishuCredentialResetConfirmTitle"),
+      content: t("admin.dataSourceFeishuCredentialResetConfirmContent"),
+      okText: t("common.confirm"),
+      cancelText: t("common.cancel"),
+      okButtonProps: { danger: true },
+      icon: <WarningFilled />,
+      onOk: () => {
+        clearOauthAttempt();
+        clearFeishuAppSetup();
+        setFeishuAppSetup(null);
+        setSelectedType((current) => (current === "feishu" ? null : current));
+        setOauthState("pending");
+        setConnectionVerified(false);
+        setOauthConnection(null);
+        message.success(t("admin.dataSourceFeishuCredentialReset"));
+      },
+    });
   };
 
   const handleSelectType = (type: SourceType) => {
@@ -792,9 +1095,69 @@ export default function DataSourceManagement() {
     applySourceType(type);
   };
 
-  const handleTestConnection = () => {
-    setConnectionVerified(true);
-    message.success(t("admin.dataSourceConnectionTestSuccess"));
+  const handleTestConnection = async () => {
+    if (selectedType !== "local") {
+      setConnectionVerified(true);
+      message.success(t("admin.dataSourceConnectionTestSuccess"));
+      return;
+    }
+
+    try {
+      await form.validateFields(["path"]);
+      const { path = "" } = form.getFieldsValue(["path"]);
+      const normalizedPath = `${path}`.trim();
+
+      if (!normalizedPath) {
+        message.warning(t("admin.dataSourceAccessPathRequired"));
+        return;
+      }
+
+      let currentAgents = scanAgents;
+      if (currentAgents.length === 0) {
+        const agentsResponse = await createScanApiClient().apiScanAgentsGet();
+        currentAgents = agentsResponse.data.items || [];
+        setScanAgents(currentAgents);
+      }
+
+      const preferredAgentId =
+        validatedAgentId ||
+        (editingId
+          ? sources.find((item) => item.id === editingId)?.agentId
+          : undefined);
+      const selectedAgent = pickScanAgent(currentAgents, preferredAgentId);
+      if (!selectedAgent?.agent_id) {
+        message.error("未发现可用扫描 Agent，请先启动并注册扫描 Agent。");
+        return;
+      }
+
+      const validateResponse = await createScanApiClient().apiScanAgentsFsValidatePost({
+        agentPathRequest: {
+          agent_id: selectedAgent.agent_id,
+          path: normalizedPath,
+        },
+      });
+      const validation = validateResponse.data;
+      const passed =
+        Boolean(validation.allowed) &&
+        Boolean(validation.exists) &&
+        Boolean(validation.readable) &&
+        Boolean(validation.is_dir);
+
+      setConnectionVerified(passed);
+      if (passed) {
+        setValidatedAgentId(selectedAgent.agent_id);
+        message.success(t("admin.dataSourceConnectionTestSuccess"));
+        return;
+      }
+
+      message.error(validation.reason || "路径校验未通过，请检查目录是否存在且具备只读权限。");
+    } catch (error) {
+      setConnectionVerified(false);
+      message.error(
+        getLocalizedErrorMessage(error, t("common.requestFailed")) ||
+          t("common.requestFailed"),
+      );
+    }
   };
 
   const handleConnectAccount = async () => {
@@ -871,6 +1234,21 @@ export default function DataSourceManagement() {
   };
 
   const openDetailPage = (record: DataSourceItem) => {
+    const detailDocuments: DetailDocumentItem[] =
+      record.detailDocuments ||
+      record.fileCandidates.map((item) => ({
+        id: item.id,
+        name: item.name,
+        path: item.path,
+        size: item.size,
+        tags: [],
+        updateState: item.updateState,
+        syncDetail: mapScanSyncDetail(item.updateState),
+        parseStatus: item.updateState === "deleted" ? "deleted" : "parsed",
+        sourceUpdatedAt: record.lastSync,
+        updatedAt: record.lastSync,
+      }));
+
     navigate(`/admin/data-sources/${record.id}`, {
       state: {
         source: {
@@ -883,6 +1261,11 @@ export default function DataSourceManagement() {
           addCount: record.addCount,
           deleteCount: record.deleteCount,
           changeCount: record.changeCount,
+          storageUsed: record.storageUsed || "0 B",
+          documents: detailDocuments,
+          scanManaged: record.scanManaged,
+          tenantId: record.tenantId,
+          agentId: record.agentId,
         },
       },
     });
@@ -917,6 +1300,129 @@ export default function DataSourceManagement() {
     }
   };
 
+  const handleSaveLocalSource = async (values: SourceFormValues) => {
+    const rootPath = `${values.path || ""}`.trim();
+    const sourceName = `${values.knowledgeBase || getSourceTypeTitle("local", t)}`.trim();
+    const isScheduled = (values.syncMode || "scheduled") === "scheduled";
+    const reconcileSeconds = getReconcileSeconds(values.scheduleCycle);
+    const currentLocalSource =
+      editingId && selectedType === "local"
+        ? sources.find((item) => item.id === editingId && item.type === "local")
+        : undefined;
+
+    if (!rootPath) {
+      message.warning(t("admin.dataSourceAccessPathRequired"));
+      return;
+    }
+
+    const client = createScanApiClient();
+    let currentAgents = scanAgents;
+    if (currentAgents.length === 0) {
+      const agentsResponse = await client.apiScanAgentsGet();
+      currentAgents = agentsResponse.data.items || [];
+      setScanAgents(currentAgents);
+    }
+
+    const selectedAgent = pickScanAgent(
+      currentAgents,
+      validatedAgentId || currentLocalSource?.agentId,
+    );
+    if (!selectedAgent) {
+      message.error("未发现可用扫描 Agent，请先启动并注册扫描 Agent。");
+      return;
+    }
+
+    try {
+      if (currentLocalSource?.scanManaged) {
+        await client.apiScanSourcesIdPut({
+          id: currentLocalSource.id,
+          updateSourceRequest: {
+            name: sourceName,
+            root_path: rootPath,
+            reconcile_seconds: reconcileSeconds,
+            idle_window_seconds: 300,
+          },
+        });
+
+        if (isScheduled) {
+          await client.apiScanSourcesIdWatchEnablePost({
+            id: currentLocalSource.id,
+            enableWatchRequest: {
+              reconcile_seconds: reconcileSeconds,
+            },
+          });
+        } else {
+          await client.apiScanSourcesIdWatchDisablePost({
+            id: currentLocalSource.id,
+          });
+        }
+      } else {
+        const algosResponse = await createCoreApiClient().apiCoreDatasetAlgosGet();
+        const algos = algosResponse.data.algos || [];
+        const selectedAlgo = algos[0];
+        if (!selectedAlgo?.algo_id) {
+          message.error("未获取到可用知识库算法，请先检查 Core 服务算法配置。");
+          return;
+        }
+
+        const kbResponse = await client.apiScanKnowledgeBasesPost({
+          createKnowledgeBaseRequest: {
+            name: sourceName,
+            algo: {
+              algo_id: selectedAlgo.algo_id,
+              display_name: selectedAlgo.display_name,
+              description: selectedAlgo.description,
+            },
+          },
+        });
+
+        const createSourceResponse = await client.apiScanSourcesPost({
+          createSourceRequest: {
+            tenant_id: selectedAgent.tenant_id,
+            agent_id: selectedAgent.agent_id,
+            dataset_id: kbResponse.data.dataset_id,
+            name: sourceName,
+            root_path: rootPath,
+            watch_enabled: isScheduled,
+            reconcile_seconds: reconcileSeconds,
+            idle_window_seconds: 300,
+          },
+        });
+
+        const createdSourceId = createSourceResponse.data.id;
+        if (!createdSourceId) {
+          message.error("数据源创建成功但未返回 source id，无法配置监听状态。");
+          return;
+        }
+
+        if (isScheduled) {
+          await client.apiScanSourcesIdWatchEnablePost({
+            id: createdSourceId,
+            enableWatchRequest: {
+              reconcile_seconds: reconcileSeconds,
+            },
+          });
+        } else {
+          await client.apiScanSourcesIdWatchDisablePost({
+            id: createdSourceId,
+          });
+        }
+      }
+
+      setValidatedAgentId(selectedAgent.agent_id);
+      await refreshLocalSources(false);
+      message.success(
+        editingId ? t("admin.dataSourceConfigUpdated") : t("admin.dataSourceCreated"),
+      );
+      handleCloseWizard();
+    } catch (error) {
+      message.error(
+        getLocalizedErrorMessage(error, t("common.requestFailed")) ||
+          t("common.requestFailed"),
+      );
+    }
+  };
+
   const handleSave = async () => {
     if (!selectedType) {
       return;
@@ -928,6 +1434,11 @@ export default function DataSourceManagement() {
     }
 
     const values = form.getFieldsValue();
+    if (selectedType === "local") {
+      await handleSaveLocalSource(values);
+      return;
+    }
+
     const currentTime = nowString();
     const scheduleLabel = buildScheduleLabel(values, t);
     const nextSync = getNextSyncLabel(values, t);
@@ -969,14 +1480,11 @@ export default function DataSourceManagement() {
       selectedFiles: [],
       fileCandidates: defaultFileCandidates,
       oauthConnection: isCloudType(selectedType) ? oauthConnection : null,
-      warning:
-        selectedType === "local"
-          ? t("admin.dataSourceReadonlyPermissionHint")
-          : isCloudType(selectedType)
-            ? oauthConnection?.status === "connected"
-              ? t("admin.dataSourceOauthConnectedBackendHint")
-              : t("admin.dataSourceOauthBackendHint")
-            : undefined,
+      warning: isCloudType(selectedType)
+        ? oauthConnection?.status === "connected"
+          ? t("admin.dataSourceOauthConnectedBackendHint")
+          : t("admin.dataSourceOauthBackendHint")
+        : undefined,
       logs: editingId
         ? sources.find((item) => item.id === editingId)?.logs || []
         : [creationLog],
@@ -1379,7 +1887,10 @@ export default function DataSourceManagement() {
                 >
                   <Input
                     placeholder="/mnt/team-share/ops-docs"
-                    onChange={() => setConnectionVerified(false)}
+                    onChange={() => {
+                      setConnectionVerified(false);
+                      setValidatedAgentId(null);
+                    }}
                   />
                 </Form.Item>
               ) : (
@@ -1467,21 +1978,15 @@ export default function DataSourceManagement() {
 
   return (
     <div className="admin-page data-source-page">
-      <div className="admin-page-toolbar data-source-page-toolbar">
-        <div className="admin-page-toolbar-left data-source-page-toolbar-left">
-          <div>
-            <h2 className="admin-page-title">{t("admin.dataSourceManagement")}</h2>
-            <Paragraph className="data-source-page-subtitle">
-              {t("admin.dataSourceSubtitle")}
-            </Paragraph>
+        <div className="admin-page-toolbar data-source-page-toolbar">
+          <div className="admin-page-toolbar-left data-source-page-toolbar-left">
+            <div>
+              <h2 className="admin-page-title">{t("admin.dataSourceManagement")}</h2>
+              <Paragraph className="data-source-page-subtitle">
+                {t("admin.dataSourceSubtitle")}
+              </Paragraph>
+            </div>
           </div>
-          <Badge
-            count="UI"
-            color="#1677ff"
-            className="data-source-page-badge"
-            title={t("admin.dataSourceDemoTitle")}
-          />
-        </div>
         <Button
           type="primary"
           icon={<PlusOutlined />}
@@ -1507,7 +2012,10 @@ export default function DataSourceManagement() {
           <Space size="middle">
             <Button
               icon={<ReloadOutlined />}
-              onClick={() => message.success(t("admin.dataSourceListRefreshed"))}
+              loading={scanLoading}
+              onClick={() => {
+                void refreshLocalSources(true);
+              }}
             >
               {t("admin.dataSourceRefresh")}
             </Button>
@@ -1518,6 +2026,7 @@ export default function DataSourceManagement() {
           rowKey="id"
           columns={columns}
           dataSource={sources}
+          loading={scanLoading}
           pagination={{ pageSize: 6, showSizeChanger: false }}
           className="admin-page-table data-source-table"
           scroll={{ x: 1480 }}

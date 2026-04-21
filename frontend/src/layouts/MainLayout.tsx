@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Button, Form, Input, Layout, Menu, Modal, Popover, message } from "antd";
 import type { MenuProps } from "antd";
 import {
+  CodeOutlined,
   SettingOutlined,
   UserOutlined,
   MessageFilled,
@@ -25,6 +26,7 @@ import "./index.scss";
 
 const { Content, Sider } = Layout;
 const MAINLAND_CHINA_PHONE_REGEX = /^1[3-9]\d{9}$/;
+const DEVELOPER_ACTIVE_STORAGE_KEY = "lazyrag:developer-active";
 
 type MenuItem = Required<MenuProps>["items"][number];
 
@@ -83,6 +85,7 @@ export default function MainLayout() {
   const [profileLoading, setProfileLoading] = useState(false);
   const [profileSubmitting, setProfileSubmitting] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [developerActive, setDeveloperActive] = useState(false);
   const [profileDetail, setProfileDetail] = useState<UserDetailResponse | null>(
     null,
   );
@@ -93,6 +96,11 @@ export default function MainLayout() {
       key: "/admin",
       label: t("layout.systemManagement"),
       icon: <TeamOutlined className="settings-popover-icon" />,
+    },
+    {
+      key: "/admin/self-evolution",
+      label: t("layout.developer"),
+      icon: <CodeOutlined className="settings-popover-icon" />,
     },
   ];
   const logoSrc =
@@ -113,6 +121,15 @@ export default function MainLayout() {
     }
   }, [isLoggedIn, navigate, pathname]);
 
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem(DEVELOPER_ACTIVE_STORAGE_KEY);
+      setDeveloperActive(stored === "1");
+    } catch {
+      setDeveloperActive(false);
+    }
+  }, []);
+
   const onMenuClick: MenuProps["onClick"] = (e) => {
     const targetPath = e.key as string;
     if (selectKeys.includes(targetPath)) return;
@@ -121,6 +138,28 @@ export default function MainLayout() {
   };
 
   const handleSettingsNavigate = (targetPath: string) => {
+    if (targetPath === "/admin/self-evolution") {
+      if (developerActive) {
+        setDeveloperActive(false);
+        try {
+          localStorage.removeItem(DEVELOPER_ACTIVE_STORAGE_KEY);
+        } catch {
+          // Ignore storage errors and keep in-memory state.
+        }
+        message.success(t("admin.developerDeactivated"));
+        return;
+      }
+
+      setDeveloperActive(true);
+      try {
+        localStorage.setItem(DEVELOPER_ACTIVE_STORAGE_KEY, "1");
+      } catch {
+        // Ignore storage errors and keep in-memory state.
+      }
+      message.success(t("admin.developerActivated"));
+      return;
+    }
+
     setSettingsOpen(false);
     navigate(targetPath);
   };
@@ -349,11 +388,20 @@ export default function MainLayout() {
                     <Button
                       key={item.key}
                       type="text"
-                      className="settings-popover-button"
+                      className={`settings-popover-button${
+                        item.key === "/admin/self-evolution" && developerActive
+                          ? " is-active"
+                          : ""
+                      }`}
                       onClick={() => handleSettingsNavigate(item.key)}
                     >
                       {item.icon}
                       <span>{item.label}</span>
+                      {item.key === "/admin/self-evolution" && developerActive && (
+                        <span className="settings-active-badge">
+                          {t("admin.developerActiveTag")}
+                        </span>
+                      )}
                     </Button>
                   ))}
                   {isLoggedIn ? (

@@ -11,6 +11,7 @@ import {
   Select,
   Space,
   Steps,
+  Switch,
   Table,
   Tag,
   Tooltip,
@@ -77,6 +78,7 @@ interface GlossaryChangeProposal {
   before: GlossaryAsset | null;
   after: GlossaryAsset;
   reason: string;
+  mergeFrom?: [GlossaryAsset, GlossaryAsset];
 }
 
 interface AssetDraft {
@@ -443,6 +445,32 @@ const initialGlossaryChangeProposals: GlossaryChangeProposal[] = (() => {
       },
       reason: "AI 从近期对话中提炼的高频术语，建议纳入词表以提升召回。",
     },
+    {
+      id: "glossary-proposal-merge-rainfall-model",
+      targetId: "glossary-rainfall-trigger-model",
+      before: null,
+      after: {
+        id: "glossary-rainfall-trigger-model",
+        term: "降雨触发阈值模型",
+        aliases: ["雨强-历时触发模型", "降雨触发模型", "ID 触发模型"],
+        source: "system",
+        content:
+          "合并雨强阈值与雨量历时曲线后的统一词条，用于灾害触发条件联合检索与研判。",
+        protect: false,
+      },
+      reason: "发现两个词条在检索与生成中频繁共现，建议合并为统一口径词条。",
+      mergeFrom: [
+        cloneGlossaryAsset(rainfallItem),
+        {
+          id: "legacy-glossary-rainfall-duration-curve",
+          term: "雨量历时曲线",
+          aliases: ["降雨历时曲线", "雨量-历时曲线"],
+          source: "system",
+          content: "描述不同降雨历时与触发概率关系的分析曲线。",
+          protect: false,
+        },
+      ],
+    },
   ];
 })();
 
@@ -456,6 +484,7 @@ export default function MemoryManagement() {
   const [skillAssets, setSkillAssets] = useState<StructuredAsset[]>(initialSkills);
   const [experienceAssets, setExperienceAssets] =
     useState<ExperienceAsset[]>(initialExperience);
+  const [experienceFeatureEnabled, setExperienceFeatureEnabled] = useState(true);
   const [glossaryAssets, setGlossaryAssets] =
     useState<GlossaryAsset[]>(initialGlossary);
   const [query, setQuery] = useState("");
@@ -905,16 +934,7 @@ export default function MemoryManagement() {
     [category, keyword, tag],
   );
 
-  const filteredExperienceItems = experienceAssets.filter((item) => {
-    if (!keyword) {
-      return true;
-    }
-
-    return (
-      item.title.toLowerCase().includes(keyword) ||
-      item.content.toLowerCase().includes(keyword)
-    );
-  });
+  const filteredExperienceItems = experienceAssets;
   const filteredGlossaryItems = glossaryAssets.filter((item) => {
     const matchesSource = !glossarySource || item.source === glossarySource;
     if (!matchesSource) {
@@ -1143,6 +1163,10 @@ export default function MemoryManagement() {
     mode: ModalMode,
     item?: StructuredAsset | ExperienceAsset | GlossaryAsset,
   ) => {
+    if (mode === "add" && activeTab === "experience") {
+      return;
+    }
+
     setModalMode(mode);
 
     if (!item) {
@@ -1800,6 +1824,15 @@ export default function MemoryManagement() {
     setGlossaryAssets((previous) => {
       const next = [...previous];
       proposals.forEach((proposal) => {
+        const mergeSourceIds = proposal.mergeFrom?.map((item) => item.id) ?? [];
+        if (mergeSourceIds.length) {
+          for (let index = next.length - 1; index >= 0; index -= 1) {
+            if (mergeSourceIds.includes(next[index].id)) {
+              next.splice(index, 1);
+            }
+          }
+        }
+
         const existingIndex = next.findIndex(
           (item) =>
             item.id === proposal.targetId ||
@@ -2027,22 +2060,6 @@ export default function MemoryManagement() {
               type="text"
               icon={<EditOutlined />}
               onClick={() => openModal("edit", record)}
-            />
-          </Tooltip>
-          <Tooltip title={t("admin.memoryShareItem")}>
-            <Button
-              type="text"
-              icon={<LinkOutlined />}
-              onClick={() => openShareModal("experience", record)}
-            />
-          </Tooltip>
-          <Tooltip title={t("admin.memoryDeleteItem")}>
-            <Button
-              type="text"
-              danger
-              disabled={record.protect}
-              icon={<DeleteOutlined />}
-              onClick={() => handleDelete(record)}
             />
           </Tooltip>
         </Space>
@@ -2482,6 +2499,17 @@ export default function MemoryManagement() {
               </p>
             </div>
             <Space>
+              {activeTab === "experience" ? (
+                <Space size={8}>
+                  <span>{t("admin.memoryHabitFeatureToggle")}</span>
+                  <Switch
+                    checked={experienceFeatureEnabled}
+                    checkedChildren={t("admin.enable")}
+                    unCheckedChildren={t("admin.disable")}
+                    onChange={setExperienceFeatureEnabled}
+                  />
+                </Space>
+              ) : null}
               {activeTab === "glossary" ? (
                 <Button onClick={() => setGlossaryInboxOpen(true)}>
                   {t("admin.memoryGlossaryInboxButton", {
@@ -2489,7 +2517,7 @@ export default function MemoryManagement() {
                   })}
                 </Button>
               ) : null}
-              {activeTab !== "tools" ? (
+              {activeTab !== "tools" && activeTab !== "experience" ? (
                 <Button
                   type="primary"
                   className="admin-page-primary-button"
@@ -2550,53 +2578,55 @@ export default function MemoryManagement() {
             })}
           </div>
 
-          <div className="memory-filter-bar">
-            <Input.Search
-              allowClear
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder={t("admin.memorySearchPlaceholder", {
-                unit: currentTabMeta.unit,
-              })}
-              className="memory-filter-search"
-            />
-            {activeTab === "tools" || activeTab === "skills" ? (
-              <>
-                <Select
-                  allowClear
-                  value={category}
-                  placeholder={t("admin.memoryAllCategories")}
-                  options={availableCategories.map((item) => ({
-                    label: item,
-                    value: item,
-                  }))}
-                  className="memory-filter-select"
-                  onChange={(value) => setCategory(value)}
-                />
-                <Select
-                  allowClear
-                  value={tag}
-                  placeholder={t("admin.memoryAllTags")}
-                  options={availableTags.map((item) => ({
-                    label: item,
-                    value: item,
-                  }))}
-                  className="memory-filter-select"
-                  onChange={(value) => setTag(value)}
-                />
-              </>
-            ) : activeTab === "glossary" ? (
-              <Select
+          {activeTab !== "experience" ? (
+            <div className="memory-filter-bar">
+              <Input.Search
                 allowClear
-                value={glossarySource}
-                placeholder={t("admin.memoryAllSources")}
-                options={availableGlossarySourceOptions}
-                className="memory-filter-select"
-                onChange={(value) => setGlossarySource(value)}
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder={t("admin.memorySearchPlaceholder", {
+                  unit: currentTabMeta.unit,
+                })}
+                className="memory-filter-search"
               />
-            ) : null}
-            <Button onClick={resetFilters}>{t("admin.memoryReset")}</Button>
-          </div>
+              {activeTab === "tools" || activeTab === "skills" ? (
+                <>
+                  <Select
+                    allowClear
+                    value={category}
+                    placeholder={t("admin.memoryAllCategories")}
+                    options={availableCategories.map((item) => ({
+                      label: item,
+                      value: item,
+                    }))}
+                    className="memory-filter-select"
+                    onChange={(value) => setCategory(value)}
+                  />
+                  <Select
+                    allowClear
+                    value={tag}
+                    placeholder={t("admin.memoryAllTags")}
+                    options={availableTags.map((item) => ({
+                      label: item,
+                      value: item,
+                    }))}
+                    className="memory-filter-select"
+                    onChange={(value) => setTag(value)}
+                  />
+                </>
+              ) : activeTab === "glossary" ? (
+                <Select
+                  allowClear
+                  value={glossarySource}
+                  placeholder={t("admin.memoryAllSources")}
+                  options={availableGlossarySourceOptions}
+                  className="memory-filter-select"
+                  onChange={(value) => setGlossarySource(value)}
+                />
+              ) : null}
+              <Button onClick={resetFilters}>{t("admin.memoryReset")}</Button>
+            </div>
+          ) : null}
 
           {activeTab === "tools" ? (
             <Alert
@@ -2713,9 +2743,13 @@ export default function MemoryManagement() {
             <div className="memory-glossary-inbox-list">
               {glossaryChangeProposals.map((proposal) => {
                 const checked = selectedGlossaryProposalIds.includes(proposal.id);
-                const proposalTypeText = proposal.before
-                  ? t("admin.memoryGlossaryInboxTypeUpdate")
-                  : t("admin.memoryGlossaryInboxTypeAdd");
+                const isMergeProposal = Boolean(proposal.mergeFrom);
+                const proposalTypeText = isMergeProposal
+                  ? t("admin.memoryGlossaryInboxTypeMerge")
+                  : proposal.before
+                    ? t("admin.memoryGlossaryInboxTypeUpdate")
+                    : t("admin.memoryGlossaryInboxTypeAdd");
+                const [mergeLeftSource, mergeRightSource] = proposal.mergeFrom ?? [];
 
                 return (
                   <div key={proposal.id} className="memory-glossary-inbox-card">
@@ -2744,24 +2778,100 @@ export default function MemoryManagement() {
                         <strong>{t("admin.memoryGlossaryInboxReason")}</strong>
                         <span>{proposal.reason}</span>
                       </div>
-                      <div className="memory-glossary-inbox-card-line">
-                        <strong>{t("admin.memoryGlossaryAliases")}</strong>
-                        <div className="memory-tag-group memory-tag-group-scroll">
-                          {proposal.after.aliases.length ? (
-                            proposal.after.aliases.map((alias) => (
-                              <Tag key={`${proposal.id}-${alias}`}>{alias}</Tag>
-                            ))
-                          ) : (
-                            <span className="memory-content-preview">-</span>
-                          )}
+                      {isMergeProposal && mergeLeftSource && mergeRightSource ? (
+                        <div className="memory-glossary-inbox-merge">
+                          <strong>{t("admin.memoryGlossaryInboxMergeLabel")}</strong>
+                          <div className="memory-glossary-merge-flow">
+                            <div className="memory-glossary-merge-node">
+                              <span className="memory-glossary-merge-node-label">
+                                {t("admin.memoryGlossaryInboxMergeFromA")}
+                              </span>
+                              <strong className="memory-glossary-merge-term">
+                                {mergeLeftSource.term}
+                              </strong>
+                              <div className="memory-tag-group memory-glossary-merge-tags">
+                                {mergeLeftSource.aliases.length ? (
+                                  mergeLeftSource.aliases.map((alias) => (
+                                    <Tag key={`${proposal.id}-${mergeLeftSource.id}-${alias}`}>
+                                      {alias}
+                                    </Tag>
+                                  ))
+                                ) : (
+                                  <span className="memory-content-preview">-</span>
+                                )}
+                              </div>
+                              <span className="memory-glossary-merge-content">
+                                {mergeLeftSource.content}
+                              </span>
+                            </div>
+                            <span className="memory-glossary-merge-operator">+</span>
+                            <div className="memory-glossary-merge-node">
+                              <span className="memory-glossary-merge-node-label">
+                                {t("admin.memoryGlossaryInboxMergeFromB")}
+                              </span>
+                              <strong className="memory-glossary-merge-term">
+                                {mergeRightSource.term}
+                              </strong>
+                              <div className="memory-tag-group memory-glossary-merge-tags">
+                                {mergeRightSource.aliases.length ? (
+                                  mergeRightSource.aliases.map((alias) => (
+                                    <Tag key={`${proposal.id}-${mergeRightSource.id}-${alias}`}>
+                                      {alias}
+                                    </Tag>
+                                  ))
+                                ) : (
+                                  <span className="memory-content-preview">-</span>
+                                )}
+                              </div>
+                              <span className="memory-glossary-merge-content">
+                                {mergeRightSource.content}
+                              </span>
+                            </div>
+                            <span className="memory-glossary-merge-arrow">-&gt;</span>
+                            <div className="memory-glossary-merge-node is-result">
+                              <span className="memory-glossary-merge-node-label">
+                                {t("admin.memoryGlossaryInboxMergeResult")}
+                              </span>
+                              <strong className="memory-glossary-merge-term">
+                                {proposal.after.term}
+                              </strong>
+                              <div className="memory-tag-group memory-glossary-merge-tags">
+                                {proposal.after.aliases.length ? (
+                                  proposal.after.aliases.map((alias) => (
+                                    <Tag key={`${proposal.id}-merged-${alias}`}>{alias}</Tag>
+                                  ))
+                                ) : (
+                                  <span className="memory-content-preview">-</span>
+                                )}
+                              </div>
+                              <span className="memory-glossary-merge-content">
+                                {proposal.after.content}
+                              </span>
+                            </div>
+                          </div>
                         </div>
-                      </div>
-                      <div className="memory-glossary-inbox-card-line">
-                        <strong>{t("admin.memoryContent")}</strong>
-                        <span className="memory-content-preview memory-content-preview-glossary">
-                          {proposal.after.content}
-                        </span>
-                      </div>
+                      ) : (
+                        <>
+                          <div className="memory-glossary-inbox-card-line">
+                            <strong>{t("admin.memoryGlossaryAliases")}</strong>
+                            <div className="memory-tag-group memory-tag-group-scroll">
+                              {proposal.after.aliases.length ? (
+                                proposal.after.aliases.map((alias) => (
+                                  <Tag key={`${proposal.id}-${alias}`}>{alias}</Tag>
+                                ))
+                              ) : (
+                                <span className="memory-content-preview">-</span>
+                              )}
+                            </div>
+                          </div>
+                          <div className="memory-glossary-inbox-card-line">
+                            <strong>{t("admin.memoryContent")}</strong>
+                            <span className="memory-content-preview memory-content-preview-glossary">
+                              {proposal.after.content}
+                            </span>
+                          </div>
+                        </>
+                      )}
                     </div>
                     <div className="memory-glossary-inbox-card-actions">
                       <Button

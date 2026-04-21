@@ -3,7 +3,6 @@ import { ConfigProvider } from "antd";
 import { useTranslation } from "react-i18next";
 import MainLayout from "@/layouts/MainLayout";
 import SigninLogin from "@/modules/signin/pages/login";
-import FeishuCallback from "@/modules/signin/pages/feishuCallback";
 import SigninRegister from "@/modules/signin/pages/register";
 import SigninDashboard from "@/modules/signin/pages/dashboard";
 import LoginTransition from "@/modules/signin/pages/loginTransition";
@@ -22,6 +21,7 @@ import DataSourceManagement from "@/modules/admin/pages/dataSource";
 import DataSourceDetail from "@/modules/admin/pages/dataSource/detail";
 import DataSourceFeishuCallback from "@/modules/admin/pages/dataSource/feishuCallback";
 import MemoryManagement from "@/modules/admin/pages/memory";
+import SelfEvolutionPage from "@/modules/admin/pages/selfEvolution";
 import { getAntdLocale } from "@/i18n/antdLocale";
 
 export default function AppRouter() {
@@ -32,7 +32,6 @@ export default function AppRouter() {
       <Routes>
         <Route path="/login" element={<SigninDashboard />}>
           <Route index element={<SigninLogin />} />
-          <Route path="feishu/callback" element={<FeishuCallback />} />
         </Route>
         <Route path="/register" element={<SigninDashboard />}>
           <Route index element={<SigninRegister />} />
@@ -67,6 +66,7 @@ export default function AppRouter() {
           <Route path="data-sources" element={<DataSourceManagement />} />
           <Route path="data-sources/:id" element={<DataSourceDetail />} />
           <Route path="memory-management" element={<MemoryManagement />} />
+          <Route path="self-evolution" element={<SelfEvolutionPage />} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>

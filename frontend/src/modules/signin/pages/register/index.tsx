@@ -13,7 +13,6 @@ interface RegisterFormValues {
   email?: string;
   password: string;
   confirmPassword: string;
-  captcha: string;
 }
 
 const Register = () => {
@@ -30,8 +29,7 @@ const Register = () => {
         password: values.password,
         confirm_password: values.confirmPassword,
         email: values.email || undefined,
-        captcha: values.captcha,
-      } as any);
+      });
       message.success(t("auth.registerSuccess"));
       navigate("/login", { state: { username: values.username } });
     } catch (error: any) {
@@ -113,17 +111,6 @@ const Register = () => {
             placeholder={t("auth.pleaseInputConfirmPassword")} 
             autoComplete="new-password"
           />
-        </Form.Item>
-
-        <Form.Item
-          name="captcha"
-          label={t("auth.captcha")}
-          rules={[{ required: true, message: t("auth.pleaseInputCaptcha") }]}
-        >
-          <div style={{ display: 'flex', gap: '8px' }}>
-            <Input placeholder={t("auth.pleaseInputCaptcha")} style={{ flex: 1 }} />
-            <Button style={{ width: '120px' }}>{t("auth.getCaptcha")}</Button>
-          </div>
         </Form.Item>
 
         <Form.Item style={{ marginTop: '16px', marginBottom: 0 }}>

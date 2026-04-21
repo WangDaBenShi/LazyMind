@@ -1,5 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
-import type { ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
   Button,
@@ -32,6 +31,15 @@ import {
 import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
+import {
+  Configuration as ScanConfiguration,
+  DefaultApi as ScanDefaultApi,
+  type Source as ScanSource,
+  type SourceDocumentItem as ScanSourceDocumentItem,
+  type SourceDocumentsSummary as ScanSourceDocumentsSummary,
+  type TreeNode as ScanTreeNode,
+} from "@/api/generated/scan-client";
+import { BASE_URL, axiosInstance, getLocalizedErrorMessage } from "@/components/request";
 
 import "./detail.scss";
 
@@ -49,6 +57,11 @@ interface DataSourceSummary {
   addCount: number;
   deleteCount: number;
   changeCount: number;
+  storageUsed?: string;
+  documents?: DocumentStatusRow[];
+  scanManaged?: boolean;
+  tenantId?: string;
+  agentId?: string;
 }
 
 interface DataSourceDetailState {
@@ -297,16 +310,6 @@ function isDocumentNeedSync(status: DocumentStatusRow["updateState"]) {
   return status === "new" || status === "changed" || status === "deleted";
 }
 
-function matchSyncStatus(
-  status: DocumentStatusRow["updateState"],
-  filter: SyncStatusFilter,
-) {
-  if (filter === "updated") {
-    return isDocumentNeedSync(status);
-  }
-  return status === "unchanged";
-}
-
 function formatNow() {
   const current = new Date();
   const pad = (value: number) => `${value}`.padStart(2, "0");
@@ -328,6 +331,260 @@ function getDocumentType(name: string) {
   return extension.toLowerCase();
 }
 
+function createScanApiClient() {
+  const baseUrl = BASE_URL || window.location.origin;
+  return new ScanDefaultApi(
+    new ScanConfiguration({
+      basePath: baseUrl,
+      baseOptions: {
+        headers: { "Content-Type": "application/json" },
+      },
+    }),
+    baseUrl,
+    axiosInstance,
+  );
+}
+
+function formatDateTime(value?: string) {
+  if (!value) {
+    return "";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  const pad = (input: number) => `${input}`.padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
+    date.getDate(),
+  )} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function formatBytes(bytes?: number) {
+  if (!bytes || bytes <= 0) {
+    return "0 B";
+  }
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const exponent = Math.min(
+    Math.floor(Math.log(bytes) / Math.log(1024)),
+    units.length - 1,
+  );
+  const value = bytes / 1024 ** exponent;
+  return `${value.toFixed(value >= 10 || exponent === 0 ? 0 : 1)} ${units[exponent]}`;
+}
+
+function mapScanSourceStatus(
+  status?: string,
+  watchEnabled?: boolean,
+): SourceStatus {
+  const normalized = (status || "").toLowerCase();
+  if (
+    normalized.includes("error") ||
+    normalized.includes("failed") ||
+    normalized.includes("invalid")
+  ) {
+    return "error";
+  }
+  if (
+    normalized.includes("disabled") ||
+    normalized.includes("pause") ||
+    normalized.includes("stopped") ||
+    watchEnabled === false
+  ) {
+    return "paused";
+  }
+  return "active";
+}
+
+function mapScanUpdateState(
+  updateType?: string,
+  hasUpdate?: boolean,
+): DocumentStatusRow["updateState"] {
+  const normalized = (updateType || "").toLowerCase();
+  if (normalized.includes("delete")) {
+    return "deleted";
+  }
+  if (normalized.includes("new") || normalized.includes("add")) {
+    return "new";
+  }
+  if (
+    normalized.includes("modify") ||
+    normalized.includes("change") ||
+    normalized.includes("update")
+  ) {
+    return "changed";
+  }
+  return hasUpdate ? "changed" : "unchanged";
+}
+
+function mapScanParseStatus(parseState?: string): DocumentStatusRow["parseStatus"] {
+  const normalized = (parseState || "").toLowerCase();
+  if (
+    normalized.includes("parsed") ||
+    normalized.includes("success") ||
+    normalized.includes("done")
+  ) {
+    return "parsed";
+  }
+  if (normalized.includes("reindex") || normalized.includes("running")) {
+    return "reindexing";
+  }
+  if (normalized.includes("duplicate")) {
+    return "duplicate";
+  }
+  if (normalized.includes("delete") || normalized.includes("removed")) {
+    return "deleted";
+  }
+  return "failed";
+}
+
+function mapScanSyncDetail(updateState: DocumentStatusRow["updateState"]) {
+  if (updateState === "new") {
+    return "新文件待入库";
+  }
+  if (updateState === "changed") {
+    return "内容变化待重解析";
+  }
+  if (updateState === "deleted") {
+    return "源端删除待清理";
+  }
+  return "当前文件已是最新";
+}
+
+function mapScanDocumentToDetail(item: ScanSourceDocumentItem): DocumentStatusRow {
+  const updateState = mapScanUpdateState(item.update_type, item.has_update);
+  const lastSyncedAt = formatDateTime(item.last_synced_at);
+  return {
+    id: `${item.document_id}`,
+    name: item.name,
+    path: item.path,
+    size: formatBytes(item.size_bytes),
+    tags: item.tags || [],
+    updateState,
+    syncDetail: item.update_desc || mapScanSyncDetail(updateState),
+    parseStatus: mapScanParseStatus(item.parse_state),
+    sourceUpdatedAt: lastSyncedAt || "-",
+    updatedAt: lastSyncedAt || "-",
+  };
+}
+
+function buildDetailSummaryFromSource(
+  source: ScanSource,
+  summary: ScanSourceDocumentsSummary | undefined,
+  documents: DocumentStatusRow[],
+): DataSourceSummary {
+  const lastSync = formatDateTime(source.updated_at) || "-";
+  return {
+    id: source.id,
+    name: source.name,
+    target: source.root_path,
+    documentCount: summary?.total_document_count || documents.length,
+    status: mapScanSourceStatus(source.status, source.watch_enabled),
+    lastSync,
+    addCount: summary?.new_count || 0,
+    deleteCount: summary?.deleted_count || 0,
+    changeCount: summary?.modified_count || 0,
+    storageUsed: formatBytes(summary?.storage_bytes),
+    documents,
+    scanManaged: true,
+    tenantId: source.tenant_id,
+    agentId: source.agent_id,
+  };
+}
+
+function isTreeNodeUpdated(node: ScanTreeNode) {
+  if (node.has_update === true) {
+    return true;
+  }
+  const normalized = (node.update_type || "").toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  if (normalized.includes("unchanged") || normalized.includes("none")) {
+    return false;
+  }
+  return true;
+}
+
+function filterScanTreeNodes(
+  nodes: ScanTreeNode[],
+  keyword: string,
+  statusFilter: SyncStatusFilter,
+): ScanTreeNode[] {
+  const normalizedKeyword = keyword.trim().toLowerCase();
+
+  const walk = (items: ScanTreeNode[]): ScanTreeNode[] =>
+    items
+      .map((node) => {
+        const children = node.children ? walk(node.children) : [];
+        const titleMatched =
+          !normalizedKeyword ||
+          node.title.toLowerCase().includes(normalizedKeyword) ||
+          node.key.toLowerCase().includes(normalizedKeyword);
+
+        if (node.is_dir) {
+          if (children.length > 0 || titleMatched) {
+            return {
+              ...node,
+              children: children.length > 0 ? children : undefined,
+            };
+          }
+          return null;
+        }
+
+        const isUpdated = isTreeNodeUpdated(node);
+        const statusMatched =
+          statusFilter === "updated" ? isUpdated : !isUpdated;
+        if (!titleMatched || !statusMatched) {
+          return null;
+        }
+
+        return {
+          ...node,
+          children: undefined,
+        };
+      })
+      .filter(Boolean) as ScanTreeNode[];
+
+  return walk(nodes);
+}
+
+function collectScanTreeFileKeys(nodes: ScanTreeNode[]): string[] {
+  const keys: string[] = [];
+  const walk = (items: ScanTreeNode[]) => {
+    items.forEach((node) => {
+      if (node.is_dir) {
+        if (node.children?.length) {
+          walk(node.children);
+        }
+        return;
+      }
+      keys.push(node.key);
+    });
+  };
+  walk(nodes);
+  return keys;
+}
+
+function collectScanTreeNodeKeys(nodes: ScanTreeNode[]): string[] {
+  const keys: string[] = [];
+  const walk = (items: ScanTreeNode[]) => {
+    items.forEach((node) => {
+      keys.push(node.key);
+      if (node.children?.length) {
+        walk(node.children);
+      }
+    });
+  };
+  walk(nodes);
+  return keys;
+}
+
+function shouldPollByParseStatus(items: DocumentStatusRow[]) {
+  return items.some(
+    (item) => item.parseStatus !== "parsed" && item.parseStatus !== "failed",
+  );
+}
+
 export default function DataSourceDetail() {
   const { t } = useTranslation();
   const navigate = useNavigate();
@@ -338,26 +595,29 @@ export default function DataSourceDetail() {
   const routeState = location.state as DataSourceDetailState | null;
   const routeSource = routeState?.source;
   const fallbackSource = fallbackSources[id];
-  const detailSource = routeSource
+  const initialSource = routeSource
     ? {
         ...routeSource,
-        storageUsed:
-          documentStatusMap[routeSource.id]?.storageUsed ||
-          fallbackSource?.storageUsed ||
-          "0 MB",
+        storageUsed: routeSource.storageUsed || documentStatusMap[routeSource.id]?.storageUsed || fallbackSource?.storageUsed || "0 B",
       }
     : fallbackSource;
 
-  const documentsSeed =
-    (detailSource && documentStatusMap[detailSource.id]?.documents) || [];
-  const [documents, setDocuments] = useState<DocumentStatusRow[]>(documentsSeed);
+  const initialDocumentsSeed =
+    routeSource?.documents || (initialSource && documentStatusMap[initialSource.id]?.documents) || [];
+  const [detailSource, setDetailSource] = useState<DataSourceSummary | undefined>(initialSource);
+  const [documents, setDocuments] = useState<DocumentStatusRow[]>(initialDocumentsSeed);
+  const [detailLoading, setDetailLoading] = useState(true);
   const [syncSelectedDocIds, setSyncSelectedDocIds] = useState<string[]>([]);
   const [syncPickerOpen, setSyncPickerOpen] = useState(false);
+  const [syncTreeNodes, setSyncTreeNodes] = useState<ScanTreeNode[]>([]);
+  const [syncTreeLoading, setSyncTreeLoading] = useState(false);
+  const [syncSelectionToken, setSyncSelectionToken] = useState<string>("");
+  const [syncSubmitting, setSyncSubmitting] = useState(false);
   const [syncKeyword, setSyncKeyword] = useState("");
   const [syncStatusFilter, setSyncStatusFilter] =
     useState<SyncStatusFilter>("updated");
   const [lastSync, setLastSync] = useState(
-    detailSource?.lastSync || t("admin.dataSourceNeverSynced"),
+    initialSource?.lastSync || t("admin.dataSourceNeverSynced"),
   );
   const [lastOperation, setLastOperation] = useState<{
     syncedCount: number;
@@ -365,16 +625,127 @@ export default function DataSourceDetail() {
     checkedCount: number;
     time: string;
   } | null>(null);
+  const syncPollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const syncPollingActiveRef = useRef(false);
+
+  const stopSyncPolling = useCallback(() => {
+    syncPollingActiveRef.current = false;
+    if (syncPollTimerRef.current) {
+      clearTimeout(syncPollTimerRef.current);
+      syncPollTimerRef.current = null;
+    }
+  }, []);
 
   useEffect(() => {
-    setDocuments(documentsSeed);
+    stopSyncPolling();
+    setDetailSource(initialSource);
+    setDocuments(initialDocumentsSeed);
     setSyncSelectedDocIds([]);
     setSyncPickerOpen(false);
-  }, [documentsSeed]);
+    setSyncTreeNodes([]);
+    setSyncTreeLoading(false);
+    setSyncSelectionToken("");
+    setSyncSubmitting(false);
+    setLastOperation(null);
+  }, [id, routeSource?.id, routeSource?.lastSync, stopSyncPolling]);
 
   useEffect(() => {
     setLastSync(detailSource?.lastSync || t("admin.dataSourceNeverSynced"));
   }, [detailSource?.lastSync, t]);
+
+  useEffect(() => () => {
+    stopSyncPolling();
+  }, [stopSyncPolling]);
+
+  const refreshDetailFromServer = useCallback(
+    async ({
+      setLoading = false,
+      showError = true,
+      resetSyncState = false,
+    }: {
+      setLoading?: boolean;
+      showError?: boolean;
+      resetSyncState?: boolean;
+    } = {}): Promise<DocumentStatusRow[] | null> => {
+      if (!id) {
+        return [];
+      }
+
+      if (setLoading) {
+        setDetailLoading(true);
+      }
+
+      try {
+        const client = createScanApiClient();
+        const sourceResponse = await client.apiScanSourcesIdGet({ id });
+        const source = sourceResponse.data;
+        const tenantId = source.tenant_id || routeSource?.tenantId;
+
+        if (!tenantId) {
+          throw new Error("缺少 tenant_id，无法加载数据源详情。");
+        }
+
+        const documentsResponse = await client.apiScanSourcesIdDocumentsGet({
+          id,
+          tenantId,
+          page: 1,
+          pageSize: 200,
+        });
+        const nextDocuments = (documentsResponse.data.items || []).map(
+          mapScanDocumentToDetail,
+        );
+        const nextSource = buildDetailSummaryFromSource(
+          source,
+          documentsResponse.data.summary,
+          nextDocuments,
+        );
+
+        setDetailSource(nextSource);
+        setDocuments(nextDocuments);
+        setLastSync(nextSource.lastSync || t("admin.dataSourceNeverSynced"));
+        if (resetSyncState) {
+          setSyncSelectedDocIds([]);
+          setSyncPickerOpen(false);
+        }
+
+        return nextDocuments;
+      } catch (error) {
+        if (showError) {
+          message.error(
+            getLocalizedErrorMessage(error, t("common.requestFailed")) ||
+              t("common.requestFailed"),
+          );
+        }
+        return null;
+      } finally {
+        if (setLoading) {
+          setDetailLoading(false);
+        }
+      }
+    },
+    [id, routeSource?.tenantId, t],
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadDetail = async () => {
+      const nextDocuments = await refreshDetailFromServer({
+        setLoading: true,
+        showError: !cancelled,
+        resetSyncState: true,
+      });
+      if (cancelled || nextDocuments === null) {
+        return;
+      }
+    };
+
+    void loadDetail();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [refreshDetailFromServer]);
 
   const filteredDocuments = useMemo(() => {
     const normalized = keyword.trim().toLowerCase();
@@ -402,167 +773,244 @@ export default function DataSourceDetail() {
   ).length;
   const sourceNameForPath = detailSource?.name || t("admin.dataSourceFallbackName");
 
-  const openSyncPicker = () => {
+  const openSyncPicker = async () => {
+    if (!detailSource?.agentId) {
+      message.error("未获取到扫描 Agent 信息，无法加载目录树。");
+      return;
+    }
+
+    if (!detailSource.target) {
+      message.error("未获取到同步路径，无法加载目录树。");
+      return;
+    }
+
     setSyncKeyword("");
     setSyncStatusFilter("updated");
-    setSyncSelectedDocIds(
-      documents
-        .filter((item) => isDocumentNeedSync(item.updateState))
-        .map((item) => item.id),
-    );
     setSyncPickerOpen(true);
+    setSyncTreeLoading(true);
+    setSyncSelectedDocIds([]);
+
+    try {
+      const client = createScanApiClient();
+      const response = await client.apiScanAgentsFsTreePost({
+        agentPathTreeRequest: {
+          agent_id: detailSource.agentId,
+          source_id: detailSource.id,
+          path: detailSource.target,
+          include_files: true,
+          changes_only: false,
+          max_depth: 8,
+        },
+      });
+
+      const nextTreeNodes = response.data.items || [];
+      const nextSelectionToken = response.data.selection_token || "";
+      const defaultSelected = collectScanTreeFileKeys(
+        filterScanTreeNodes(nextTreeNodes, "", "updated"),
+      );
+
+      setSyncTreeNodes(nextTreeNodes);
+      setSyncSelectionToken(nextSelectionToken);
+      setSyncSelectedDocIds(defaultSelected);
+    } catch (error) {
+      message.error(
+        getLocalizedErrorMessage(error, t("common.requestFailed")) ||
+          t("common.requestFailed"),
+      );
+      setSyncPickerOpen(false);
+    } finally {
+      setSyncTreeLoading(false);
+    }
   };
 
-  const runSyncPipeline = (targetDocumentIds: string[]) => {
+  const runSyncPipeline = async (targetDocumentIds: string[]) => {
     if (targetDocumentIds.length === 0) {
       message.warning(t("admin.dataSourceDetailSelectFileFirst"));
       return false;
     }
 
-    const targetSet = new Set(targetDocumentIds);
-    const currentTime = formatNow();
-    const checkedRows = documents.filter((item) => targetSet.has(item.id));
-    const syncRows = checkedRows.filter((item) => isDocumentNeedSync(item.updateState));
-    const checkedCount = checkedRows.length;
-    const syncedCount = syncRows.length;
-    const ignoredCount = checkedCount - syncedCount;
+    if (!detailSource?.id) {
+      message.error("未获取到数据源信息，无法发起拉取。");
+      return false;
+    }
 
-    if (syncedCount === 0) {
-      message.info(
-        t("admin.dataSourceDetailSyncNoChange", { checkedCount }),
+    const targetSet = new Set(targetDocumentIds);
+    const targetPaths = Array.from(targetSet);
+    const currentTime = formatNow();
+
+    stopSyncPolling();
+    setSyncSubmitting(true);
+    try {
+      const client = createScanApiClient();
+      const generateTasksRequest: {
+        mode: string;
+        paths: string[];
+        updated_only?: boolean;
+        selection_token?: string;
+      } = {
+        mode: "manual_pull",
+        paths: targetPaths,
+        updated_only: syncStatusFilter === "updated",
+      };
+      if (syncSelectionToken) {
+        generateTasksRequest.selection_token = syncSelectionToken;
+      }
+
+      const generateResponse = await client.apiScanSourcesIdTasksGeneratePost({
+        id: detailSource.id,
+        generateTasksRequest,
+      });
+      const result = generateResponse.data;
+      const checkedCount = result.requested_count ?? targetPaths.length;
+      const syncedCount = result.accepted_count ?? 0;
+      const ignoredCount =
+        result.ignored_unchanged_count ??
+        result.skipped_count ??
+        Math.max(checkedCount - syncedCount, 0);
+
+      const checkedRows = documents.filter(
+        (item) => targetSet.has(item.id) || targetSet.has(item.path),
       );
+      const hasDocumentMatch = checkedRows.length > 0;
+
+      if (hasDocumentMatch) {
+        setDocuments((prev) =>
+          prev
+            .map((item) => {
+              if (
+                (!targetSet.has(item.id) && !targetSet.has(item.path)) ||
+                !isDocumentNeedSync(item.updateState)
+              ) {
+                return item;
+              }
+
+              if (item.updateState === "deleted") {
+                return null;
+              }
+
+              return {
+                ...item,
+                updateState: "unchanged",
+                parseStatus: "parsed",
+                syncDetail: t("admin.dataSourceDetailManualSyncDone"),
+                updatedAt: currentTime,
+              };
+            })
+            .filter(Boolean) as DocumentStatusRow[],
+        );
+      }
+
+      setLastSync(currentTime);
       setLastOperation({
         syncedCount,
         ignoredCount,
         checkedCount,
         time: currentTime,
       });
+
+      if (syncedCount === 0) {
+        message.info(
+          t("admin.dataSourceDetailSyncNoChange", { checkedCount }),
+        );
+      } else {
+        message.success(
+          t("admin.dataSourceDetailSyncDone", {
+            syncedCount,
+            ignoredCount,
+          }),
+        );
+      }
+
+      setSyncSelectedDocIds([]);
+
+      const refreshedDocuments = await refreshDetailFromServer({
+        setLoading: false,
+        showError: true,
+        resetSyncState: false,
+      });
+      if (refreshedDocuments && shouldPollByParseStatus(refreshedDocuments)) {
+        syncPollingActiveRef.current = true;
+
+        const pollOnce = async () => {
+          if (!syncPollingActiveRef.current) {
+            return;
+          }
+
+          const latestDocuments = await refreshDetailFromServer({
+            setLoading: false,
+            showError: false,
+            resetSyncState: false,
+          });
+          if (!syncPollingActiveRef.current) {
+            return;
+          }
+
+          if (latestDocuments && !shouldPollByParseStatus(latestDocuments)) {
+            stopSyncPolling();
+            return;
+          }
+
+          syncPollTimerRef.current = setTimeout(pollOnce, 3000);
+        };
+
+        syncPollTimerRef.current = setTimeout(pollOnce, 3000);
+      }
+
       return true;
+    } catch (error) {
+      stopSyncPolling();
+      message.error(
+        getLocalizedErrorMessage(error, t("common.requestFailed")) ||
+          t("common.requestFailed"),
+      );
+      return false;
+    } finally {
+      setSyncSubmitting(false);
     }
-
-    setDocuments((prev) =>
-      prev
-        .map((item) => {
-          if (!targetSet.has(item.id) || !isDocumentNeedSync(item.updateState)) {
-            return item;
-          }
-
-          if (item.updateState === "deleted") {
-            return null;
-          }
-
-          return {
-            ...item,
-            updateState: "unchanged",
-            parseStatus: "parsed",
-            syncDetail: t("admin.dataSourceDetailManualSyncDone"),
-            updatedAt: currentTime,
-          };
-        })
-        .filter(Boolean) as DocumentStatusRow[],
-    );
-
-    setLastSync(currentTime);
-    setLastOperation({
-      syncedCount,
-      ignoredCount,
-      checkedCount,
-      time: currentTime,
-    });
-    message.success(
-      t("admin.dataSourceDetailSyncDone", {
-        syncedCount,
-        ignoredCount,
-      }),
-    );
-    setSyncSelectedDocIds([]);
-    return true;
   };
 
-  const filteredSyncDocuments = useMemo(() => {
-    const normalizedKeyword = syncKeyword.trim().toLowerCase();
-    return documents.filter((item) => {
-      const keywordMatched =
-        !normalizedKeyword ||
-        item.name.toLowerCase().includes(normalizedKeyword) ||
-        item.path.toLowerCase().includes(normalizedKeyword);
-      return keywordMatched && matchSyncStatus(item.updateState, syncStatusFilter);
-    });
-  }, [documents, syncKeyword, syncStatusFilter]);
+  const filteredSyncTreeNodes = useMemo(
+    () => filterScanTreeNodes(syncTreeNodes, syncKeyword, syncStatusFilter),
+    [syncTreeNodes, syncKeyword, syncStatusFilter],
+  );
 
   const syncTreeData = useMemo<DataNode[]>(() => {
-    if (filteredSyncDocuments.length === 0) {
-      return [];
-    }
+    const toDataNode = (nodes: ScanTreeNode[]): DataNode[] =>
+      nodes.map((node) => {
+        const children = node.children ? toDataNode(node.children) : undefined;
+        const updated = isTreeNodeUpdated(node);
 
-    type MutableNode = {
-      key: string;
-      title: ReactNode;
-      children: Map<string, MutableNode>;
-    };
-
-    const createDirNode = (key: string, title: string): MutableNode => ({
-      key,
-      title: <span>{title}</span>,
-      children: new Map<string, MutableNode>(),
-    });
-
-    const root = createDirNode("root", "root");
-
-    filteredSyncDocuments.forEach((item) => {
-      const segments = item.path.split("/").filter(Boolean);
-      const folderSegments = segments.slice(0, -1);
-      let currentNode = root;
-      let currentPath = "";
-
-      folderSegments.forEach((segment) => {
-        currentPath = `${currentPath}/${segment}`;
-        const key = `dir:${currentPath}`;
-        if (!currentNode.children.has(key)) {
-          currentNode.children.set(key, createDirNode(key, segment));
-        }
-        currentNode = currentNode.children.get(key)!;
-      });
-
-      const meta = getUpdateStateMeta(item.updateState, t);
-      const leafKey = `file:${item.id}`;
-      currentNode.children.set(leafKey, {
-        key: leafKey,
-        title: (
-          <div className="data-source-sync-tree-file">
-            <div className="data-source-sync-tree-file-main">
-              <span>{item.name}</span>
-              {isDocumentNeedSync(item.updateState) && (
-                <span
-                  className={`data-source-sync-tree-chip data-source-sync-tree-chip-${meta.tone}`}
-                >
-                  {meta.text}
-                </span>
-              )}
-            </div>
-          </div>
-        ),
-        children: new Map<string, MutableNode>(),
-      });
-    });
-
-    const toTreeData = (node: MutableNode): DataNode[] =>
-      Array.from(node.children.values()).map((child) => {
-        const children = toTreeData(child);
         return {
-          key: child.key,
-          title: child.title,
-          children: children.length > 0 ? children : undefined,
-          isLeaf: children.length === 0,
+          key: node.key,
+          isLeaf: !node.is_dir,
+          disableCheckbox: !node.is_dir && node.selectable === false,
+          title: node.is_dir ? (
+            <span>{node.title}</span>
+          ) : (
+            <div className="data-source-sync-tree-file">
+              <div className="data-source-sync-tree-file-main">
+                <span>{node.title}</span>
+                {updated ? (
+                  <span className="data-source-sync-tree-chip data-source-sync-tree-chip-changed">
+                    {t("admin.dataSourceFileUpdateChanged")}
+                  </span>
+                ) : null}
+              </div>
+            </div>
+          ),
+          children,
         };
       });
 
-    return toTreeData(root);
-  }, [filteredSyncDocuments, t]);
+    return toDataNode(filteredSyncTreeNodes);
+  }, [filteredSyncTreeNodes, t]);
 
-  const checkedTreeKeys = syncSelectedDocIds.map((id) => `file:${id}`);
-  const filteredSyncDocIds = filteredSyncDocuments.map((item) => item.id);
-  const hasFilteredSelected = filteredSyncDocIds.some((id) =>
+  const checkedTreeKeys = syncSelectedDocIds;
+  const filteredSyncNodeKeys = useMemo(
+    () => collectScanTreeNodeKeys(filteredSyncTreeNodes),
+    [filteredSyncTreeNodes],
+  );
+  const hasFilteredSelected = filteredSyncNodeKeys.some((id) =>
     syncSelectedDocIds.includes(id),
   );
 
@@ -679,6 +1127,22 @@ export default function DataSourceDetail() {
       width: 180,
     },
   ];
+
+  if (!detailSource && detailLoading) {
+    return (
+      <div className="admin-page data-source-detail-page">
+        <Button
+          type="link"
+          icon={<ArrowLeftOutlined />}
+          className="data-source-detail-back"
+          onClick={() => navigate("/admin/data-sources")}
+        >
+          {t("admin.dataSourceBackToList")}
+        </Button>
+        <Card loading />
+      </div>
+    );
+  }
 
   if (!detailSource) {
     return (
@@ -805,6 +1269,8 @@ export default function DataSourceDetail() {
           <Space wrap>
             <Button
               type="primary"
+              loading={detailLoading}
+              disabled={detailLoading}
               onClick={openSyncPicker}
             >
               {t("admin.dataSourceDetailSyncNow")}
@@ -824,6 +1290,7 @@ export default function DataSourceDetail() {
           rowKey="id"
           columns={columns}
           dataSource={filteredDocuments}
+          loading={detailLoading}
           pagination={{ pageSize: 8, showSizeChanger: false }}
           className="admin-page-table data-source-detail-table"
           locale={{ emptyText: t("admin.dataSourceDetailNoDocStatus") }}
@@ -834,11 +1301,15 @@ export default function DataSourceDetail() {
       <Modal
         title={t("admin.dataSourceDetailManualPullTitle")}
         open={syncPickerOpen}
-        onCancel={() => setSyncPickerOpen(false)}
+        onCancel={() => {
+          if (!syncSubmitting) {
+            setSyncPickerOpen(false);
+          }
+        }}
         okText={t("admin.dataSourceDetailStartPull", { count: syncSelectedDocIds.length })}
-        okButtonProps={{ disabled: syncSelectedDocIds.length === 0 }}
-        onOk={() => {
-          const finished = runSyncPipeline(syncSelectedDocIds);
+        okButtonProps={{ disabled: syncSelectedDocIds.length === 0 || syncSubmitting, loading: syncSubmitting }}
+        onOk={async () => {
+          const finished = await runSyncPipeline(syncSelectedDocIds);
           if (finished) {
             setSyncPickerOpen(false);
           }
@@ -870,17 +1341,17 @@ export default function DataSourceDetail() {
                 <Button
                   onClick={() =>
                     setSyncSelectedDocIds((prev) =>
-                      prev.filter((id) => !filteredSyncDocIds.includes(id)),
+                      prev.filter((id) => !filteredSyncNodeKeys.includes(id)),
                     )
                   }
-                  disabled={filteredSyncDocIds.length === 0}
+                  disabled={filteredSyncNodeKeys.length === 0}
                 >
                   {t("chat.cancelSelectAll")}
                 </Button>
               ) : (
                 <Button
-                  onClick={() => setSyncSelectedDocIds(filteredSyncDocIds)}
-                  disabled={filteredSyncDocIds.length === 0}
+                  onClick={() => setSyncSelectedDocIds(filteredSyncNodeKeys)}
+                  disabled={filteredSyncNodeKeys.length === 0}
                 >
                   {t("chat.selectAll")}
                 </Button>
@@ -895,7 +1366,9 @@ export default function DataSourceDetail() {
             description={t("admin.dataSourceDetailTreeSelectDesc")}
           />
 
-          {syncTreeData.length > 0 ? (
+          {syncTreeLoading ? (
+            <div className="data-source-sync-tree-loading">加载目录树中...</div>
+          ) : syncTreeData.length > 0 ? (
             <Tree
               checkable
               defaultExpandAll
@@ -904,11 +1377,7 @@ export default function DataSourceDetail() {
               className="data-source-sync-tree"
               onCheck={(keys) => {
                 const nextKeys = Array.isArray(keys) ? keys : keys.checked;
-                const fileIds = nextKeys
-                  .map((key) => `${key}`)
-                  .filter((key) => key.startsWith("file:"))
-                  .map((key) => key.slice("file:".length));
-                setSyncSelectedDocIds(fileIds);
+                setSyncSelectedDocIds(nextKeys.map((key) => `${key}`));
               }}
             />
           ) : (
