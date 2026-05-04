@@ -54,6 +54,7 @@ export interface AgentPathTreeRequest {
     'max_depth'?: number;
     'path': string;
     'source_id'?: string;
+    'updated_only'?: boolean;
 }
 export interface AgentPathTreeResponse {
     'items': Array<TreeNode>;
@@ -75,6 +76,47 @@ export interface ApiScanSourcesGet200Response {
 }
 export interface ApiV1AgentsCommandsAckPost200Response {
     'accepted': boolean;
+}
+export interface CloudSourceBinding {
+    'auth_connection_id': string;
+    'created_at': string;
+    'enabled': boolean;
+    'exclude_patterns'?: Array<string>;
+    'include_patterns'?: Array<string>;
+    'last_error'?: string;
+    'max_object_size_bytes'?: number;
+    'next_sync_at'?: string;
+    'provider': string;
+    'provider_options'?: { [key: string]: any; };
+    'reconcile_after_sync'?: boolean;
+    'reconcile_delay_minutes'?: number;
+    'schedule_expr': string;
+    'schedule_tz': string;
+    'source_id': string;
+    'status': string;
+    'target_ref'?: string;
+    'target_type'?: string;
+    'tenant_id': string;
+    'updated_at': string;
+}
+export interface CloudSyncRun {
+    'created_count'?: number;
+    'deleted_count'?: number;
+    'error_code'?: string;
+    'error_message'?: string;
+    'failed_count'?: number;
+    'finished_at'?: string;
+    'provider': string;
+    'remote_total'?: number;
+    'requested_paths'?: Array<string>;
+    'run_id': string;
+    'skipped_count'?: number;
+    'source_id': string;
+    'started_at'?: string;
+    'status': string;
+    'tenant_id': string;
+    'trigger_type': string;
+    'updated_count'?: number;
 }
 export interface CreateKnowledgeBaseRequest {
     'algo': CreateKnowledgeBaseRequestAlgo;
@@ -99,9 +141,13 @@ export interface CreateSourceRequest {
     'name': string;
     'reconcile_schedule'?: string;
     'reconcile_seconds'?: number;
-    'root_path': string;
+    'root_path'?: string;
     'tenant_id': string;
     'watch_enabled'?: boolean;
+}
+export interface DeleteSourceResponse {
+    'deleted': boolean;
+    'source_id': string;
 }
 export interface EnableWatchRequest {
     'reconcile_schedule'?: string;
@@ -162,6 +208,9 @@ export interface HeartbeatPayload {
     'tenant_id': string;
     'version'?: string;
 }
+export interface ListCloudSyncRunsResponse {
+    'items': Array<CloudSyncRun>;
+}
 export interface ListManualPullJobsResponse {
     'items': Array<ManualPullJob>;
     'page': number;
@@ -198,6 +247,7 @@ export interface ParseTaskDetailResponse {
     'core_dataset_id'?: string;
     'core_document_id'?: string;
     'core_task_id'?: string;
+    'core_task_state'?: string;
     'created_at': string;
     'current_version_id'?: string;
     'desired_version_id'?: string;
@@ -231,6 +281,7 @@ export interface ParseTaskListItem {
     'core_dataset_id'?: string;
     'core_document_id'?: string;
     'core_task_id'?: string;
+    'core_task_state'?: string;
     'created_at': string;
     'document_id': number;
     'finished_at'?: string;
@@ -380,8 +431,16 @@ export interface SourceDocumentsSummary {
     'storage_bytes': number;
     'total_document_count': number;
 }
+export interface SourcePathTreeRequest {
+    'changes_only'?: boolean;
+    'include_files'?: boolean;
+    'max_depth'?: number;
+    'path'?: string;
+    'updated_only'?: boolean;
+}
 export interface TreeNode {
     'children'?: Array<TreeNode>;
+    'core_task_state'?: string;
     'external_file_id'?: string;
     'has_update'?: boolean;
     'is_dir': boolean;
@@ -393,6 +452,14 @@ export interface TreeNode {
     'update_desc'?: string;
     'update_type'?: string;
 }
+export interface TriggerCloudSyncRequest {
+    'paths'?: Array<string>;
+    'trigger_type'?: string;
+}
+export interface TriggerCloudSyncResponse {
+    'accepted': boolean;
+    'run_id': string;
+}
 export interface UpdateSourceRequest {
     'dataset_id'?: string;
     'default_origin_platform'?: string;
@@ -403,6 +470,21 @@ export interface UpdateSourceRequest {
     'reconcile_schedule'?: string;
     'reconcile_seconds'?: number;
     'root_path'?: string;
+}
+export interface UpsertCloudSourceBindingRequest {
+    'auth_connection_id': string;
+    'enabled'?: boolean;
+    'exclude_patterns'?: Array<string>;
+    'include_patterns'?: Array<string>;
+    'max_object_size_bytes'?: number;
+    'provider': string;
+    'provider_options'?: { [key: string]: any; };
+    'reconcile_after_sync'?: boolean;
+    'reconcile_delay_minutes'?: number;
+    'schedule_expr'?: string;
+    'schedule_tz'?: string;
+    'target_ref'?: string;
+    'target_type'?: string;
 }
 export interface WatchToggleResponse {
     'accepted': boolean;
@@ -772,6 +854,191 @@ export const DefaultApiAxiosParamCreator = function (configuration?: Configurati
             }
 
             const localVarRequestOptions = { method: 'GET', ...baseOptions, ...options};
+            const localVarHeaderParameter = {} as any;
+            const localVarQueryParameter = {} as any;
+
+            localVarHeaderParameter['Accept'] = 'application/json';
+
+            setSearchParams(localVarUrlObj, localVarQueryParameter);
+            let headersFromBaseOptions = baseOptions && baseOptions.headers ? baseOptions.headers : {};
+            localVarRequestOptions.headers = {...localVarHeaderParameter, ...headersFromBaseOptions, ...options.headers};
+
+            return {
+                url: toPathString(localVarUrlObj),
+                options: localVarRequestOptions,
+            };
+        },
+        /**
+         * 
+         * @summary Get cloud binding
+         * @param {string} id 
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        apiScanSourcesIdCloudBindingGet: async (id: string, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+            // verify required parameter 'id' is not null or undefined
+            assertParamExists('apiScanSourcesIdCloudBindingGet', 'id', id)
+            const localVarPath = `/api/scan/sources/{id}/cloud/binding`
+                .replace(`{${"id"}}`, encodeURIComponent(String(id)));
+            // use dummy base URL string because the URL constructor only accepts absolute URLs.
+            const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
+            let baseOptions;
+            if (configuration) {
+                baseOptions = configuration.baseOptions;
+            }
+
+            const localVarRequestOptions = { method: 'GET', ...baseOptions, ...options};
+            const localVarHeaderParameter = {} as any;
+            const localVarQueryParameter = {} as any;
+
+            localVarHeaderParameter['Accept'] = 'application/json';
+
+            setSearchParams(localVarUrlObj, localVarQueryParameter);
+            let headersFromBaseOptions = baseOptions && baseOptions.headers ? baseOptions.headers : {};
+            localVarRequestOptions.headers = {...localVarHeaderParameter, ...headersFromBaseOptions, ...options.headers};
+
+            return {
+                url: toPathString(localVarUrlObj),
+                options: localVarRequestOptions,
+            };
+        },
+        /**
+         * 
+         * @summary Create or update cloud binding
+         * @param {string} id 
+         * @param {UpsertCloudSourceBindingRequest} upsertCloudSourceBindingRequest 
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        apiScanSourcesIdCloudBindingPost: async (id: string, upsertCloudSourceBindingRequest: UpsertCloudSourceBindingRequest, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+            // verify required parameter 'id' is not null or undefined
+            assertParamExists('apiScanSourcesIdCloudBindingPost', 'id', id)
+            // verify required parameter 'upsertCloudSourceBindingRequest' is not null or undefined
+            assertParamExists('apiScanSourcesIdCloudBindingPost', 'upsertCloudSourceBindingRequest', upsertCloudSourceBindingRequest)
+            const localVarPath = `/api/scan/sources/{id}/cloud/binding`
+                .replace(`{${"id"}}`, encodeURIComponent(String(id)));
+            // use dummy base URL string because the URL constructor only accepts absolute URLs.
+            const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
+            let baseOptions;
+            if (configuration) {
+                baseOptions = configuration.baseOptions;
+            }
+
+            const localVarRequestOptions = { method: 'POST', ...baseOptions, ...options};
+            const localVarHeaderParameter = {} as any;
+            const localVarQueryParameter = {} as any;
+
+            localVarHeaderParameter['Content-Type'] = 'application/json';
+            localVarHeaderParameter['Accept'] = 'application/json';
+
+            setSearchParams(localVarUrlObj, localVarQueryParameter);
+            let headersFromBaseOptions = baseOptions && baseOptions.headers ? baseOptions.headers : {};
+            localVarRequestOptions.headers = {...localVarHeaderParameter, ...headersFromBaseOptions, ...options.headers};
+            localVarRequestOptions.data = serializeDataIfNeeded(upsertCloudSourceBindingRequest, localVarRequestOptions, configuration)
+
+            return {
+                url: toPathString(localVarUrlObj),
+                options: localVarRequestOptions,
+            };
+        },
+        /**
+         * 
+         * @summary List cloud sync runs
+         * @param {string} id 
+         * @param {number} [limit] 
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        apiScanSourcesIdCloudSyncRunsGet: async (id: string, limit?: number, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+            // verify required parameter 'id' is not null or undefined
+            assertParamExists('apiScanSourcesIdCloudSyncRunsGet', 'id', id)
+            const localVarPath = `/api/scan/sources/{id}/cloud/sync/runs`
+                .replace(`{${"id"}}`, encodeURIComponent(String(id)));
+            // use dummy base URL string because the URL constructor only accepts absolute URLs.
+            const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
+            let baseOptions;
+            if (configuration) {
+                baseOptions = configuration.baseOptions;
+            }
+
+            const localVarRequestOptions = { method: 'GET', ...baseOptions, ...options};
+            const localVarHeaderParameter = {} as any;
+            const localVarQueryParameter = {} as any;
+
+            if (limit !== undefined) {
+                localVarQueryParameter['limit'] = limit;
+            }
+
+            localVarHeaderParameter['Accept'] = 'application/json';
+
+            setSearchParams(localVarUrlObj, localVarQueryParameter);
+            let headersFromBaseOptions = baseOptions && baseOptions.headers ? baseOptions.headers : {};
+            localVarRequestOptions.headers = {...localVarHeaderParameter, ...headersFromBaseOptions, ...options.headers};
+
+            return {
+                url: toPathString(localVarUrlObj),
+                options: localVarRequestOptions,
+            };
+        },
+        /**
+         * 
+         * @summary Trigger cloud sync once
+         * @param {string} id 
+         * @param {TriggerCloudSyncRequest} triggerCloudSyncRequest 
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        apiScanSourcesIdCloudSyncTriggerPost: async (id: string, triggerCloudSyncRequest: TriggerCloudSyncRequest, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+            // verify required parameter 'id' is not null or undefined
+            assertParamExists('apiScanSourcesIdCloudSyncTriggerPost', 'id', id)
+            // verify required parameter 'triggerCloudSyncRequest' is not null or undefined
+            assertParamExists('apiScanSourcesIdCloudSyncTriggerPost', 'triggerCloudSyncRequest', triggerCloudSyncRequest)
+            const localVarPath = `/api/scan/sources/{id}/cloud/sync/trigger`
+                .replace(`{${"id"}}`, encodeURIComponent(String(id)));
+            // use dummy base URL string because the URL constructor only accepts absolute URLs.
+            const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
+            let baseOptions;
+            if (configuration) {
+                baseOptions = configuration.baseOptions;
+            }
+
+            const localVarRequestOptions = { method: 'POST', ...baseOptions, ...options};
+            const localVarHeaderParameter = {} as any;
+            const localVarQueryParameter = {} as any;
+
+            localVarHeaderParameter['Content-Type'] = 'application/json';
+            localVarHeaderParameter['Accept'] = 'application/json';
+
+            setSearchParams(localVarUrlObj, localVarQueryParameter);
+            let headersFromBaseOptions = baseOptions && baseOptions.headers ? baseOptions.headers : {};
+            localVarRequestOptions.headers = {...localVarHeaderParameter, ...headersFromBaseOptions, ...options.headers};
+            localVarRequestOptions.data = serializeDataIfNeeded(triggerCloudSyncRequest, localVarRequestOptions, configuration)
+
+            return {
+                url: toPathString(localVarUrlObj),
+                options: localVarRequestOptions,
+            };
+        },
+        /**
+         * 
+         * @summary Delete source
+         * @param {string} id 
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        apiScanSourcesIdDelete: async (id: string, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+            // verify required parameter 'id' is not null or undefined
+            assertParamExists('apiScanSourcesIdDelete', 'id', id)
+            const localVarPath = `/api/scan/sources/{id}`
+                .replace(`{${"id"}}`, encodeURIComponent(String(id)));
+            // use dummy base URL string because the URL constructor only accepts absolute URLs.
+            const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
+            let baseOptions;
+            if (configuration) {
+                baseOptions = configuration.baseOptions;
+            }
+
+            const localVarRequestOptions = { method: 'DELETE', ...baseOptions, ...options};
             const localVarHeaderParameter = {} as any;
             const localVarQueryParameter = {} as any;
 
@@ -1300,6 +1567,76 @@ export const DefaultApiAxiosParamCreator = function (configuration?: Configurati
         },
         /**
          * 
+         * @summary Get directory tree via agent
+         * @param {AgentPathTreeRequest} agentPathTreeRequest 
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        apiV1AgentsFsTreePost: async (agentPathTreeRequest: AgentPathTreeRequest, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+            // verify required parameter 'agentPathTreeRequest' is not null or undefined
+            assertParamExists('apiV1AgentsFsTreePost', 'agentPathTreeRequest', agentPathTreeRequest)
+            const localVarPath = `/api/v1/agents/fs/tree`;
+            // use dummy base URL string because the URL constructor only accepts absolute URLs.
+            const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
+            let baseOptions;
+            if (configuration) {
+                baseOptions = configuration.baseOptions;
+            }
+
+            const localVarRequestOptions = { method: 'POST', ...baseOptions, ...options};
+            const localVarHeaderParameter = {} as any;
+            const localVarQueryParameter = {} as any;
+
+            localVarHeaderParameter['Content-Type'] = 'application/json';
+            localVarHeaderParameter['Accept'] = 'application/json';
+
+            setSearchParams(localVarUrlObj, localVarQueryParameter);
+            let headersFromBaseOptions = baseOptions && baseOptions.headers ? baseOptions.headers : {};
+            localVarRequestOptions.headers = {...localVarHeaderParameter, ...headersFromBaseOptions, ...options.headers};
+            localVarRequestOptions.data = serializeDataIfNeeded(agentPathTreeRequest, localVarRequestOptions, configuration)
+
+            return {
+                url: toPathString(localVarUrlObj),
+                options: localVarRequestOptions,
+            };
+        },
+        /**
+         * 
+         * @summary Validate path via agent
+         * @param {AgentPathRequest} agentPathRequest 
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        apiV1AgentsFsValidatePost: async (agentPathRequest: AgentPathRequest, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+            // verify required parameter 'agentPathRequest' is not null or undefined
+            assertParamExists('apiV1AgentsFsValidatePost', 'agentPathRequest', agentPathRequest)
+            const localVarPath = `/api/v1/agents/fs/validate`;
+            // use dummy base URL string because the URL constructor only accepts absolute URLs.
+            const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
+            let baseOptions;
+            if (configuration) {
+                baseOptions = configuration.baseOptions;
+            }
+
+            const localVarRequestOptions = { method: 'POST', ...baseOptions, ...options};
+            const localVarHeaderParameter = {} as any;
+            const localVarQueryParameter = {} as any;
+
+            localVarHeaderParameter['Content-Type'] = 'application/json';
+            localVarHeaderParameter['Accept'] = 'application/json';
+
+            setSearchParams(localVarUrlObj, localVarQueryParameter);
+            let headersFromBaseOptions = baseOptions && baseOptions.headers ? baseOptions.headers : {};
+            localVarRequestOptions.headers = {...localVarHeaderParameter, ...headersFromBaseOptions, ...options.headers};
+            localVarRequestOptions.data = serializeDataIfNeeded(agentPathRequest, localVarRequestOptions, configuration)
+
+            return {
+                url: toPathString(localVarUrlObj),
+                options: localVarRequestOptions,
+            };
+        },
+        /**
+         * 
          * @summary Report heartbeat
          * @param {HeartbeatPayload} heartbeatPayload 
          * @param {*} [options] Override http request option.
@@ -1648,6 +1985,74 @@ export const DefaultApiFp = function(configuration?: Configuration) {
         },
         /**
          * 
+         * @summary Get cloud binding
+         * @param {string} id 
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        async apiScanSourcesIdCloudBindingGet(id: string, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<CloudSourceBinding>> {
+            const localVarAxiosArgs = await localVarAxiosParamCreator.apiScanSourcesIdCloudBindingGet(id, options);
+            const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
+            const localVarOperationServerBasePath = operationServerMap['DefaultApi.apiScanSourcesIdCloudBindingGet']?.[localVarOperationServerIndex]?.url;
+            return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
+        },
+        /**
+         * 
+         * @summary Create or update cloud binding
+         * @param {string} id 
+         * @param {UpsertCloudSourceBindingRequest} upsertCloudSourceBindingRequest 
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        async apiScanSourcesIdCloudBindingPost(id: string, upsertCloudSourceBindingRequest: UpsertCloudSourceBindingRequest, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<CloudSourceBinding>> {
+            const localVarAxiosArgs = await localVarAxiosParamCreator.apiScanSourcesIdCloudBindingPost(id, upsertCloudSourceBindingRequest, options);
+            const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
+            const localVarOperationServerBasePath = operationServerMap['DefaultApi.apiScanSourcesIdCloudBindingPost']?.[localVarOperationServerIndex]?.url;
+            return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
+        },
+        /**
+         * 
+         * @summary List cloud sync runs
+         * @param {string} id 
+         * @param {number} [limit] 
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        async apiScanSourcesIdCloudSyncRunsGet(id: string, limit?: number, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<ListCloudSyncRunsResponse>> {
+            const localVarAxiosArgs = await localVarAxiosParamCreator.apiScanSourcesIdCloudSyncRunsGet(id, limit, options);
+            const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
+            const localVarOperationServerBasePath = operationServerMap['DefaultApi.apiScanSourcesIdCloudSyncRunsGet']?.[localVarOperationServerIndex]?.url;
+            return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
+        },
+        /**
+         * 
+         * @summary Trigger cloud sync once
+         * @param {string} id 
+         * @param {TriggerCloudSyncRequest} triggerCloudSyncRequest 
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        async apiScanSourcesIdCloudSyncTriggerPost(id: string, triggerCloudSyncRequest: TriggerCloudSyncRequest, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<TriggerCloudSyncResponse>> {
+            const localVarAxiosArgs = await localVarAxiosParamCreator.apiScanSourcesIdCloudSyncTriggerPost(id, triggerCloudSyncRequest, options);
+            const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
+            const localVarOperationServerBasePath = operationServerMap['DefaultApi.apiScanSourcesIdCloudSyncTriggerPost']?.[localVarOperationServerIndex]?.url;
+            return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
+        },
+        /**
+         * 
+         * @summary Delete source
+         * @param {string} id 
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        async apiScanSourcesIdDelete(id: string, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<DeleteSourceResponse>> {
+            const localVarAxiosArgs = await localVarAxiosParamCreator.apiScanSourcesIdDelete(id, options);
+            const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
+            const localVarOperationServerBasePath = operationServerMap['DefaultApi.apiScanSourcesIdDelete']?.[localVarOperationServerIndex]?.url;
+            return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
+        },
+        /**
+         * 
          * @summary Disable source
          * @param {string} id 
          * @param {*} [options] Override http request option.
@@ -1826,6 +2231,32 @@ export const DefaultApiFp = function(configuration?: Configuration) {
             const localVarAxiosArgs = await localVarAxiosParamCreator.apiV1AgentsEventsPost(reportEventsRequest, options);
             const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
             const localVarOperationServerBasePath = operationServerMap['DefaultApi.apiV1AgentsEventsPost']?.[localVarOperationServerIndex]?.url;
+            return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
+        },
+        /**
+         * 
+         * @summary Get directory tree via agent
+         * @param {AgentPathTreeRequest} agentPathTreeRequest 
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        async apiV1AgentsFsTreePost(agentPathTreeRequest: AgentPathTreeRequest, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<AgentPathTreeResponse>> {
+            const localVarAxiosArgs = await localVarAxiosParamCreator.apiV1AgentsFsTreePost(agentPathTreeRequest, options);
+            const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
+            const localVarOperationServerBasePath = operationServerMap['DefaultApi.apiV1AgentsFsTreePost']?.[localVarOperationServerIndex]?.url;
+            return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
+        },
+        /**
+         * 
+         * @summary Validate path via agent
+         * @param {AgentPathRequest} agentPathRequest 
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        async apiV1AgentsFsValidatePost(agentPathRequest: AgentPathRequest, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<AgentPathValidateResponse>> {
+            const localVarAxiosArgs = await localVarAxiosParamCreator.apiV1AgentsFsValidatePost(agentPathRequest, options);
+            const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
+            const localVarOperationServerBasePath = operationServerMap['DefaultApi.apiV1AgentsFsValidatePost']?.[localVarOperationServerIndex]?.url;
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
         },
         /**
@@ -2014,6 +2445,56 @@ export const DefaultApiFactory = function (configuration?: Configuration, basePa
         },
         /**
          * 
+         * @summary Get cloud binding
+         * @param {DefaultApiApiScanSourcesIdCloudBindingGetRequest} requestParameters Request parameters.
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        apiScanSourcesIdCloudBindingGet(requestParameters: DefaultApiApiScanSourcesIdCloudBindingGetRequest, options?: RawAxiosRequestConfig): AxiosPromise<CloudSourceBinding> {
+            return localVarFp.apiScanSourcesIdCloudBindingGet(requestParameters.id, options).then((request) => request(axios, basePath));
+        },
+        /**
+         * 
+         * @summary Create or update cloud binding
+         * @param {DefaultApiApiScanSourcesIdCloudBindingPostRequest} requestParameters Request parameters.
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        apiScanSourcesIdCloudBindingPost(requestParameters: DefaultApiApiScanSourcesIdCloudBindingPostRequest, options?: RawAxiosRequestConfig): AxiosPromise<CloudSourceBinding> {
+            return localVarFp.apiScanSourcesIdCloudBindingPost(requestParameters.id, requestParameters.upsertCloudSourceBindingRequest, options).then((request) => request(axios, basePath));
+        },
+        /**
+         * 
+         * @summary List cloud sync runs
+         * @param {DefaultApiApiScanSourcesIdCloudSyncRunsGetRequest} requestParameters Request parameters.
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        apiScanSourcesIdCloudSyncRunsGet(requestParameters: DefaultApiApiScanSourcesIdCloudSyncRunsGetRequest, options?: RawAxiosRequestConfig): AxiosPromise<ListCloudSyncRunsResponse> {
+            return localVarFp.apiScanSourcesIdCloudSyncRunsGet(requestParameters.id, requestParameters.limit, options).then((request) => request(axios, basePath));
+        },
+        /**
+         * 
+         * @summary Trigger cloud sync once
+         * @param {DefaultApiApiScanSourcesIdCloudSyncTriggerPostRequest} requestParameters Request parameters.
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        apiScanSourcesIdCloudSyncTriggerPost(requestParameters: DefaultApiApiScanSourcesIdCloudSyncTriggerPostRequest, options?: RawAxiosRequestConfig): AxiosPromise<TriggerCloudSyncResponse> {
+            return localVarFp.apiScanSourcesIdCloudSyncTriggerPost(requestParameters.id, requestParameters.triggerCloudSyncRequest, options).then((request) => request(axios, basePath));
+        },
+        /**
+         * 
+         * @summary Delete source
+         * @param {DefaultApiApiScanSourcesIdDeleteRequest} requestParameters Request parameters.
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        apiScanSourcesIdDelete(requestParameters: DefaultApiApiScanSourcesIdDeleteRequest, options?: RawAxiosRequestConfig): AxiosPromise<DeleteSourceResponse> {
+            return localVarFp.apiScanSourcesIdDelete(requestParameters.id, options).then((request) => request(axios, basePath));
+        },
+        /**
+         * 
          * @summary Disable source
          * @param {DefaultApiApiScanSourcesIdDisablePostRequest} requestParameters Request parameters.
          * @param {*} [options] Override http request option.
@@ -2141,6 +2622,26 @@ export const DefaultApiFactory = function (configuration?: Configuration, basePa
          */
         apiV1AgentsEventsPost(requestParameters: DefaultApiApiV1AgentsEventsPostRequest, options?: RawAxiosRequestConfig): AxiosPromise<ApiV1AgentsCommandsAckPost200Response> {
             return localVarFp.apiV1AgentsEventsPost(requestParameters.reportEventsRequest, options).then((request) => request(axios, basePath));
+        },
+        /**
+         * 
+         * @summary Get directory tree via agent
+         * @param {DefaultApiApiV1AgentsFsTreePostRequest} requestParameters Request parameters.
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        apiV1AgentsFsTreePost(requestParameters: DefaultApiApiV1AgentsFsTreePostRequest, options?: RawAxiosRequestConfig): AxiosPromise<AgentPathTreeResponse> {
+            return localVarFp.apiV1AgentsFsTreePost(requestParameters.agentPathTreeRequest, options).then((request) => request(axios, basePath));
+        },
+        /**
+         * 
+         * @summary Validate path via agent
+         * @param {DefaultApiApiV1AgentsFsValidatePostRequest} requestParameters Request parameters.
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        apiV1AgentsFsValidatePost(requestParameters: DefaultApiApiV1AgentsFsValidatePostRequest, options?: RawAxiosRequestConfig): AxiosPromise<AgentPathValidateResponse> {
+            return localVarFp.apiV1AgentsFsValidatePost(requestParameters.agentPathRequest, options).then((request) => request(axios, basePath));
         },
         /**
          * 
@@ -2273,6 +2774,47 @@ export interface DefaultApiApiScanParseTasksStatsGetRequest {
 }
 
 /**
+ * Request parameters for apiScanSourcesIdCloudBindingGet operation in DefaultApi.
+ */
+export interface DefaultApiApiScanSourcesIdCloudBindingGetRequest {
+    readonly id: string
+}
+
+/**
+ * Request parameters for apiScanSourcesIdCloudBindingPost operation in DefaultApi.
+ */
+export interface DefaultApiApiScanSourcesIdCloudBindingPostRequest {
+    readonly id: string
+
+    readonly upsertCloudSourceBindingRequest: UpsertCloudSourceBindingRequest
+}
+
+/**
+ * Request parameters for apiScanSourcesIdCloudSyncRunsGet operation in DefaultApi.
+ */
+export interface DefaultApiApiScanSourcesIdCloudSyncRunsGetRequest {
+    readonly id: string
+
+    readonly limit?: number
+}
+
+/**
+ * Request parameters for apiScanSourcesIdCloudSyncTriggerPost operation in DefaultApi.
+ */
+export interface DefaultApiApiScanSourcesIdCloudSyncTriggerPostRequest {
+    readonly id: string
+
+    readonly triggerCloudSyncRequest: TriggerCloudSyncRequest
+}
+
+/**
+ * Request parameters for apiScanSourcesIdDelete operation in DefaultApi.
+ */
+export interface DefaultApiApiScanSourcesIdDeleteRequest {
+    readonly id: string
+}
+
+/**
  * Request parameters for apiScanSourcesIdDisablePost operation in DefaultApi.
  */
 export interface DefaultApiApiScanSourcesIdDisablePostRequest {
@@ -2387,6 +2929,20 @@ export interface DefaultApiApiV1AgentsCommandsAckPostRequest {
  */
 export interface DefaultApiApiV1AgentsEventsPostRequest {
     readonly reportEventsRequest: ReportEventsRequest
+}
+
+/**
+ * Request parameters for apiV1AgentsFsTreePost operation in DefaultApi.
+ */
+export interface DefaultApiApiV1AgentsFsTreePostRequest {
+    readonly agentPathTreeRequest: AgentPathTreeRequest
+}
+
+/**
+ * Request parameters for apiV1AgentsFsValidatePost operation in DefaultApi.
+ */
+export interface DefaultApiApiV1AgentsFsValidatePostRequest {
+    readonly agentPathRequest: AgentPathRequest
 }
 
 /**
@@ -2538,6 +3094,61 @@ export class DefaultApi extends BaseAPI {
 
     /**
      * 
+     * @summary Get cloud binding
+     * @param {DefaultApiApiScanSourcesIdCloudBindingGetRequest} requestParameters Request parameters.
+     * @param {*} [options] Override http request option.
+     * @throws {RequiredError}
+     */
+    public apiScanSourcesIdCloudBindingGet(requestParameters: DefaultApiApiScanSourcesIdCloudBindingGetRequest, options?: RawAxiosRequestConfig) {
+        return DefaultApiFp(this.configuration).apiScanSourcesIdCloudBindingGet(requestParameters.id, options).then((request) => request(this.axios, this.basePath));
+    }
+
+    /**
+     * 
+     * @summary Create or update cloud binding
+     * @param {DefaultApiApiScanSourcesIdCloudBindingPostRequest} requestParameters Request parameters.
+     * @param {*} [options] Override http request option.
+     * @throws {RequiredError}
+     */
+    public apiScanSourcesIdCloudBindingPost(requestParameters: DefaultApiApiScanSourcesIdCloudBindingPostRequest, options?: RawAxiosRequestConfig) {
+        return DefaultApiFp(this.configuration).apiScanSourcesIdCloudBindingPost(requestParameters.id, requestParameters.upsertCloudSourceBindingRequest, options).then((request) => request(this.axios, this.basePath));
+    }
+
+    /**
+     * 
+     * @summary List cloud sync runs
+     * @param {DefaultApiApiScanSourcesIdCloudSyncRunsGetRequest} requestParameters Request parameters.
+     * @param {*} [options] Override http request option.
+     * @throws {RequiredError}
+     */
+    public apiScanSourcesIdCloudSyncRunsGet(requestParameters: DefaultApiApiScanSourcesIdCloudSyncRunsGetRequest, options?: RawAxiosRequestConfig) {
+        return DefaultApiFp(this.configuration).apiScanSourcesIdCloudSyncRunsGet(requestParameters.id, requestParameters.limit, options).then((request) => request(this.axios, this.basePath));
+    }
+
+    /**
+     * 
+     * @summary Trigger cloud sync once
+     * @param {DefaultApiApiScanSourcesIdCloudSyncTriggerPostRequest} requestParameters Request parameters.
+     * @param {*} [options] Override http request option.
+     * @throws {RequiredError}
+     */
+    public apiScanSourcesIdCloudSyncTriggerPost(requestParameters: DefaultApiApiScanSourcesIdCloudSyncTriggerPostRequest, options?: RawAxiosRequestConfig) {
+        return DefaultApiFp(this.configuration).apiScanSourcesIdCloudSyncTriggerPost(requestParameters.id, requestParameters.triggerCloudSyncRequest, options).then((request) => request(this.axios, this.basePath));
+    }
+
+    /**
+     * 
+     * @summary Delete source
+     * @param {DefaultApiApiScanSourcesIdDeleteRequest} requestParameters Request parameters.
+     * @param {*} [options] Override http request option.
+     * @throws {RequiredError}
+     */
+    public apiScanSourcesIdDelete(requestParameters: DefaultApiApiScanSourcesIdDeleteRequest, options?: RawAxiosRequestConfig) {
+        return DefaultApiFp(this.configuration).apiScanSourcesIdDelete(requestParameters.id, options).then((request) => request(this.axios, this.basePath));
+    }
+
+    /**
+     * 
      * @summary Disable source
      * @param {DefaultApiApiScanSourcesIdDisablePostRequest} requestParameters Request parameters.
      * @param {*} [options] Override http request option.
@@ -2677,6 +3288,28 @@ export class DefaultApi extends BaseAPI {
      */
     public apiV1AgentsEventsPost(requestParameters: DefaultApiApiV1AgentsEventsPostRequest, options?: RawAxiosRequestConfig) {
         return DefaultApiFp(this.configuration).apiV1AgentsEventsPost(requestParameters.reportEventsRequest, options).then((request) => request(this.axios, this.basePath));
+    }
+
+    /**
+     * 
+     * @summary Get directory tree via agent
+     * @param {DefaultApiApiV1AgentsFsTreePostRequest} requestParameters Request parameters.
+     * @param {*} [options] Override http request option.
+     * @throws {RequiredError}
+     */
+    public apiV1AgentsFsTreePost(requestParameters: DefaultApiApiV1AgentsFsTreePostRequest, options?: RawAxiosRequestConfig) {
+        return DefaultApiFp(this.configuration).apiV1AgentsFsTreePost(requestParameters.agentPathTreeRequest, options).then((request) => request(this.axios, this.basePath));
+    }
+
+    /**
+     * 
+     * @summary Validate path via agent
+     * @param {DefaultApiApiV1AgentsFsValidatePostRequest} requestParameters Request parameters.
+     * @param {*} [options] Override http request option.
+     * @throws {RequiredError}
+     */
+    public apiV1AgentsFsValidatePost(requestParameters: DefaultApiApiV1AgentsFsValidatePostRequest, options?: RawAxiosRequestConfig) {
+        return DefaultApiFp(this.configuration).apiV1AgentsFsValidatePost(requestParameters.agentPathRequest, options).then((request) => request(this.axios, this.basePath));
     }
 
     /**

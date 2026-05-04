@@ -1,5 +1,7 @@
 .data-source-detail-page {
-  gap: 20px;
+  gap: 16px;
+  padding: 12px;
+  min-width: 0;
 }
 
 .data-source-detail-back.ant-btn {
@@ -41,14 +43,15 @@
 }
 
 .data-source-detail-stat-card.ant-card {
-  min-height: 160px;
+  min-height: 112px;
 
   .ant-card-body {
     height: 100%;
+    padding: 18px 24px;
     display: flex;
     flex-direction: column;
     justify-content: center;
-    gap: 14px;
+    gap: 10px;
   }
 }
 
@@ -59,17 +62,17 @@
 }
 
 .data-source-detail-stat-value {
-  font-size: 26px;
+  font-size: 24px;
   font-weight: 700;
   color: #1d2939;
-  line-height: 1.25;
+  line-height: 1.2;
   word-break: break-word;
 
   &.path {
     font-family:
       ui-monospace, SFMono-Regular, SFMono-Regular, Menlo, Monaco, Consolas,
       "Liberation Mono", "Courier New", monospace;
-    font-size: 18px;
+    font-size: 17px;
   }
 
   span {
@@ -85,7 +88,23 @@
   border-radius: 10px;
 }
 
+.data-source-detail-doc-card.ant-card {
+  min-width: 0;
+
+  .ant-card-head {
+    gap: 12px;
+  }
+
+  .ant-card-head-title,
+  .ant-card-extra,
+  .ant-card-body {
+    min-width: 0;
+  }
+}
+
 .data-source-detail-table.ant-table-wrapper {
+  min-width: 0;
+
   .ant-table {
     border-radius: 16px;
     overflow: hidden;
@@ -102,6 +121,14 @@
     padding-top: 18px;
     padding-bottom: 18px;
     vertical-align: middle;
+  }
+
+  .ant-table-container {
+    min-width: 0;
+  }
+
+  .ant-table-body {
+    scrollbar-gutter: stable;
   }
 }
 

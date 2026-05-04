@@ -78,6 +78,8 @@ components:
                     type: string
                 source_id:
                     type: string
+                updated_only:
+                    type: boolean
             required:
                 - agent_id
                 - path
@@ -113,6 +115,124 @@ components:
                 - readable
                 - is_dir
                 - allowed
+            type: object
+        CloudSourceBinding:
+            properties:
+                auth_connection_id:
+                    type: string
+                created_at:
+                    format: date-time
+                    type: string
+                enabled:
+                    type: boolean
+                exclude_patterns:
+                    items:
+                        type: string
+                    type: array
+                include_patterns:
+                    items:
+                        type: string
+                    type: array
+                last_error:
+                    type: string
+                max_object_size_bytes:
+                    format: int64
+                    type: integer
+                next_sync_at:
+                    format: date-time
+                    type: string
+                provider:
+                    type: string
+                provider_options:
+                    additionalProperties: true
+                    type: object
+                reconcile_after_sync:
+                    type: boolean
+                reconcile_delay_minutes:
+                    format: int64
+                    type: integer
+                schedule_expr:
+                    type: string
+                schedule_tz:
+                    type: string
+                source_id:
+                    type: string
+                status:
+                    type: string
+                target_ref:
+                    type: string
+                target_type:
+                    type: string
+                tenant_id:
+                    type: string
+                updated_at:
+                    format: date-time
+                    type: string
+            required:
+                - source_id
+                - tenant_id
+                - provider
+                - enabled
+                - status
+                - auth_connection_id
+                - schedule_expr
+                - schedule_tz
+                - created_at
+                - updated_at
+            type: object
+        CloudSyncRun:
+            properties:
+                created_count:
+                    format: int64
+                    type: integer
+                deleted_count:
+                    format: int64
+                    type: integer
+                error_code:
+                    type: string
+                error_message:
+                    type: string
+                failed_count:
+                    format: int64
+                    type: integer
+                finished_at:
+                    format: date-time
+                    type: string
+                provider:
+                    type: string
+                remote_total:
+                    format: int64
+                    type: integer
+                requested_paths:
+                    items:
+                        type: string
+                    type: array
+                run_id:
+                    type: string
+                skipped_count:
+                    format: int64
+                    type: integer
+                source_id:
+                    type: string
+                started_at:
+                    format: date-time
+                    type: string
+                status:
+                    type: string
+                tenant_id:
+                    type: string
+                trigger_type:
+                    type: string
+                updated_count:
+                    format: int64
+                    type: integer
+            required:
+                - run_id
+                - source_id
+                - tenant_id
+                - provider
+                - trigger_type
+                - status
             type: object
         CreateKnowledgeBaseRequest:
             properties:
@@ -174,8 +294,17 @@ components:
             required:
                 - tenant_id
                 - name
-                - root_path
                 - agent_id
+            type: object
+        DeleteSourceResponse:
+            properties:
+                deleted:
+                    type: boolean
+                source_id:
+                    type: string
+            required:
+                - source_id
+                - deleted
             type: object
         EnableWatchRequest:
             properties:
@@ -324,6 +453,15 @@ components:
                 - tenant_id
                 - status
             type: object
+        ListCloudSyncRunsResponse:
+            properties:
+                items:
+                    items:
+                        $ref: '#/components/schemas/CloudSyncRun'
+                    type: array
+            required:
+                - items
+            type: object
         ListManualPullJobsResponse:
             properties:
                 items:
@@ -432,6 +570,8 @@ components:
                     type: string
                 core_task_id:
                     type: string
+                core_task_state:
+                    type: string
                 created_at:
                     format: date-time
                     type: string
@@ -519,6 +659,8 @@ components:
                 core_document_id:
                     type: string
                 core_task_id:
+                    type: string
+                core_task_state:
                     type: string
                 created_at:
                     format: date-time
@@ -937,12 +1079,28 @@ components:
                 - deleted_count
                 - pending_pull_count
             type: object
+        SourcePathTreeRequest:
+            properties:
+                changes_only:
+                    type: boolean
+                include_files:
+                    type: boolean
+                max_depth:
+                    format: int64
+                    type: integer
+                path:
+                    type: string
+                updated_only:
+                    type: boolean
+            type: object
         TreeNode:
             properties:
                 children:
                     items:
                         $ref: '#/components/schemas/TreeNode'
                     type: array
+                core_task_state:
+                    type: string
                 external_file_id:
                     type: string
                 has_update:
@@ -968,6 +1126,25 @@ components:
                 - key
                 - is_dir
             type: object
+        TriggerCloudSyncRequest:
+            properties:
+                paths:
+                    items:
+                        type: string
+                    type: array
+                trigger_type:
+                    type: string
+            type: object
+        TriggerCloudSyncResponse:
+            properties:
+                accepted:
+                    type: boolean
+                run_id:
+                    type: string
+            required:
+                - run_id
+                - accepted
+            type: object
         UpdateSourceRequest:
             properties:
                 dataset_id:
@@ -990,6 +1167,45 @@ components:
                     type: integer
                 root_path:
                     type: string
+            type: object
+        UpsertCloudSourceBindingRequest:
+            properties:
+                auth_connection_id:
+                    type: string
+                enabled:
+                    type: boolean
+                exclude_patterns:
+                    items:
+                        type: string
+                    type: array
+                include_patterns:
+                    items:
+                        type: string
+                    type: array
+                max_object_size_bytes:
+                    format: int64
+                    type: integer
+                provider:
+                    type: string
+                provider_options:
+                    additionalProperties: true
+                    type: object
+                reconcile_after_sync:
+                    type: boolean
+                reconcile_delay_minutes:
+                    format: int64
+                    type: integer
+                schedule_expr:
+                    type: string
+                schedule_tz:
+                    type: string
+                target_ref:
+                    type: string
+                target_type:
+                    type: string
+            required:
+                - provider
+                - auth_connection_id
             type: object
         WatchToggleResponse:
             properties:
@@ -1320,6 +1536,33 @@ paths:
                     description: Error
             summary: Create source
     /api/scan/sources/{id}:
+        delete:
+            parameters:
+                - in: path
+                  name: id
+                  required: true
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/DeleteSourceResponse'
+                    description: Deleted source
+                "400":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorResponse'
+                    description: Error
+                "404":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorResponse'
+                    description: Error
+            summary: Delete source
         get:
             parameters:
                 - in: path
@@ -1374,6 +1617,147 @@ paths:
                                 $ref: '#/components/schemas/ErrorResponse'
                     description: Error
             summary: Update source
+    /api/scan/sources/{id}/cloud/binding:
+        get:
+            parameters:
+                - in: path
+                  name: id
+                  required: true
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/CloudSourceBinding'
+                    description: Cloud binding
+                "404":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorResponse'
+                    description: Error
+                "500":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorResponse'
+                    description: Error
+            summary: Get cloud binding
+        post:
+            parameters:
+                - in: path
+                  name: id
+                  required: true
+                  schema:
+                    type: string
+            requestBody:
+                content:
+                    application/json:
+                        schema:
+                            $ref: '#/components/schemas/UpsertCloudSourceBindingRequest'
+                required: true
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/CloudSourceBinding'
+                    description: Cloud binding
+                "400":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorResponse'
+                    description: Error
+                "404":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorResponse'
+                    description: Error
+            summary: Create or update cloud binding
+    /api/scan/sources/{id}/cloud/sync/runs:
+        get:
+            parameters:
+                - in: path
+                  name: id
+                  required: true
+                  schema:
+                    type: string
+                - in: query
+                  name: limit
+                  required: false
+                  schema:
+                    format: int64
+                    type: integer
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ListCloudSyncRunsResponse'
+                    description: Cloud sync runs
+                "400":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorResponse'
+                    description: Error
+                "404":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorResponse'
+                    description: Error
+                "500":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorResponse'
+                    description: Error
+            summary: List cloud sync runs
+    /api/scan/sources/{id}/cloud/sync/trigger:
+        post:
+            parameters:
+                - in: path
+                  name: id
+                  required: true
+                  schema:
+                    type: string
+            requestBody:
+                content:
+                    application/json:
+                        schema:
+                            $ref: '#/components/schemas/TriggerCloudSyncRequest'
+                required: true
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/TriggerCloudSyncResponse'
+                    description: Trigger accepted
+                "400":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorResponse'
+                    description: Error
+                "404":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorResponse'
+                    description: Error
+                "500":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorResponse'
+                    description: Error
+            summary: Trigger cloud sync once
     /api/scan/sources/{id}/disable:
         post:
             parameters:
@@ -1719,6 +2103,62 @@ paths:
                                 $ref: '#/components/schemas/ErrorResponse'
                     description: Error
             summary: Report file events
+    /api/v1/agents/fs/tree:
+        post:
+            requestBody:
+                content:
+                    application/json:
+                        schema:
+                            $ref: '#/components/schemas/AgentPathTreeRequest'
+                required: true
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/AgentPathTreeResponse'
+                    description: Directory tree
+                "404":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorResponse'
+                    description: Error
+                "502":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorResponse'
+                    description: Error
+            summary: Get directory tree via agent
+    /api/v1/agents/fs/validate:
+        post:
+            requestBody:
+                content:
+                    application/json:
+                        schema:
+                            $ref: '#/components/schemas/AgentPathRequest'
+                required: true
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/AgentPathValidateResponse'
+                    description: Path validation result
+                "404":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorResponse'
+                    description: Error
+                "502":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ErrorResponse'
+                    description: Error
+            summary: Validate path via agent
     /api/v1/agents/heartbeat:
         post:
             requestBody:

@@ -1,5 +1,5 @@
 import { Button, Result, Spin, Typography } from "antd";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useSearchParams } from "react-router-dom";
 
@@ -34,7 +34,6 @@ export default function FeishuDataSourceCallback() {
     title: t("admin.dataSourceCallbackLoadingTitle"),
     subtitle: t("admin.dataSourceCallbackLoadingSubtitle"),
   });
-  const redirectTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     const finalize = (payload: FeishuDataSourceOAuthMessage) => {
@@ -42,15 +41,7 @@ export default function FeishuDataSourceCallback() {
 
       if (isPopupWindow()) {
         window.opener?.postMessage(payload, window.location.origin);
-        redirectTimerRef.current = window.setTimeout(() => {
-          window.close();
-        }, 600);
-        return;
       }
-
-      redirectTimerRef.current = window.setTimeout(() => {
-        window.location.replace(getDataSourceManagementUrl());
-      }, 1000);
     };
 
     const run = async () => {
@@ -125,12 +116,6 @@ export default function FeishuDataSourceCallback() {
     };
 
     void run();
-
-    return () => {
-      if (redirectTimerRef.current) {
-        window.clearTimeout(redirectTimerRef.current);
-      }
-    };
   }, [searchParams, t]);
 
   return (

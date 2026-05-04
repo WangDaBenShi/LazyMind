@@ -9,6 +9,9 @@ import {
   AppstoreOutlined,
   TeamOutlined,
   GlobalOutlined,
+  DatabaseOutlined,
+  LeftOutlined,
+  RightOutlined,
 } from "@ant-design/icons";
 import { Navigate, Outlet, useLocation, useNavigate } from "react-router-dom";
 import type { UserDetailResponse } from "@/api/generated/auth-client";
@@ -22,13 +25,27 @@ import { validatePassword } from "@/modules/signin/utils/formRules";
 import logoImage from "@/public/Lazy.png";
 import { useTranslation } from "react-i18next";
 import LanguageSwitcher from "@/components/LanguageSwitcher";
+import {
+  isDeveloperModeActive,
+  setDeveloperModeActive,
+} from "@/utils/developerMode";
 import "./index.scss";
 
 const { Content, Sider } = Layout;
 const MAINLAND_CHINA_PHONE_REGEX = /^1[3-9]\d{9}$/;
-const DEVELOPER_ACTIVE_STORAGE_KEY = "lazyrag:developer-active";
+const MAIN_MENU_COLLAPSED_STORAGE_KEY = "lazyrag:main-menu-collapsed";
 
 type MenuItem = Required<MenuProps>["items"][number];
+
+function isAdminRole(role?: string) {
+  const normalizedRole = (role || "").trim().toLowerCase();
+  return (
+    normalizedRole === "admin" ||
+    normalizedRole === "system-admin" ||
+    normalizedRole === "system_admin" ||
+    normalizedRole.endsWith(".admin")
+  );
+}
 
 interface ProfileFormValues {
   username: string;
@@ -53,6 +70,25 @@ export default function MainLayout() {
   const { t } = useTranslation();
   const [profileForm] = Form.useForm<ProfileFormValues>();
 
+  const userInfo = AgentAppsAuth.getUserInfo();
+  const isLoggedIn = Boolean(userInfo?.token);
+  const userName = userInfo?.username || "";
+  const isAdminUser = isAdminRole(userInfo?.role);
+
+  const [selectKeys, setSelectKeys] = useState<string[]>([]);
+  const [profileModalOpen, setProfileModalOpen] = useState(false);
+  const [profileLoading, setProfileLoading] = useState(false);
+  const [profileSubmitting, setProfileSubmitting] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [isMenuCollapsed, setIsMenuCollapsed] = useState(false);
+  const [developerActive, setDeveloperActive] = useState(isDeveloperModeActive);
+  const [profileDetail, setProfileDetail] = useState<UserDetailResponse | null>(null);
+  const aiEvolutionMenuChildren: MenuItem[] = [
+    ...(isAdminUser && developerActive
+      ? [{ key: "/self-evolution", label: t("layout.selfEvolution"), icon: <CodeOutlined /> }]
+      : []),
+    { key: "/memory-management", label: t("layout.memoryManagement"), icon: <AppstoreOutlined /> },
+  ];
   const allMenuItems: MenuItem[] = [
     {
       key: "agent",
@@ -68,27 +104,18 @@ export default function MainLayout() {
       type: "group",
       children: [
         { key: "/lib/knowledge", label: t("layout.knowledgeBase"), icon: <AppstoreOutlined /> },
+        { key: "/data-sources", label: t("layout.dataSourceManagement"), icon: <DatabaseOutlined /> },
       ],
     },
+    {
+      key: "ai-evolution",
+      label: t("layout.aiEvolution"),
+      type: "group",
+      children: aiEvolutionMenuChildren,
+    },
   ];
+
   const pathname = location.pathname || "/agent/chat";
-
-  const userInfo = AgentAppsAuth.getUserInfo();
-  const isLoggedIn = Boolean(userInfo?.token);
-  const userName = userInfo?.username || "";
-
-  const [selectKeys, setSelectKeys] = useState<string[]>([
-    pathname.startsWith("/lib") ? "/lib/knowledge" : "/agent/chat",
-  ]);
-
-  const [profileModalOpen, setProfileModalOpen] = useState(false);
-  const [profileLoading, setProfileLoading] = useState(false);
-  const [profileSubmitting, setProfileSubmitting] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [developerActive, setDeveloperActive] = useState(false);
-  const [profileDetail, setProfileDetail] = useState<UserDetailResponse | null>(
-    null,
-  );
   const menuItems = allMenuItems;
 
   const settingsMenuItems = [
@@ -98,7 +125,7 @@ export default function MainLayout() {
       icon: <TeamOutlined className="settings-popover-icon" />,
     },
     {
-      key: "/admin/self-evolution",
+      key: "developer-toggle",
       label: t("layout.developer"),
       icon: <CodeOutlined className="settings-popover-icon" />,
     },
@@ -108,27 +135,45 @@ export default function MainLayout() {
       .VITE_APP_LOGO || "";
 
   useEffect(() => {
+    setDeveloperActive(isDeveloperModeActive());
+  }, []);
+
+  useEffect(() => {
     let key = "/agent/chat";
     if (pathname.startsWith("/lib")) {
       key = "/lib/knowledge";
+    } else if (pathname.startsWith("/data-sources")) {
+      key = "/data-sources";
+    } else if (pathname.startsWith("/memory-management")) {
+      key = "/memory-management";
+    } else if (pathname.startsWith("/self-evolution")) {
+      key = "/self-evolution";
     }
     setSelectKeys([key]);
   }, [pathname]);
 
   useEffect(() => {
-    if (pathname.startsWith("/admin") && !isLoggedIn) {
-      navigate("/login", { replace: true });
+    if (pathname.startsWith("/self-evolution") && (!isAdminUser || !developerActive)) {
+      navigate("/agent/chat", { replace: true });
     }
-  }, [isLoggedIn, navigate, pathname]);
+  }, [pathname, isAdminUser, developerActive, navigate]);
 
   useEffect(() => {
     try {
-      const stored = localStorage.getItem(DEVELOPER_ACTIVE_STORAGE_KEY);
-      setDeveloperActive(stored === "1");
+      const stored = localStorage.getItem(MAIN_MENU_COLLAPSED_STORAGE_KEY);
+      setIsMenuCollapsed(stored === "1");
     } catch {
-      setDeveloperActive(false);
+      setIsMenuCollapsed(false);
     }
   }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(MAIN_MENU_COLLAPSED_STORAGE_KEY, isMenuCollapsed ? "1" : "0");
+    } catch {
+      // ignore persistence errors
+    }
+  }, [isMenuCollapsed]);
 
   const onMenuClick: MenuProps["onClick"] = (e) => {
     const targetPath = e.key as string;
@@ -137,25 +182,24 @@ export default function MainLayout() {
     navigate(targetPath);
   };
 
+  const toggleMenu = () => {
+    setIsMenuCollapsed((prev) => !prev);
+  };
+
   const handleSettingsNavigate = (targetPath: string) => {
-    if (targetPath === "/admin/self-evolution") {
+    if (targetPath === "developer-toggle") {
       if (developerActive) {
         setDeveloperActive(false);
-        try {
-          localStorage.removeItem(DEVELOPER_ACTIVE_STORAGE_KEY);
-        } catch {
-          // Ignore storage errors and keep in-memory state.
-        }
+        setDeveloperModeActive(false);
         message.success(t("admin.developerDeactivated"));
+        if (pathname.startsWith("/self-evolution")) {
+          navigate("/agent/chat");
+        }
         return;
       }
 
       setDeveloperActive(true);
-      try {
-        localStorage.setItem(DEVELOPER_ACTIVE_STORAGE_KEY, "1");
-      } catch {
-        // Ignore storage errors and keep in-memory state.
-      }
+      setDeveloperModeActive(true);
       message.success(t("admin.developerActivated"));
       return;
     }
@@ -359,7 +403,14 @@ export default function MainLayout() {
 
   return (
     <Layout hasSider className="main-layout">
-      <Sider width={200} className="sider-bar-style">
+      <Sider
+        width={232}
+        collapsedWidth={72}
+        collapsible
+        trigger={null}
+        collapsed={isMenuCollapsed}
+        className={`sider-bar-style${isMenuCollapsed ? " is-collapsed" : ""}`}
+      >
         <div className="sider-inner">
           <div className="img-box">
             {logoSrc ? (
@@ -368,18 +419,31 @@ export default function MainLayout() {
               <img src={logoImage} alt="logo" />
             )}
           </div>
+          <div className="sider-top-action">
+            <button
+              type="button"
+              className="sider-inline-toggle"
+              onClick={toggleMenu}
+              aria-label={isMenuCollapsed ? "展开菜单" : "收起菜单"}
+              title={isMenuCollapsed ? "展开菜单" : "收起菜单"}
+            >
+              {isMenuCollapsed ? <RightOutlined /> : <LeftOutlined />}
+              {!isMenuCollapsed && <span className="sider-inline-toggle-text">收起导航</span>}
+            </button>
+          </div>
           <Menu
             onClick={onMenuClick}
             selectedKeys={selectKeys}
             items={menuItems}
             mode="inline"
+            inlineCollapsed={isMenuCollapsed}
             className="sider-menu"
             style={{ border: "none" }}
           />
           <div className="sider-bar-bottom">
             <div className="bottom-item language-item">
               <GlobalOutlined className="bottom-icon" />
-              <LanguageSwitcher />
+              {!isMenuCollapsed && <LanguageSwitcher />}
             </div>
             <Popover
               content={
@@ -389,18 +453,14 @@ export default function MainLayout() {
                       key={item.key}
                       type="text"
                       className={`settings-popover-button${
-                        item.key === "/admin/self-evolution" && developerActive
-                          ? " is-active"
-                          : ""
+                        item.key === "developer-toggle" && developerActive ? " is-active" : ""
                       }`}
                       onClick={() => handleSettingsNavigate(item.key)}
                     >
                       {item.icon}
                       <span>{item.label}</span>
-                      {item.key === "/admin/self-evolution" && developerActive && (
-                        <span className="settings-active-badge">
-                          {t("admin.developerActiveTag")}
-                        </span>
+                      {item.key === "developer-toggle" && developerActive && (
+                        <span className="settings-active-badge">{t("admin.developerActiveTag")}</span>
                       )}
                     </Button>
                   ))}
@@ -441,7 +501,7 @@ export default function MainLayout() {
                 }}
               >
                 <SettingOutlined className="bottom-icon" />
-                <span className="bottom-text">{t("layout.settings")}</span>
+                {!isMenuCollapsed && <span className="bottom-text">{t("layout.settings")}</span>}
               </div>
             </Popover>
             {userName && (
@@ -458,7 +518,7 @@ export default function MainLayout() {
                 }}
               >
                 <UserOutlined className="bottom-icon" />
-                <span className="bottom-text">{userName}</span>
+                {!isMenuCollapsed && <span className="bottom-text">{userName}</span>}
               </div>
             )}
           </div>
@@ -467,7 +527,12 @@ export default function MainLayout() {
       <Layout className="main-layout-content">
         <Content className="main-layout-body">
           <div className="sub-app-container">
-            <Outlet />
+            <Outlet
+              context={{
+                isMenuCollapsed,
+                toggleMenu,
+              }}
+            />
           </div>
         </Content>
       </Layout>

@@ -21,6 +21,9 @@ import DataSourceManagement from "@/modules/admin/pages/dataSource";
 import DataSourceDetail from "@/modules/admin/pages/dataSource/detail";
 import DataSourceFeishuCallback from "@/modules/admin/pages/dataSource/feishuCallback";
 import MemoryManagement from "@/modules/admin/pages/memory";
+import MemoryManagementListPage from "@/modules/admin/pages/memory/pages/list";
+import MemoryReviewPage from "@/modules/admin/pages/memory/pages/review";
+import MemoryGlossaryDetailPage from "@/modules/admin/pages/memory/pages/glossaryDetail";
 import SelfEvolutionPage from "@/modules/admin/pages/selfEvolution";
 import { getAntdLocale } from "@/i18n/antdLocale";
 
@@ -57,16 +60,32 @@ export default function AppRouter() {
               element={<Knowledge />}
             />
           </Route>
+          <Route path="data-sources" element={<DataSourceManagement />} />
+          <Route path="data-sources/:id" element={<DataSourceDetail />} />
+          <Route path="memory-management" element={<MemoryManagement />}>
+            <Route index element={<MemoryManagementListPage />} />
+            <Route path="tools" element={<MemoryManagementListPage />} />
+            <Route path="skills" element={<MemoryManagementListPage />} />
+            <Route path="experience" element={<MemoryManagementListPage />} />
+            <Route path="glossary" element={<MemoryManagementListPage />} />
+            <Route
+              path="glossary/:itemId"
+              element={<MemoryGlossaryDetailPage />}
+            />
+            <Route
+              path="review/:tab/:itemId"
+              element={<MemoryReviewPage />}
+            />
+          </Route>
+          <Route path="self-evolution" element={<SelfEvolutionPage />} />
+          <Route path="self-evolution/detail/:threadId" element={<SelfEvolutionPage />} />
+          <Route path="self-evolution/:threadId" element={<SelfEvolutionPage />} />
         </Route>
         <Route path="/admin" element={<AdminLayout />}>
           <Route index element={<Navigate to="groups" replace />} />
           <Route path="users" element={<UserManagement />} />
           <Route path="groups" element={<GroupManagement />} />
           <Route path="groups/:id" element={<GroupDetail />} />
-          <Route path="data-sources" element={<DataSourceManagement />} />
-          <Route path="data-sources/:id" element={<DataSourceDetail />} />
-          <Route path="memory-management" element={<MemoryManagement />} />
-          <Route path="self-evolution" element={<SelfEvolutionPage />} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>

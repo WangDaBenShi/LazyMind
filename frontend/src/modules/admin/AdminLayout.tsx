@@ -39,15 +39,8 @@ export default function AdminLayout() {
   const [isSelfEvolutionMenuCollapsed, setIsSelfEvolutionMenuCollapsed] = useState(false);
 
   const pathname = location.pathname;
-  const isSelfEvolutionRoute = pathname.startsWith("/admin/self-evolution");
   const selectedKey = pathname.startsWith("/admin/users")
     ? "/admin/users"
-    : pathname.startsWith("/admin/data-sources")
-      ? "/admin/data-sources"
-    : pathname.startsWith("/admin/memory-management")
-      ? "/admin/memory-management"
-    : pathname.startsWith("/admin/self-evolution")
-      ? "/admin/self-evolution"
     : "/admin/groups";
 
   const menuChildren: MenuItem[] = [
@@ -57,25 +50,6 @@ export default function AdminLayout() {
             key: "/admin/users",
             label: t("layout.userManagement"),
             icon: <UserOutlined />,
-          },
-        ]
-      : []),
-    {
-      key: "/admin/data-sources",
-      label: t("layout.dataSourceManagement"),
-      icon: <DatabaseOutlined />,
-    },
-    {
-      key: "/admin/memory-management",
-      label: t("layout.memoryManagement"),
-      icon: <BulbOutlined />,
-    },
-    ...(isAdminUser
-      ? [
-          {
-            key: "/admin/self-evolution",
-            label: t("layout.selfEvolution"),
-            icon: <ExperimentOutlined />,
           },
         ]
       : []),
@@ -105,12 +79,8 @@ export default function AdminLayout() {
   };
 
   useEffect(() => {
-    if (isSelfEvolutionRoute) {
-      setIsSelfEvolutionMenuCollapsed(true);
-      return;
-    }
-    setIsSelfEvolutionMenuCollapsed(false);
-  }, [isSelfEvolutionRoute]);
+    // Cleanup effect no longer needed
+  }, []);
 
   if (!isLoggedIn) {
     return <Navigate to="/login" replace />;
@@ -118,8 +88,7 @@ export default function AdminLayout() {
 
   if (
     !isAdminUser &&
-    (pathname.startsWith("/admin/users") ||
-      pathname.startsWith("/admin/self-evolution"))
+    pathname.startsWith("/admin/users")
   ) {
     return <Navigate to="/admin/groups" replace />;
   }
@@ -129,10 +98,6 @@ export default function AdminLayout() {
       <Sider
         width={232}
         className="admin-layout-sider"
-        collapsible={isSelfEvolutionRoute}
-        collapsed={isSelfEvolutionRoute ? isSelfEvolutionMenuCollapsed : false}
-        collapsedWidth={0}
-        trigger={null}
       >
         <div className="admin-layout-brand">
           <img
@@ -164,21 +129,10 @@ export default function AdminLayout() {
         </div>
       </Sider>
       <Layout className="admin-layout-content">
-        <Content
-          className={`admin-layout-body${isSelfEvolutionRoute ? " admin-layout-body-full" : ""}`}
-        >
-          {isSelfEvolutionRoute ? (
-            <Outlet
-              context={{
-                isMenuCollapsed: isSelfEvolutionMenuCollapsed,
-                toggleMenu: () => setIsSelfEvolutionMenuCollapsed((prev) => !prev),
-              }}
-            />
-          ) : (
-            <div className="admin-layout-panel">
-              <Outlet />
-            </div>
-          )}
+        <Content className="admin-layout-body">
+          <div className="admin-layout-panel">
+            <Outlet />
+          </div>
         </Content>
       </Layout>
     </Layout>
