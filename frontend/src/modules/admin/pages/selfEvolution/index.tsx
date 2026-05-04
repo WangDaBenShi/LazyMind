@@ -3,7 +3,6 @@ import { useNavigate, useParams } from "react-router-dom";
 import {
   Collapse,
   Dropdown,
-  Input,
   Modal,
   Table,
   Tag,
@@ -39,6 +38,12 @@ import { BASE_URL, axiosInstance, getLocalizedErrorMessage } from "@/components/
 import { pxReportCaseMetrics } from "./mockPxReport";
 import analysisReportMarkdown from "./mockAnalysisReport.md?raw";
 import codeOptimizeDiff from "./mockCodeOptimize.diff?raw";
+import {
+  ChatComposer,
+  ChatMessageStream,
+  HistorySessionItem,
+  HistorySessionTab,
+} from "./components";
 import "./index.scss";
 
 const { Paragraph, Text, Title } = Typography;
@@ -57,6 +62,7 @@ type WorkflowProgressSnapshot = {
 
 type WorkflowStep = {
   id: WorkflowStepId;
+  renderKey?: string;
   title: string;
   desc: string;
   status: StepStatus;
@@ -91,6 +97,7 @@ type ChatMessage = {
   content: string;
   time: string;
   sortTime?: number;
+  agentLabel?: string;
 };
 
 type ChatSession = {
@@ -172,6 +179,8 @@ type NormalizedThreadEvent = {
   progress?: WorkflowProgressSnapshot;
   checkpointWait?: CheckpointWaitPrompt;
 };
+
+type ChatStreamDeltaKind = "thinking" | "answer";
 
 type CheckpointWaitPrompt = {
   message: string;
@@ -274,7 +283,7 @@ const FIXED_EVAL_SET = "__none__";
 const FIXED_EXTRA_EVAL_STRATEGY: ExtraEvalStrategy = "generate";
 const AGENT_API_BASE = `${BASE_URL}/api/core/agent`;
 const SELF_EVOLUTION_LAST_THREAD_STORAGE_KEY = "lazyrag:self-evolution:last-thread";
-const SELF_EVOLUTION_THREAD_HISTORY_STORAGE_KEY = "lazyrag:self-evolution:thread-history";
+const DEPRECATED_SELF_EVOLUTION_THREAD_HISTORY_STORAGE_KEY = "lazyrag:self-evolution:thread-history";
 
 const workflowResultLabels: Record<WorkflowResultKind, string> = {
   datasets: "数据集结果",
@@ -364,6 +373,8 @@ const stageLabels: Record<ThreadEventStage, string> = {
 
 const checkpointCommandText = "继续执行";
 
+const terminalThreadEventTypes = new Set(["done", "thread.done", "thread.stop", "intent.done"]);
+
 const eventActionLabels: Record<string, string> = {
   start: "开始",
   progress: "进度更新",
@@ -418,6 +429,8 @@ const workflowStepDefinitions: Omit<WorkflowStep, "status" | "runtimeText">[] = 
     desc: "执行对照实验并上传新评测报告，确认优化收益。",
   },
 ];
+
+const workflowStepOrder = workflowStepDefinitions.map((step) => step.id);
 
 const getKnowledgeBaseName = (dataset: Dataset) =>
   dataset.display_name || dataset.name || dataset.dataset_id || "未命名知识库";
@@ -1093,67 +1106,6 @@ function normalizeThreadListPayload(payload: unknown): ThreadHistoryEntry[] {
     }, []);
 }
 
-function getRecordMessageContent(record: Record<string, unknown>) {
-  const directText = getNestedStringField(record, [
-    "content",
-    "message",
-    "text",
-    "reply",
-    "thought",
-    "delta",
-    "raw_content",
-    "input",
-    "output",
-  ]);
-  if (directText) {
-    return directText;
-  }
-
-  const messageRecord = getNestedRecordField(record, ["message", "payload"]);
-  const nestedPayloadRecord = getNestedRecordField(messageRecord, ["payload"]);
-  return getNestedStringField(nestedPayloadRecord, [
-    "content",
-    "message",
-    "text",
-    "reply",
-    "thought",
-    "delta",
-    "raw_content",
-    "input",
-    "output",
-  ]) || getNestedStringField(messageRecord, [
-    "content",
-    "message",
-    "text",
-    "reply",
-    "thought",
-    "delta",
-    "raw_content",
-    "input",
-    "output",
-  ]);
-}
-
-function getRecordRole(record: Record<string, unknown>): ChatRole | undefined {
-  const role = getNestedStringField(record, ["role", "sender"]);
-  if (role === "user" || role === "assistant") {
-    return role;
-  }
-
-  const payloadRecord = getNestedRecordField(record, ["payload"]);
-  const type =
-    getNestedStringField(record, ["tag", "type", "event", "event_name", "kind", "name"]) ||
-    getNestedStringField(payloadRecord, ["tag", "type", "event", "event_name", "kind", "name"]);
-  if (type === "message.user" || type === "user") {
-    return "user";
-  }
-  if (type === "message.assistant" || type === "assistant" || type === "intent.reply" || type === "intent.thought") {
-    return "assistant";
-  }
-
-  return undefined;
-}
-
 function normalizeRoundMessagesFromPayload(payload: ThreadRestorePayload, threadId: string): ChatMessage[] {
   const rounds = getNestedArrayField(payload, ["rounds"]);
   const messages: ChatMessage[] = [];
@@ -1221,46 +1173,44 @@ function dedupeAndSortChatMessages(messages: ChatMessage[]) {
 }
 
 function normalizeChatMessagesFromPayload(payload: ThreadRestorePayload, threadId: string): ChatMessage[] {
-  const records = getNestedArrayField(payload, ["history", "messages", "items", "records", "events", "thread_events"]);
-  const messages: ChatMessage[] = normalizeRoundMessagesFromPayload(payload, threadId);
+  return dedupeAndSortChatMessages(normalizeRoundMessagesFromPayload(payload, threadId));
+}
 
-  records.forEach((item, index) => {
-    if (!isRecord(item)) {
-      return;
-    }
+function getDialogueEventAgentLabel(event: NormalizedThreadEvent) {
+  if (event.type === "message.user") {
+    return "模拟用户";
+  }
+  if (event.type === "message.assistant") {
+    return "回复 Agent";
+  }
+  return undefined;
+}
 
-    const role = getRecordRole(item);
-    const content = getRecordMessageContent(item);
-    if (!role || !content) {
-      return;
-    }
-
-    const messageId =
-      getNestedStringField(item, ["id", "message_id", "event_id", "record_id"]) ||
-      `${threadId}-history-${index}`;
-    const timeValue =
-      item.created_at ||
-      item.create_time ||
-      item.updated_at ||
-      item.update_time ||
-      item.ts ||
-      item.timestamp ||
-      getNestedRecordField(item, ["payload"])?.ts ||
-      getNestedRecordField(item, ["payload"])?.timestamp;
-
-    messages.push({
-      id: messageId,
-      role,
-      content,
-      time: formatThreadTime(timeValue),
-      sortTime: getThreadTimeSortValue(timeValue),
-    });
-  });
-
-  return dedupeAndSortChatMessages(messages);
+function normalizeChatMessagesFromEvents(events: NormalizedThreadEvent[]): ChatMessage[] {
+  return events
+    .filter((event) => Boolean(event.role && event.content && getDialogueEventAgentLabel(event)))
+    .map((event) => ({
+      id: `event-chat-${event.key}`,
+      role: event.role as ChatRole,
+      content: event.content as string,
+      time: formatThreadTime(event.timestamp),
+      sortTime:
+        getThreadTimeSortValue(event.timestamp) ||
+        (typeof event.sequence === "number" ? event.sequence : 0),
+      agentLabel: getDialogueEventAgentLabel(event),
+    }));
 }
 
 function normalizeEventFrameFromRecord(record: Record<string, unknown>, index: number): ThreadEventFrame | undefined {
+  const rawFrame = getStringField(record, ["raw_frame", "rawFrame"]);
+  if (rawFrame) {
+    return {
+      id: getNestedStringField(record, ["id", "event_id", "record_id"]) || `restore-${index}`,
+      eventName: getNestedStringField(record, ["tag", "eventName", "event_name", "event", "type", "kind", "name"]) || "message",
+      data: rawFrame,
+    };
+  }
+
   const eventName =
     getNestedStringField(record, ["tag", "eventName", "event_name", "event", "type", "kind", "name"]) ||
     "message";
@@ -1268,7 +1218,7 @@ function normalizeEventFrameFromRecord(record: Record<string, unknown>, index: n
     getStringField(record, ["tag", "stage", "task_id", "thread_id", "seq"]) ||
       getNumberField(record, ["seq"]),
   );
-  const rawData = record.data ?? (hasEventEnvelope ? record : record.payload ?? record.message ?? record);
+  const rawData = record.data ?? record.payload ?? (hasEventEnvelope ? record : record.message ?? record);
 
   let data = "";
   if (typeof rawData === "string") {
@@ -1296,6 +1246,42 @@ function getEventPayloadData(payload: Record<string, unknown> | undefined) {
     return payload.data;
   }
   return payload;
+}
+
+function getThreadEventPayloadEnvelope(payload: Record<string, unknown> | undefined) {
+  if (isRecord(payload?.payload)) {
+    return payload.payload;
+  }
+  return undefined;
+}
+
+function getThreadEventTypeFromPayload(payload: Record<string, unknown> | undefined) {
+  const eventEnvelope = getThreadEventPayloadEnvelope(payload);
+  const directTag = getStringField(payload, ["tag", "type"]);
+  const nestedTag = getStringField(eventEnvelope, ["tag", "type"]);
+  const eventName =
+    getStringField(payload, ["event_name", "event", "kind", "name"]) ||
+    getStringField(eventEnvelope, ["event_name", "event", "kind", "name"]);
+  const stage =
+    getStringField(payload, ["stage"]) ||
+    getStringField(eventEnvelope, ["stage"]);
+
+  if (!directTag && !nestedTag && stage === "message" && (eventName === "user" || eventName === "assistant")) {
+    return `message.${eventName}`;
+  }
+
+  return directTag || nestedTag || eventName;
+}
+
+function getThreadEventContentFromPayload(payload: Record<string, unknown> | undefined) {
+  const eventEnvelope = getThreadEventPayloadEnvelope(payload);
+  const eventPayload = getEventPayloadData(eventEnvelope) || getEventPayloadData(payload);
+
+  return (
+    getNestedStringField(payload, ["message", "content", "text", "reply", "thought", "delta"]) ||
+    getNestedStringField(eventEnvelope, ["message", "content", "text", "reply", "thought", "delta"]) ||
+    getNestedStringField(eventPayload, ["message", "content", "text", "reply", "thought", "delta"])
+  );
 }
 
 function clampPercent(value: number) {
@@ -1951,15 +1937,33 @@ function parseThreadEventPayload(data: string): Record<string, unknown> | undefi
   }
 }
 
+function getChatStreamDeltaKind(type: string): ChatStreamDeltaKind | undefined {
+  if (type === "thinking_delta" || type === "intent.thinking_delta") {
+    return "thinking";
+  }
+  if (type === "answer_delta" || type === "intent.answer_delta") {
+    return "answer";
+  }
+  return undefined;
+}
+
+function isTerminalThreadEvent(type: string) {
+  return terminalThreadEventTypes.has(type);
+}
+
 function normalizeThreadEvent(frame: ThreadEventFrame): NormalizedThreadEvent {
   const payload = parseThreadEventPayload(frame.data);
-  const payloadType = getStringField(payload, ["tag", "type", "event_name", "event", "kind", "name"]);
+  const eventEnvelope = getThreadEventPayloadEnvelope(payload);
+  const payloadType = getThreadEventTypeFromPayload(payload);
   const eventType = payloadType || (frame.eventName !== "message" ? frame.eventName : "");
-  const stageFromPayload = toThreadEventStage(payload?.stage);
+  const stageFromPayload =
+    toThreadEventStage(payload?.stage) ||
+    toThreadEventStage(eventEnvelope?.stage);
   const [typeStage, ...actionParts] = eventType.split(".");
   const stage = stageFromPayload || toThreadEventStage(typeStage);
   const action =
     getStringField(payload, ["action"]) ||
+    getStringField(eventEnvelope, ["action"]) ||
     (stage && actionParts.length > 0
       ? actionParts.join(".")
       : stage && eventType && !toThreadEventStage(eventType) && eventType !== "message"
@@ -1967,21 +1971,21 @@ function normalizeThreadEvent(frame: ThreadEventFrame): NormalizedThreadEvent {
         : undefined);
   const type = stage && action ? `${stage}.${action}` : eventType || "message";
   const role = type === "message.user" ? "user" : type === "message.assistant" ? "assistant" : undefined;
-  const content =
-    getNestedStringField(payload, ["message", "content", "text", "reply", "thought", "delta"]) ||
-    (!payload ? frame.data.trim() : undefined);
+  const content = getThreadEventContentFromPayload(payload) || (!payload ? frame.data.trim() : undefined);
   const timestamp =
     getStringField(payload, ["ts", "timestamp", "created_at", "create_time", "updated_at", "update_time"]) ||
+    getStringField(eventEnvelope, ["ts", "timestamp", "created_at", "create_time", "updated_at", "update_time"]) ||
     undefined;
-  const sequence = getNumberField(payload, ["seq"]);
+  const sequence = getNumberField(payload, ["seq"]) ?? getNumberField(eventEnvelope, ["seq"]);
   const taskId =
     getStringField(payload, ["task_id"]) ||
+    getStringField(eventEnvelope, ["task_id"]) ||
     getStringField(getEventPayloadData(payload), ["task_id", "run_id"]) ||
     undefined;
   const key =
     frame.id ||
     [
-      getStringField(payload, ["thread_id"]),
+      getStringField(payload, ["thread_id"]) || getStringField(eventEnvelope, ["thread_id"]),
       typeof sequence === "number" ? String(sequence) : "",
       taskId,
       type,
@@ -1991,15 +1995,30 @@ function normalizeThreadEvent(frame: ThreadEventFrame): NormalizedThreadEvent {
       .join(":") ||
     `${type}:${frame.data}`;
 
-  if (frame.eventName === "thread.stop" || type === "thread.stop") {
+  if (isTerminalThreadEvent(frame.eventName) || isTerminalThreadEvent(type)) {
     return {
       key,
       timestamp,
       sequence,
       taskId,
-      type: "thread.stop",
+      type,
       payload,
       displayText: "事件流已结束，线程停止信号已收到。",
+    };
+  }
+
+  const chatStreamDeltaKind = getChatStreamDeltaKind(type);
+  if (chatStreamDeltaKind) {
+    return {
+      key,
+      timestamp,
+      sequence,
+      taskId,
+      type,
+      role: "assistant",
+      content,
+      payload,
+      displayText: content,
     };
   }
 
@@ -2122,6 +2141,89 @@ function compareNormalizedThreadEvents(a: NormalizedThreadEvent, b: NormalizedTh
 
 function dedupeNormalizedEvents(events: NormalizedThreadEvent[]) {
   return Array.from(new Map(events.map((item) => [item.key, item])).values()).sort(compareNormalizedThreadEvents);
+}
+
+function getWorkflowStepIndex(stepId: WorkflowStepId | undefined) {
+  if (!stepId) {
+    return -1;
+  }
+  return workflowStepOrder.indexOf(stepId);
+}
+
+function createWorkflowStepFromRuntime(
+  stepId: WorkflowStepId,
+  runtimeState: WorkflowRuntimeState,
+  renderKey = stepId,
+): WorkflowStep {
+  const definition = workflowStepDefinitions.find((step) => step.id === stepId) || workflowStepDefinitions[0];
+  const runtime = runtimeState[stepId];
+  return {
+    ...definition,
+    renderKey,
+    status: runtime.status,
+    runtimeText: runtime.runtimeText,
+    progress: runtime.progress,
+  };
+}
+
+function buildWorkflowStepRuntimeFromEvents(events: NormalizedThreadEvent[], isSuperseded: boolean) {
+  const snapshot: { status: StepStatus; runtimeText?: string; progress?: WorkflowProgressSnapshot } = {
+    status: "running",
+  };
+
+  events.forEach((event) => {
+    if (event.action === "finish") {
+      snapshot.status = "done";
+    } else if (event.action === "cancel") {
+      snapshot.status = "canceled";
+    } else if (event.action === "pause") {
+      snapshot.status = "paused";
+    } else {
+      snapshot.status = "running";
+    }
+    snapshot.progress = event.progress || snapshot.progress;
+    snapshot.runtimeText = event.progress ? undefined : event.displayText;
+  });
+
+  if (isSuperseded && snapshot.status === "running") {
+    snapshot.status = "done";
+  }
+
+  return snapshot;
+}
+
+function buildVisibleWorkflowSteps(
+  events: NormalizedThreadEvent[],
+  runtimeState: WorkflowRuntimeState,
+  includeFirstStep: boolean,
+): WorkflowStep[] {
+  const stageEvents = dedupeNormalizedEvents(events).filter((event) => event.stage);
+  if (stageEvents.length === 0) {
+    return includeFirstStep ? [createWorkflowStepFromRuntime("dataset", runtimeState)] : [];
+  }
+
+  const groups: Array<{ stepId: WorkflowStepId; events: NormalizedThreadEvent[] }> = [];
+  stageEvents.forEach((event) => {
+    if (!event.stage) {
+      return;
+    }
+    const stepId = stageStepMap[event.stage];
+    const latestGroup = groups.at(-1);
+    if (latestGroup?.stepId === stepId) {
+      latestGroup.events.push(event);
+      return;
+    }
+    groups.push({ stepId, events: [event] });
+  });
+
+  return groups.map((group, index) => {
+    const definition = workflowStepDefinitions.find((step) => step.id === group.stepId) || workflowStepDefinitions[0];
+    return {
+      ...definition,
+      renderKey: `${group.stepId}-${index}`,
+      ...buildWorkflowStepRuntimeFromEvents(group.events, index < groups.length - 1),
+    };
+  });
 }
 
 function buildAnalysisRunSummary(events: NormalizedThreadEvent[]): AnalysisRunSummary | undefined {
@@ -2521,7 +2623,8 @@ function reduceWorkflowRuntimeState(
   }
 
   const stepId = stageStepMap[event.stage];
-  const stepIndex = workflowStepDefinitions.findIndex((step) => step.id === stepId);
+  const stepIndex = getWorkflowStepIndex(stepId);
+  const action = event.action;
   const next: WorkflowRuntimeState = { ...prev };
   workflowStepDefinitions.forEach((step, index) => {
     next[step.id] = { ...prev[step.id] };
@@ -2531,7 +2634,6 @@ function reduceWorkflowRuntimeState(
   });
 
   const current = next[stepId];
-  const action = event.action;
   if (action === "finish") {
     current.status = "done";
   } else if (action === "cancel") {
@@ -2566,60 +2668,44 @@ function getThreadKnowledgeBaseId(payload: ThreadRestorePayload) {
     return undefined;
   }
 
-  const inputs = getNestedRecordField(payload, ["inputs", "input", "config"]);
+  const threadPayload = getThreadPayloadFromRestorePayload(payload);
+  const inputs =
+    getNestedRecordField(threadPayload, ["inputs", "input", "config"]) ||
+    getNestedRecordField(payload, ["inputs", "input", "config"]);
   return (
+    getNestedStringField(threadPayload, ["kb_id", "knowledge_base_id", "dataset_id"]) ||
     getNestedStringField(payload, ["kb_id", "knowledge_base_id", "dataset_id"]) ||
     getNestedStringField(inputs, ["kb_id", "knowledge_base_id", "dataset_id"])
   );
 }
 
-function readStoredThreadHistory(): ThreadHistoryEntry[] {
-  if (typeof window === "undefined") {
-    return [];
+function getThreadPayloadFromRestorePayload(payload: ThreadRestorePayload) {
+  if (!isRecord(payload)) {
+    return undefined;
   }
 
-  try {
-    const rawValue = window.localStorage.getItem(SELF_EVOLUTION_THREAD_HISTORY_STORAGE_KEY);
-    if (!rawValue) {
-      return [];
-    }
-
-    const parsed = JSON.parse(rawValue);
-    if (!Array.isArray(parsed)) {
-      return [];
-    }
-
-    return parsed
-      .filter((item): item is Record<string, unknown> => isRecord(item))
-      .map((item) => ({
-        threadId: getStringField(item, ["threadId"]) || "",
-        title: getStringField(item, ["title"]) || "历史会话",
-        updatedAt: getStringField(item, ["updatedAt"]) || "刚刚",
-      }))
-      .filter((item) => item.threadId);
-  } catch {
-    return [];
-  }
-}
-
-function writeStoredThreadHistory(entries: ThreadHistoryEntry[]) {
-  if (typeof window === "undefined") {
-    return;
-  }
-
-  window.localStorage.setItem(
-    SELF_EVOLUTION_THREAD_HISTORY_STORAGE_KEY,
-    JSON.stringify(entries.slice(0, 20)),
+  const threadRecord = getNestedRecordField(payload, ["thread"]);
+  return (
+    getNestedRecordField(threadRecord, ["thread_payload", "threadPayload", "payload"]) ||
+    getNestedRecordField(payload, ["thread_payload", "threadPayload", "payload"])
   );
 }
 
-function upsertStoredThreadHistory(entry: ThreadHistoryEntry) {
-  const existingEntries = readStoredThreadHistory();
-  const nextEntries = [
-    entry,
-    ...existingEntries.filter((item) => item.threadId !== entry.threadId),
-  ];
-  writeStoredThreadHistory(nextEntries);
+function getThreadModeFromPayload(payload: ThreadRestorePayload): EvolutionMode | undefined {
+  if (!isRecord(payload)) {
+    return undefined;
+  }
+
+  const threadPayload = getThreadPayloadFromRestorePayload(payload);
+  const inputs =
+    getNestedRecordField(threadPayload, ["inputs", "input", "config"]) ||
+    getNestedRecordField(payload, ["inputs", "input", "config"]);
+  const modeValue =
+    getNestedStringField(threadPayload, ["mode", "evolution_mode", "interaction_mode"]) ||
+    getNestedStringField(payload, ["mode", "evolution_mode", "interaction_mode"]) ||
+    getNestedStringField(inputs, ["mode", "evolution_mode", "interaction_mode"]);
+
+  return modeValue === "auto" || modeValue === "interactive" ? modeValue : undefined;
 }
 
 export default function SelfEvolutionPage() {
@@ -2638,9 +2724,9 @@ export default function SelfEvolutionPage() {
   const [isStartingSession, setIsStartingSession] = useState(false);
   const [isSendingMessage, setIsSendingMessage] = useState(false);
   const [isRestoringThread, setIsRestoringThread] = useState(false);
-  const [isFetchingThreadHistory, setIsFetchingThreadHistory] = useState(false);
   const [isHistorySessionModalOpen, setIsHistorySessionModalOpen] = useState(false);
   const [isLoadingThreadHistoryList, setIsLoadingThreadHistoryList] = useState(false);
+  const [deletingHistoryKeys, setDeletingHistoryKeys] = useState<string[]>([]);
   const [threadHistoryListError, setThreadHistoryListError] = useState("");
   const [threadRestoreError, setThreadRestoreError] = useState("");
   const [isNewSessionConfigOpen, setIsNewSessionConfigOpen] = useState(false);
@@ -2658,9 +2744,6 @@ export default function SelfEvolutionPage() {
     content: "",
   });
   const [threadEvents, setThreadEvents] = useState<NormalizedThreadEvent[]>([]);
-  const [storedThreadHistory, setStoredThreadHistory] = useState<ThreadHistoryEntry[]>(() =>
-    readStoredThreadHistory(),
-  );
   const [remoteThreadHistory, setRemoteThreadHistory] = useState<ThreadHistoryEntry[]>([]);
   const [chatSessions, setChatSessions] = useState<ChatSession[]>([
     {
@@ -2674,9 +2757,15 @@ export default function SelfEvolutionPage() {
   const chatStreamRef = useRef<HTMLDivElement | null>(null);
   const threadEventsAbortRef = useRef<AbortController | null>(null);
   const processedThreadEventIdsRef = useRef<Set<string>>(new Set());
+  const processedWorkflowEventKeysRef = useRef<Set<string>>(new Set());
   const restoreRequestIdRef = useRef(0);
   const [activeDiffFileId, setActiveDiffFileId] = useState("");
   const [collapsedDiffDirs, setCollapsedDiffDirs] = useState<Record<string, boolean>>({});
+
+  useEffect(() => {
+    window.localStorage.removeItem(DEPRECATED_SELF_EVOLUTION_THREAD_HISTORY_STORAGE_KEY);
+  }, []);
+
   const fetchKnowledgeBaseOptions = useCallback((signal?: AbortSignal) => {
     setIsKnowledgeBaseLoading(true);
     setKnowledgeBaseError("");
@@ -2781,14 +2870,8 @@ export default function SelfEvolutionPage() {
   const isNewSessionStepThreeDone = Boolean(newSessionDraft.extraEvalStrategy);
   const isNewSessionStepFourDone = Boolean(newSessionDraft.mode);
   const workflowSteps = useMemo<WorkflowStep[]>(
-    () =>
-      workflowStepDefinitions.map((step) => ({
-        ...step,
-        status: workflowRuntimeState[step.id].status,
-        runtimeText: workflowRuntimeState[step.id].runtimeText,
-        progress: workflowRuntimeState[step.id].progress,
-      })),
-    [workflowRuntimeState],
+    () => buildVisibleWorkflowSteps(threadEvents, workflowRuntimeState, isWorkbenchVisible),
+    [isWorkbenchVisible, threadEvents, workflowRuntimeState],
   );
   const analysisRunSummary = useMemo(() => buildAnalysisRunSummary(threadEvents), [threadEvents]);
   const applyRunSummary = useMemo(() => buildApplyRunSummary(threadEvents), [threadEvents]);
@@ -2962,6 +3045,7 @@ export default function SelfEvolutionPage() {
   const activeSession = chatSessions.find((item) => item.id === activeSessionId) || chatSessions[0];
   const activeMessages = activeSession?.messages ?? [];
   const activeThreadId = activeSession?.threadId || routeThreadId;
+  const isAutoInteractionActive = mode === "auto" && Boolean(activeThreadId);
   const datasetResultDownloadUrl = useMemo(
     () => buildCoreDownloadUrl(getResultDownloadPath(workflowResults.datasets.data)),
     [workflowResults.datasets.data],
@@ -3062,16 +3146,9 @@ export default function SelfEvolutionPage() {
         messageCount: session.messages.length,
         source: session.threadId ? "thread" : "local",
       }));
-    const mergedThreadHistory = [
-      ...remoteThreadHistory,
-      ...storedThreadHistory.filter(
-        (storedItem) => !remoteThreadHistory.some((remoteItem) => remoteItem.threadId === storedItem.threadId),
-      ),
-    ];
-
     const mergedEntries = [
       ...sessionEntries,
-      ...mergedThreadHistory
+      ...remoteThreadHistory
         .filter((item) => item.threadId !== activeThreadId)
         .filter((item) => !sessionEntries.some((session) => session.threadId === item.threadId))
         .map<HistorySessionEntry>((item) => ({
@@ -3089,7 +3166,7 @@ export default function SelfEvolutionPage() {
     return mergedEntries.sort((a, b) =>
       b.updatedAt.localeCompare(a.updatedAt, "zh-CN", { numeric: true }),
     );
-  }, [activeSessionId, activeThreadId, chatSessions, remoteThreadHistory, storedThreadHistory]);
+  }, [activeSessionId, activeThreadId, chatSessions, remoteThreadHistory]);
   const isRuntimeConfigLocked = isWorkbenchVisible || Boolean(activeSession?.threadId);
   const getWorkflowResultUrl = useCallback(
     (kind: WorkflowResultKind) => {
@@ -3378,15 +3455,143 @@ export default function SelfEvolutionPage() {
     });
   };
 
-  const applyWorkflowEvent = (event: NormalizedThreadEvent) => {
+  const appendStreamDeltaToSession = (
+    sessionId: string,
+    kind: ChatStreamDeltaKind,
+    delta: string | undefined,
+    streamId = "default",
+  ) => {
+    if (!delta) {
+      return;
+    }
+
+    const nowLabel = getTimeLabel();
+    const streamMessageId = `${sessionId}-${kind}-stream-${streamId}`;
+    const initialContent = kind === "thinking" ? `思考过程：${delta}` : delta;
+
+    setChatSessions((prev) =>
+      prev.map((session) => {
+        if (session.id !== sessionId) {
+          return session;
+        }
+
+        const existingIndex = session.messages.findIndex((item) => item.id === streamMessageId);
+        if (existingIndex >= 0) {
+          const messages = [...session.messages];
+          const current = messages[existingIndex];
+          messages[existingIndex] = {
+            ...current,
+            content: `${current.content}${delta}`,
+            time: nowLabel,
+          };
+          return {
+            ...session,
+            updatedAt: nowLabel,
+            messages,
+          };
+        }
+
+        return {
+          ...session,
+          updatedAt: nowLabel,
+          messages: [
+            ...session.messages,
+            {
+              id: streamMessageId,
+              role: "assistant",
+              content: initialContent,
+              time: nowLabel,
+            },
+          ],
+        };
+      }),
+    );
+  };
+
+  const applyWorkflowEvent = (event: NormalizedThreadEvent, sessionId = activeSessionId) => {
+    const isNewEvent = !processedWorkflowEventKeysRef.current.has(event.key);
+    if (!isNewEvent) {
+      return;
+    }
+
+    processedWorkflowEventKeysRef.current.add(event.key);
     setThreadEvents((prev) => dedupeNormalizedEvents([...prev, event]));
+
+    const chatStreamDeltaKind = getChatStreamDeltaKind(event.type);
+    if (chatStreamDeltaKind) {
+      const streamId = getStringField(event.payload, ["message_id", "messageId", "id"]) || event.taskId || "default";
+      appendStreamDeltaToSession(sessionId, chatStreamDeltaKind, event.content, streamId);
+    }
+    const dialogueAgentLabel = getDialogueEventAgentLabel(event);
+    if (event.role && event.content && dialogueAgentLabel) {
+      appendMessageToSession(
+        sessionId,
+        {
+          id: `event-chat-${event.key}`,
+          role: event.role,
+          content: event.content,
+          time: formatThreadTime(event.timestamp),
+          sortTime:
+            getThreadTimeSortValue(event.timestamp) ||
+            (typeof event.sequence === "number" ? event.sequence : undefined),
+          agentLabel: dialogueAgentLabel,
+        },
+        { dedupeLast: true },
+      );
+    }
     if (!event.stage) {
       return;
     }
     setWorkflowRuntimeState((prev) => reduceWorkflowRuntimeState(prev, event));
   };
 
-  const subscribeThreadEvents = async (threadId: string) => {
+  const consumeThreadMessageStream = async (
+    response: Response,
+    sessionId: string,
+    signal?: AbortSignal,
+  ) => {
+    if (!response.body) {
+      return;
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done || signal?.aborted) {
+        break;
+      }
+
+      buffer += decoder.decode(value, { stream: true });
+      const frames = buffer.split(/\r?\n\r?\n/);
+      buffer = frames.pop() || "";
+
+      for (const rawFrame of frames) {
+        const frame = parseSSEFrame(rawFrame.trim());
+        if (!frame) {
+          continue;
+        }
+
+        const event = normalizeThreadEvent(frame);
+        applyWorkflowEvent(event, sessionId);
+        if (isTerminalThreadEvent(event.type)) {
+          return;
+        }
+      }
+    }
+
+    const trailingText = buffer.trim();
+    if (trailingText) {
+      const frame = parseSSEFrame(trailingText);
+      if (frame) {
+        applyWorkflowEvent(normalizeThreadEvent(frame), sessionId);
+      }
+    }
+  };
+
+  const subscribeThreadEvents = async (threadId: string, sessionId = activeSessionId) => {
     threadEventsAbortRef.current?.abort();
     const controller = new AbortController();
     threadEventsAbortRef.current = controller;
@@ -3437,8 +3642,8 @@ export default function SelfEvolutionPage() {
           }
 
           const event = normalizeThreadEvent(frame);
-          applyWorkflowEvent(event);
-          if (event.type === "thread.stop") {
+          applyWorkflowEvent(event, sessionId);
+          if (isTerminalThreadEvent(event.type)) {
             controller.abort();
           }
         });
@@ -3462,6 +3667,7 @@ export default function SelfEvolutionPage() {
     setThreadRestoreError("");
     setIsWorkbenchVisible(true);
     setThreadEvents([]);
+    processedWorkflowEventKeysRef.current = new Set();
 
     const restoredSessionId = `thread-${threadId}`;
     setActiveSessionId(restoredSessionId);
@@ -3526,14 +3732,21 @@ export default function SelfEvolutionPage() {
       if (knowledgeBaseId) {
         setSelectedKb(knowledgeBaseId);
       }
+      const restoredMode = fulfilledPayloads.map(getThreadModeFromPayload).find(Boolean);
+      if (restoredMode) {
+        setMode(restoredMode);
+      }
 
-      const restoredMessages = fulfilledPayloads.flatMap((payload) =>
-        normalizeChatMessagesFromPayload(payload, threadId),
-      );
-      const dedupedMessages = dedupeAndSortChatMessages(restoredMessages);
+      const roundsPayload =
+        roundsResult.status === "fulfilled" ? (roundsResult.value.data as ThreadRestorePayload) : undefined;
       const restoredEvents = dedupeNormalizedEvents(
         fulfilledPayloads.flatMap(normalizeWorkflowEventsFromPayload),
       );
+      const restoredMessages = dedupeAndSortChatMessages([
+        ...normalizeChatMessagesFromEvents(restoredEvents),
+        ...normalizeChatMessagesFromPayload(roundsPayload, threadId),
+      ]);
+      const dedupedMessages = restoredMessages;
       const restoredWorkflowState = restoredEvents.reduce(
         reduceWorkflowRuntimeState,
         createInitialWorkflowRuntimeState(),
@@ -3542,6 +3755,7 @@ export default function SelfEvolutionPage() {
 
       setWorkflowRuntimeState(restoredWorkflowState);
       setThreadEvents(restoredEvents);
+      processedWorkflowEventKeysRef.current = new Set(restoredEvents.map((event) => event.key));
       setChatSessions([
         {
           id: restoredSessionId,
@@ -3553,14 +3767,7 @@ export default function SelfEvolutionPage() {
       ]);
       setActiveSessionId(restoredSessionId);
       window.localStorage.setItem(SELF_EVOLUTION_LAST_THREAD_STORAGE_KEY, threadId);
-      const nextHistoryEntry = {
-        threadId,
-        title,
-        updatedAt: nowLabel,
-      };
-      upsertStoredThreadHistory(nextHistoryEntry);
-      setStoredThreadHistory(readStoredThreadHistory());
-      void subscribeThreadEvents(threadId);
+      void subscribeThreadEvents(threadId, restoredSessionId);
     } catch (error) {
       if (signal?.aborted || isCanceledRequest(error)) {
         return;
@@ -3635,17 +3842,36 @@ export default function SelfEvolutionPage() {
 
     if (activeThreadId) {
       setIsSendingMessage(true);
+      const controller = new AbortController();
       try {
-        const response = await axiosInstance.post(
-          `${AGENT_API_BASE}/threads/${encodeURIComponent(activeThreadId)}:messages`,
-          {
+        const response = await fetch(`${AGENT_API_BASE}/threads/${encodeURIComponent(activeThreadId)}:messages`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "text/event-stream",
+            ...AgentAppsAuth.getAuthHeaders(),
+          },
+          body: JSON.stringify({
             type: "message.user",
             role: "user",
             message: trimmedPrompt,
             content: trimmedPrompt,
-          },
-        );
-        const responsePayload = isRecord(response.data) ? response.data : undefined;
+          }),
+          signal: controller.signal,
+        });
+
+        if (!response.ok) {
+          throw new Error(`消息发送失败：HTTP ${response.status}`);
+        }
+
+        const contentType = response.headers.get("content-type") || "";
+        if (contentType.includes("text/event-stream")) {
+          await consumeThreadMessageStream(response, activeSessionId, controller.signal);
+          return;
+        }
+
+        const responseData = await response.json().catch(() => undefined);
+        const responsePayload = isRecord(responseData) ? responseData : undefined;
         const responseText = getNestedStringField(responsePayload, ["message", "content", "text", "reply"]);
         if (responseText) {
           appendMessageToSession(
@@ -3714,7 +3940,8 @@ export default function SelfEvolutionPage() {
       const threadId = await createAndStartThread();
       setWorkflowRuntimeState(createInitialWorkflowRuntimeState());
       setThreadEvents([]);
-      void subscribeThreadEvents(threadId);
+      processedWorkflowEventKeysRef.current = new Set();
+      void subscribeThreadEvents(threadId, activeSessionId);
       setIsWorkbenchVisible(true);
       window.localStorage.setItem(SELF_EVOLUTION_LAST_THREAD_STORAGE_KEY, threadId);
       const nowLabel = getTimeLabel();
@@ -3746,13 +3973,6 @@ export default function SelfEvolutionPage() {
             : session,
         ),
       );
-      const nextHistoryEntry = {
-        threadId,
-        title: activeSession.title === "当前会话" ? selectedKnowledgeBase : activeSession.title,
-        updatedAt: nowLabel,
-      };
-      upsertStoredThreadHistory(nextHistoryEntry);
-      setStoredThreadHistory(readStoredThreadHistory());
       navigate(`/self-evolution/detail/${encodeURIComponent(threadId)}`);
       message.success("已调用接口并启动自进化流程。", 1.2);
     } catch (error) {
@@ -3838,6 +4058,7 @@ export default function SelfEvolutionPage() {
     setHasLaunchValidationTriggered(false);
     setWorkflowRuntimeState(createInitialWorkflowRuntimeState());
     setThreadEvents([]);
+    processedWorkflowEventKeysRef.current = new Set();
     setChatSessions((prev) => [...prev, newSession]);
     setActiveSessionId(newSessionId);
     setPrompt("");
@@ -3873,10 +4094,6 @@ export default function SelfEvolutionPage() {
       });
       const nextRemoteThreads = normalizeThreadListPayload(response.data);
       setRemoteThreadHistory(nextRemoteThreads);
-      if (nextRemoteThreads.length > 0) {
-        nextRemoteThreads.forEach(upsertStoredThreadHistory);
-        setStoredThreadHistory(readStoredThreadHistory());
-      }
       if (nextRemoteThreads.length === 0) {
         message.info("暂未获取到服务端历史会话。", 1.2);
       }
@@ -3888,68 +4105,6 @@ export default function SelfEvolutionPage() {
       message.error(errorText, 2);
     } finally {
       setIsLoadingThreadHistoryList(false);
-    }
-  };
-
-  const onFetchThreadHistory = async () => {
-    if (!activeThreadId || isFetchingThreadHistory) {
-      return;
-    }
-
-    setIsFetchingThreadHistory(true);
-    try {
-      const response = await createCoreAgentApiClient().apiCoreAgentThreadsThreadIdHistoryGet({
-        threadId: activeThreadId,
-      });
-      const payload = response.data as unknown as ThreadRestorePayload;
-      const restoredMessages = normalizeChatMessagesFromPayload(payload, activeThreadId);
-      const dedupedMessages = dedupeAndSortChatMessages(restoredMessages);
-      const restoredEvents = dedupeNormalizedEvents(normalizeWorkflowEventsFromPayload(payload));
-      const nowLabel = getTimeLabel();
-
-      if (dedupedMessages.length === 0 && restoredEvents.length === 0) {
-        message.info("暂未获取到当前线程的会话历史。", 1.2);
-        return;
-      }
-
-      if (dedupedMessages.length > 0) {
-        setChatSessions((prev) =>
-          prev.map((session) =>
-            session.id === activeSessionId
-              ? {
-                  ...session,
-                  threadId: session.threadId || activeThreadId,
-                  messages: dedupedMessages,
-                  updatedAt: nowLabel,
-                }
-              : session,
-          ),
-        );
-      }
-
-      if (restoredEvents.length > 0) {
-        setThreadEvents(restoredEvents);
-        setWorkflowRuntimeState(
-          restoredEvents.reduce(reduceWorkflowRuntimeState, createInitialWorkflowRuntimeState()),
-        );
-      }
-
-      upsertStoredThreadHistory({
-        threadId: activeThreadId,
-        title: activeSession.title,
-        updatedAt: nowLabel,
-      });
-      setStoredThreadHistory(readStoredThreadHistory());
-
-      message.success("已获取当前线程的会话历史。", 1.2);
-    } catch (error) {
-      message.error(
-        getLocalizedErrorMessage(error, "获取会话历史失败，请稍后重试。") ||
-          "获取会话历史失败，请稍后重试。",
-        2,
-      );
-    } finally {
-      setIsFetchingThreadHistory(false);
     }
   };
 
@@ -3978,6 +4133,84 @@ export default function SelfEvolutionPage() {
       setActiveSessionId(entry.sessionId);
     }
     setIsHistorySessionModalOpen(false);
+  };
+
+  const resetToEmptySession = () => {
+    const nowLabel = getTimeLabel();
+    const nextSessionId = `session-${Date.now()}`;
+    setChatSessions([
+      {
+        id: nextSessionId,
+        title: "当前会话",
+        updatedAt: nowLabel,
+        messages: [],
+      },
+    ]);
+    setActiveSessionId(nextSessionId);
+    setIsWorkbenchVisible(false);
+    setWorkflowRuntimeState(createInitialWorkflowRuntimeState());
+    setWorkflowResults(createInitialWorkflowResultsState());
+    setThreadEvents([]);
+    processedWorkflowEventKeysRef.current = new Set();
+    setThreadRestoreError("");
+    setPrompt("");
+    navigate("/self-evolution");
+  };
+
+  const deleteHistorySession = async (entry: HistorySessionEntry) => {
+    if (deletingHistoryKeys.includes(entry.key)) {
+      return;
+    }
+
+    setDeletingHistoryKeys((prev) => [...prev, entry.key]);
+    try {
+      if (entry.threadId) {
+        await createCoreAgentApiClient().apiCoreAgentThreadsThreadIdHistoryDelete({
+          threadId: entry.threadId,
+        });
+        setRemoteThreadHistory((prev) => prev.filter((item) => item.threadId !== entry.threadId));
+        setChatSessions((prev) => prev.filter((session) => session.threadId !== entry.threadId));
+
+        if (window.localStorage.getItem(SELF_EVOLUTION_LAST_THREAD_STORAGE_KEY) === entry.threadId) {
+          window.localStorage.removeItem(SELF_EVOLUTION_LAST_THREAD_STORAGE_KEY);
+        }
+        if (entry.threadId === activeThreadId || entry.threadId === routeThreadId) {
+          threadEventsAbortRef.current?.abort();
+          threadEventsAbortRef.current = null;
+          resetToEmptySession();
+        }
+      } else if (entry.sessionId) {
+        setChatSessions((prev) => prev.filter((session) => session.id !== entry.sessionId));
+        if (entry.sessionId === activeSessionId) {
+          resetToEmptySession();
+        }
+      }
+
+      message.success("会话历史已删除。", 1.2);
+    } catch (error) {
+      message.error(
+        getLocalizedErrorMessage(error, "删除会话历史失败，请稍后重试。") ||
+          "删除会话历史失败，请稍后重试。",
+        2,
+      );
+    } finally {
+      setDeletingHistoryKeys((prev) => prev.filter((key) => key !== entry.key));
+    }
+  };
+
+  const onDeleteHistorySession = (entry: HistorySessionEntry, event: MouseEvent<HTMLElement>) => {
+    event.stopPropagation();
+    Modal.confirm({
+      title: "删除会话历史",
+      content: entry.threadId
+        ? "确认删除该线程的会话历史？删除后将调用服务端历史删除接口。"
+        : "确认删除该本地会话？",
+      okText: "删除",
+      okButtonProps: { danger: true },
+      cancelText: "取消",
+      centered: true,
+      onOk: () => deleteHistorySession(entry),
+    });
   };
 
   const renderKnowledgeBaseButton = (extraClassName = "", isLocked = false) => (
@@ -5273,7 +5506,7 @@ export default function SelfEvolutionPage() {
               <div className="self-evolution-step-scroll">
                 {workflowSteps.map((step, index) => (
                   <article
-                    key={step.id}
+                    key={step.renderKey || step.id}
                     className={`self-evolution-step-card is-${step.status}`}
                     style={{ animationDelay: `${index * 70}ms` }}
                   >
@@ -5485,29 +5718,13 @@ export default function SelfEvolutionPage() {
                     )}
                   </button>
                   {historySessionEntries.map((entry) => (
-                      <button
-                        key={entry.key}
-                        type="button"
-                        className="self-evolution-history-tab"
-                        title={entry.title}
-                        onClick={() =>
-                          onSelectHistorySession({
-                            sessionId: entry.sessionId,
-                            threadId: entry.threadId,
-                          })
-                        }
-                      >
-                        <span className="self-evolution-history-tab-icon">
-                          {entry.source === "thread" ? (
-                            <HistoryOutlined />
-                          ) : (
-                            <MessageOutlined />
-                          )}
-                        </span>
-                        <span className="self-evolution-history-tab-content">
-                          <span className="self-evolution-history-tab-label">{entry.title}</span>
-                        </span>
-                      </button>
+                    <HistorySessionTab
+                      key={entry.key}
+                      entry={entry}
+                      isDeleting={deletingHistoryKeys.includes(entry.key)}
+                      onSelect={onSelectHistorySession}
+                      onDelete={onDeleteHistorySession}
+                    />
                   ))}
                 </div>
                 <button
@@ -5532,87 +5749,19 @@ export default function SelfEvolutionPage() {
               </div>
             </div>
 
-            <div
-              ref={chatStreamRef}
-              className="self-evolution-chat-stream"
-              aria-live="polite"
-              aria-label="会话消息流"
-            >
-              {activeMessages.length > 0 ? (
-                activeMessages.map((item) => (
-                  <article key={item.id} className={`self-evolution-bubble is-${item.role}`}>
-                    <Paragraph>{item.content}</Paragraph>
-                    <Text>{item.time}</Text>
-                  </article>
-                ))
-              ) : (
-                <Paragraph className="self-evolution-chat-empty">
-                  当前会话暂无消息，请在底部输入指令开始。
-                </Paragraph>
-              )}
-            </div>
+            <ChatMessageStream messages={activeMessages} streamRef={chatStreamRef} />
 
-            <div className="self-evolution-chat-composer">
-              {pendingCheckpointWaitPrompt && (
-                <div className="self-evolution-checkpoint-wait" role="status" aria-live="polite">
-                  <div className="self-evolution-checkpoint-wait-icon">
-                    <ClockCircleFilled />
-                  </div>
-                  <div className="self-evolution-checkpoint-wait-content">
-                    <Text className="self-evolution-checkpoint-wait-title">等待确认下一步</Text>
-                    <Paragraph className="self-evolution-checkpoint-wait-message">
-                      {pendingCheckpointWaitPrompt.message}
-                    </Paragraph>
-                    <div className="self-evolution-checkpoint-wait-meta">
-                      {pendingCheckpointWaitPrompt.completedStageLabel && (
-                        <span>已完成：{pendingCheckpointWaitPrompt.completedStageLabel}</span>
-                      )}
-                      {pendingCheckpointWaitPrompt.nextOperationLabel && (
-                        <span>下一步：{pendingCheckpointWaitPrompt.nextOperationLabel}</span>
-                      )}
-                    </div>
-                  </div>
-                  <button
-                    type="button"
-                    className="self-evolution-checkpoint-wait-command"
-                    onClick={() => void onSend(pendingCheckpointWaitPrompt.command)}
-                    disabled={isSendingMessage}
-                  >
-                    {isSendingMessage ? "继续中..." : pendingCheckpointWaitPrompt.command}
-                  </button>
-                </div>
-              )}
-              <Input.TextArea
-                value={prompt}
-                onChange={(event) => setPrompt(event.target.value)}
-                autoSize={{ minRows: 2, maxRows: 4 }}
-                className="self-evolution-chatlike-input"
-                placeholder="继续输入指令，例如：请先扩展数据集样本，再进入评测阶段。"
-                aria-label="继续输入自进化指令"
-                onPressEnter={(event) => {
-                  if (event.shiftKey) {
-                    return;
-                  }
-                  event.preventDefault();
-                  if (prompt.trim()) {
-                    void onSend();
-                  }
-                }}
-              />
-
-              <div className="self-evolution-chat-composer-footer">
-                <div className="self-evolution-chat-composer-left">
-                  {renderKnowledgeAndModeTools()}
-                </div>
-
-                <div className="self-evolution-chatlike-actions">
-                  <Text className="self-evolution-chatlike-helper">
-                    {isSendingMessage ? "消息发送中" : activeStepText}
-                  </Text>
-                  {renderSendButton()}
-                </div>
-              </div>
-            </div>
+            <ChatComposer
+              activeStepText={activeStepText}
+              isAutoInteractionActive={isAutoInteractionActive}
+              isSendingMessage={isSendingMessage}
+              pendingCheckpointWaitPrompt={pendingCheckpointWaitPrompt}
+              prompt={prompt}
+              onPromptChange={setPrompt}
+              onSend={(command) => void onSend(command)}
+              renderKnowledgeAndModeTools={renderKnowledgeAndModeTools}
+              renderSendButton={renderSendButton}
+            />
           </section>
 
           <Modal
@@ -5635,17 +5784,6 @@ export default function SelfEvolutionPage() {
                     从服务端会话列表选择线程，进入后会自动恢复详情、历史消息与执行记录。
                   </Text>
                 </div>
-                {activeThreadId && (
-                  <button
-                    type="button"
-                    className="self-evolution-history-modal-sync"
-                    onClick={() => void onFetchThreadHistory()}
-                    disabled={isFetchingThreadHistory}
-                  >
-                    {isFetchingThreadHistory ? <LoadingOutlined spin /> : <HistoryOutlined />}
-                    <span>{isFetchingThreadHistory ? "同步中" : "同步当前"}</span>
-                  </button>
-                )}
               </header>
 
               {threadHistoryListError && (
@@ -5665,38 +5803,13 @@ export default function SelfEvolutionPage() {
                   </div>
                 ) : historySessionEntries.length > 0 ? (
                   historySessionEntries.map((entry) => (
-                    <button
+                    <HistorySessionItem
                       key={entry.key}
-                      type="button"
-                      className="self-evolution-history-modal-item"
-                      onClick={() => onSelectHistorySession(entry)}
-                      role="listitem"
-                    >
-                      <div className="self-evolution-history-modal-item-main">
-                        <div className="self-evolution-history-modal-item-title-row">
-                          <strong>{entry.title}</strong>
-                          <span
-                            className={`self-evolution-history-modal-item-badge is-${entry.source}`}
-                          >
-                            {entry.source === "thread" ? "线程会话" : "本地会话"}
-                          </span>
-                        </div>
-                        <span className="self-evolution-history-modal-item-meta">
-                          {entry.threadId
-                            ? `线程 ID：${entry.threadId}`
-                            : `消息数：${entry.messageCount || 0}`}
-                        </span>
-                      </div>
-                      <div className="self-evolution-history-modal-item-side">
-                        {entry.status && (
-                          <span className="self-evolution-history-modal-item-status">
-                            {entry.status}
-                          </span>
-                        )}
-                        <span>{entry.updatedAt}</span>
-                        <span>进入</span>
-                      </div>
-                    </button>
+                      entry={entry}
+                      isDeleting={deletingHistoryKeys.includes(entry.key)}
+                      onSelect={onSelectHistorySession}
+                      onDelete={onDeleteHistorySession}
+                    />
                   ))
                 ) : (
                   <div className="self-evolution-history-modal-empty">
@@ -5846,7 +5959,7 @@ export default function SelfEvolutionPage() {
               <div className="self-evolution-welcome-visual-badges" role="list" aria-label="流程状态">
                 {workflowSteps.map((step) => (
                   <span
-                    key={`welcome-badge-${step.id}`}
+                    key={`welcome-badge-${step.renderKey || step.id}`}
                     className={`self-evolution-welcome-visual-badge is-${step.status}`}
                     role="listitem"
                   >
@@ -5941,17 +6054,6 @@ export default function SelfEvolutionPage() {
                 从服务端会话列表选择线程，进入后会自动恢复详情、历史消息与执行记录。
               </Text>
             </div>
-            {activeThreadId && (
-              <button
-                type="button"
-                className="self-evolution-history-modal-sync"
-                onClick={() => void onFetchThreadHistory()}
-                disabled={isFetchingThreadHistory}
-              >
-                {isFetchingThreadHistory ? <LoadingOutlined spin /> : <HistoryOutlined />}
-                <span>{isFetchingThreadHistory ? "同步中" : "同步当前"}</span>
-              </button>
-            )}
           </header>
 
           {threadHistoryListError && (
@@ -5971,32 +6073,13 @@ export default function SelfEvolutionPage() {
               </div>
             ) : historySessionEntries.length > 0 ? (
               historySessionEntries.map((entry) => (
-                <button
+                <HistorySessionItem
                   key={entry.key}
-                  type="button"
-                  className="self-evolution-history-modal-item"
-                  onClick={() => onSelectHistorySession(entry)}
-                  role="listitem"
-                >
-                  <div className="self-evolution-history-modal-item-main">
-                    <div className="self-evolution-history-modal-item-title-row">
-                      <strong>{entry.title}</strong>
-                      <span className={`self-evolution-history-modal-item-badge is-${entry.source}`}>
-                        {entry.source === "thread" ? "线程会话" : "本地会话"}
-                      </span>
-                    </div>
-                    <span className="self-evolution-history-modal-item-meta">
-                      {entry.threadId ? `线程 ID：${entry.threadId}` : `消息数：${entry.messageCount || 0}`}
-                    </span>
-                  </div>
-                  <div className="self-evolution-history-modal-item-side">
-                    {entry.status && (
-                      <span className="self-evolution-history-modal-item-status">{entry.status}</span>
-                    )}
-                    <span>{entry.updatedAt}</span>
-                    <span>进入</span>
-                  </div>
-                </button>
+                  entry={entry}
+                  isDeleting={deletingHistoryKeys.includes(entry.key)}
+                  onSelect={onSelectHistorySession}
+                  onDelete={onDeleteHistorySession}
+                />
               ))
             ) : (
               <div className="self-evolution-history-modal-empty">

@@ -2507,11 +2507,10 @@
   background: #ffffff;
   color: #335273;
   height: 44px;
-  padding: 0 10px;
+  padding: 0 6px 0 10px;
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  cursor: pointer;
   min-width: 170px;
   max-width: 260px;
   transition:
@@ -2529,11 +2528,33 @@
   }
 }
 
+.self-evolution-history-tab-main {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+  cursor: pointer;
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.62;
+  }
+}
+
 .self-evolution-history-tab.is-active {
+  padding: 0 10px;
   border-color: transparent;
   background: linear-gradient(135deg, #1b7ce3 0%, #155dbf 100%);
   color: #f4f9ff;
   box-shadow: 0 8px 16px rgba(24, 101, 189, 0.28);
+  cursor: pointer;
 }
 
 .self-evolution-history-tab-icon {
@@ -2584,6 +2605,36 @@
     background: rgba(19, 88, 174, 0.12);
     color: #175fbf;
     opacity: 1;
+  }
+}
+
+.self-evolution-history-tab-delete {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: #7890ad;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition:
+    background 0.2s ease,
+    border-color 0.2s ease,
+    color 0.2s ease;
+
+  &:hover {
+    border-color: #ffd0d0;
+    background: #fff2f2;
+    color: #c42f2f;
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    color: #b3bfcc;
+    background: #f4f7fb;
   }
 }
 
@@ -2707,36 +2758,6 @@
   font-size: 13px;
 }
 
-.self-evolution-history-modal-sync {
-  flex: 0 0 auto;
-  height: 38px;
-  padding: 0 12px;
-  border: 1px solid #c9dbf2;
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.9);
-  color: #2f5378;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: all 0.2s ease;
-
-  &:hover {
-    border-color: #8cb8ea;
-    color: #165eb9;
-    background: #f2f8ff;
-  }
-
-  &:disabled {
-    cursor: not-allowed;
-    color: #9aaabd;
-    border-color: #d6e1ef;
-    background: #f6f9fc;
-  }
-}
-
 .self-evolution-history-modal-list {
   margin-top: 14px;
   display: flex;
@@ -2780,16 +2801,15 @@
 
 .self-evolution-history-modal-item {
   width: 100%;
-  padding: 12px 14px;
+  padding: 8px;
   border: 1px solid #d9e6f8;
   border-radius: 14px;
   background: rgba(255, 255, 255, 0.94);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 14px;
+  gap: 8px;
   text-align: left;
-  cursor: pointer;
   transition:
     transform 0.2s ease,
     border-color 0.2s ease,
@@ -2799,6 +2819,55 @@
     transform: translateY(-1px);
     border-color: #92bbed;
     box-shadow: 0 10px 20px rgba(70, 110, 166, 0.12);
+  }
+}
+
+.self-evolution-history-modal-item-select {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 6px;
+  border: 0;
+  background: transparent;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  text-align: left;
+  cursor: pointer;
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.62;
+  }
+}
+
+.self-evolution-history-modal-item-delete {
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: transparent;
+  color: #9a4b4b;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition:
+    background 0.2s ease,
+    border-color 0.2s ease,
+    color 0.2s ease;
+
+  &:hover {
+    border-color: #ffd0d0;
+    background: #fff2f2;
+    color: #c42f2f;
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    color: #b9a2a2;
+    background: #f8f2f2;
   }
 }
 
@@ -2960,6 +3029,16 @@
   }
 }
 
+.self-evolution-bubble-agent-label.ant-typography {
+  margin: 0 0 6px;
+  display: block;
+  text-align: left;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.2;
+  opacity: 0.86;
+}
+
 .self-evolution-bubble.is-assistant {
   align-self: flex-start;
   color: #224e78;
@@ -2983,6 +3062,34 @@
     inset 0 1px 0 rgba(255, 255, 255, 0.96),
     0 6px 14px rgba(68, 100, 145, 0.08);
   padding: 10px;
+}
+
+.self-evolution-chat-composer.is-auto {
+  padding: 12px;
+}
+
+.self-evolution-auto-interaction-status {
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #275b85;
+  border: 1px solid #cfe2f4;
+  border-radius: 12px;
+  background: linear-gradient(180deg, #f8fcff 0%, #eef6ff 100%);
+  padding: 10px 12px;
+
+  .anticon {
+    flex: 0 0 auto;
+    color: #1d70d3;
+    font-size: 16px;
+  }
+
+  span.ant-typography {
+    color: inherit;
+    font-size: 12px;
+    line-height: 1.45;
+  }
 }
 
 .self-evolution-checkpoint-wait {
@@ -3015,44 +3122,11 @@
   min-width: 0;
 }
 
-.self-evolution-checkpoint-wait-title.ant-typography {
-  display: block;
-  margin: 0 0 3px;
-  color: #7a4f13;
-  font-size: 13px;
-  font-weight: 800;
-}
-
 .self-evolution-checkpoint-wait-message.ant-typography {
   margin: 0;
   color: #5d4a2a;
   font-size: 12px;
   line-height: 1.5;
-}
-
-.self-evolution-checkpoint-wait-meta {
-  margin-top: 6px;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-
-  span {
-    max-width: 100%;
-    min-width: 0;
-    display: inline-flex;
-    align-items: center;
-    height: 22px;
-    padding: 0 8px;
-    border-radius: 999px;
-    border: 1px solid #efd08b;
-    background: rgba(255, 255, 255, 0.64);
-    color: #7b5a20;
-    font-size: 11px;
-    font-weight: 700;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
 }
 
 .self-evolution-checkpoint-wait-command {
@@ -3555,9 +3629,21 @@
   }
 
   .self-evolution-history-modal-head,
-  .self-evolution-history-modal-item {
+  .self-evolution-history-modal-item,
+  .self-evolution-history-modal-item-select {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .self-evolution-history-modal-item {
+    position: relative;
+    padding-right: 48px;
+  }
+
+  .self-evolution-history-modal-item-delete {
+    position: absolute;
+    top: 10px;
+    right: 10px;
   }
 
   .self-evolution-history-modal-item-side {
