@@ -198,10 +198,11 @@ export function ChatComposer({
       onSend();
     }
   };
+  const isCheckpointWaiting = Boolean(pendingCheckpointWaitPrompt);
 
   return (
     <div className={`self-evolution-chat-composer${isAutoInteractionActive ? " is-auto" : ""}`}>
-      {pendingCheckpointWaitPrompt && !isAutoInteractionActive && (
+      {pendingCheckpointWaitPrompt && (
         <div className="self-evolution-checkpoint-wait" role="status" aria-live="polite">
           <div className="self-evolution-checkpoint-wait-icon">
             <ClockCircleFilled />
@@ -222,7 +223,7 @@ export function ChatComposer({
         </div>
       )}
 
-      {isAutoInteractionActive ? (
+      {isAutoInteractionActive && !isCheckpointWaiting ? (
         <div className="self-evolution-auto-interaction-status" role="status" aria-live="polite">
           <MessageOutlined />
           <Text>自动交互进行中，模拟用户与回复 Agent 的消息会展示在上方对话流。</Text>

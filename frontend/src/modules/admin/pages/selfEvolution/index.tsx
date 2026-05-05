@@ -1106,76 +1106,6 @@ function normalizeThreadListPayload(payload: unknown): ThreadHistoryEntry[] {
     }, []);
 }
 
-function normalizeRoundMessagesFromPayload(payload: ThreadRestorePayload, threadId: string): ChatMessage[] {
-  const rounds = getNestedArrayField(payload, ["rounds"]);
-  const messages: ChatMessage[] = [];
-
-  rounds.forEach((item, index) => {
-    if (!isRecord(item)) {
-      return;
-    }
-
-    const roundId = getStringField(item, ["round_id", "id"]) || `${threadId}-round-${index}`;
-    const requestPayload = getNestedRecordField(item, ["request_payload", "payload"]);
-    const userContent =
-      getStringField(item, ["user_message", "message", "content", "input"]) ||
-      getNestedStringField(requestPayload, ["content", "message", "text", "input"]);
-    const timeValue = item.created_at || item.create_time || item.updated_at || item.update_time;
-
-    if (userContent) {
-      messages.push({
-        id: `${roundId}-user`,
-        role: "user",
-        content: userContent,
-        time: formatThreadTime(timeValue),
-        sortTime: getThreadTimeSortValue(timeValue),
-      });
-    }
-
-    const assistantContent =
-      getStringField(item, ["assistant_message", "assistant_reply", "reply", "response", "output"]) ||
-      getNestedStringField(getNestedRecordField(item, ["response_payload", "response", "result"]), [
-        "content",
-        "message",
-        "text",
-        "reply",
-        "output",
-      ]);
-    if (assistantContent) {
-      messages.push({
-        id: `${roundId}-assistant`,
-        role: "assistant",
-        content: assistantContent,
-        time: formatThreadTime(item.updated_at || item.update_time || timeValue),
-        sortTime: getThreadTimeSortValue(item.updated_at || item.update_time || timeValue),
-      });
-    }
-  });
-
-  return messages;
-}
-
-function dedupeAndSortChatMessages(messages: ChatMessage[]) {
-  const byId = Array.from(new Map(messages.map((item) => [item.id, item])).values());
-  const sortedMessages = byId.sort((a, b) => {
-    const aTime = a.sortTime || 0;
-    const bTime = b.sortTime || 0;
-    if (aTime !== bTime) {
-      return aTime - bTime;
-    }
-    return a.id.localeCompare(b.id, "zh-CN", { numeric: true });
-  });
-
-  return sortedMessages.filter((messageItem, index) => {
-    const previous = sortedMessages[index - 1];
-    return !previous || previous.role !== messageItem.role || previous.content !== messageItem.content;
-  });
-}
-
-function normalizeChatMessagesFromPayload(payload: ThreadRestorePayload, threadId: string): ChatMessage[] {
-  return dedupeAndSortChatMessages(normalizeRoundMessagesFromPayload(payload, threadId));
-}
-
 function getDialogueEventAgentLabel(event: NormalizedThreadEvent) {
   if (event.type === "message.user") {
     return "模拟用户";
@@ -1184,58 +1114,6 @@ function getDialogueEventAgentLabel(event: NormalizedThreadEvent) {
     return "回复 Agent";
   }
   return undefined;
-}
-
-function normalizeChatMessagesFromEvents(events: NormalizedThreadEvent[]): ChatMessage[] {
-  return events
-    .filter((event) => Boolean(event.role && event.content && getDialogueEventAgentLabel(event)))
-    .map((event) => ({
-      id: `event-chat-${event.key}`,
-      role: event.role as ChatRole,
-      content: event.content as string,
-      time: formatThreadTime(event.timestamp),
-      sortTime:
-        getThreadTimeSortValue(event.timestamp) ||
-        (typeof event.sequence === "number" ? event.sequence : 0),
-      agentLabel: getDialogueEventAgentLabel(event),
-    }));
-}
-
-function normalizeEventFrameFromRecord(record: Record<string, unknown>, index: number): ThreadEventFrame | undefined {
-  const rawFrame = getStringField(record, ["raw_frame", "rawFrame"]);
-  if (rawFrame) {
-    return {
-      id: getNestedStringField(record, ["id", "event_id", "record_id"]) || `restore-${index}`,
-      eventName: getNestedStringField(record, ["tag", "eventName", "event_name", "event", "type", "kind", "name"]) || "message",
-      data: rawFrame,
-    };
-  }
-
-  const eventName =
-    getNestedStringField(record, ["tag", "eventName", "event_name", "event", "type", "kind", "name"]) ||
-    "message";
-  const hasEventEnvelope = Boolean(
-    getStringField(record, ["tag", "stage", "task_id", "thread_id", "seq"]) ||
-      getNumberField(record, ["seq"]),
-  );
-  const rawData = record.data ?? record.payload ?? (hasEventEnvelope ? record : record.message ?? record);
-
-  let data = "";
-  if (typeof rawData === "string") {
-    data = rawData;
-  } else {
-    try {
-      data = JSON.stringify(rawData);
-    } catch {
-      return undefined;
-    }
-  }
-
-  return {
-    id: getNestedStringField(record, ["id", "event_id", "record_id"]) || `restore-${index}`,
-    eventName,
-    data,
-  };
 }
 
 function getEventPayloadData(payload: Record<string, unknown> | undefined) {
@@ -1302,6 +1180,13 @@ function getRuntimeProgressStatusLabel(action: string | undefined) {
     return "已暂停";
   }
   return "进行中";
+}
+
+function getCompletedProgressSnapshot(): WorkflowProgressSnapshot {
+  return {
+    statusText: "已完成",
+    percent: 100,
+  };
 }
 
 function parseStructuredRecord(value: unknown): Record<string, unknown> | undefined {
@@ -1956,20 +1841,22 @@ function normalizeThreadEvent(frame: ThreadEventFrame): NormalizedThreadEvent {
   const eventEnvelope = getThreadEventPayloadEnvelope(payload);
   const payloadType = getThreadEventTypeFromPayload(payload);
   const eventType = payloadType || (frame.eventName !== "message" ? frame.eventName : "");
+  const [typeStage, ...actionParts] = eventType.split(".");
+  const isCheckpointEvent = eventType.startsWith("checkpoint.");
   const stageFromPayload =
     toThreadEventStage(payload?.stage) ||
     toThreadEventStage(eventEnvelope?.stage);
-  const [typeStage, ...actionParts] = eventType.split(".");
-  const stage = stageFromPayload || toThreadEventStage(typeStage);
-  const action =
-    getStringField(payload, ["action"]) ||
-    getStringField(eventEnvelope, ["action"]) ||
-    (stage && actionParts.length > 0
-      ? actionParts.join(".")
-      : stage && eventType && !toThreadEventStage(eventType) && eventType !== "message"
-        ? eventType
-        : undefined);
-  const type = stage && action ? `${stage}.${action}` : eventType || "message";
+  const stage = isCheckpointEvent ? undefined : stageFromPayload || toThreadEventStage(typeStage);
+  const action = isCheckpointEvent
+    ? actionParts.join(".") || undefined
+    : getStringField(payload, ["action"]) ||
+      getStringField(eventEnvelope, ["action"]) ||
+      (stage && actionParts.length > 0
+        ? actionParts.join(".")
+        : stage && eventType && !toThreadEventStage(eventType) && eventType !== "message"
+          ? eventType
+          : undefined);
+  const type = isCheckpointEvent ? eventType : stage && action ? `${stage}.${action}` : eventType || "message";
   const role = type === "message.user" ? "user" : type === "message.assistant" ? "assistant" : undefined;
   const content = getThreadEventContentFromPayload(payload) || (!payload ? frame.data.trim() : undefined);
   const timestamp =
@@ -2103,26 +1990,6 @@ function normalizeThreadEvent(frame: ThreadEventFrame): NormalizedThreadEvent {
   };
 }
 
-function normalizeWorkflowEventsFromPayload(payload: ThreadRestorePayload): NormalizedThreadEvent[] {
-  const records = getNestedArrayField(payload, [
-    "thread_events",
-    "records",
-    "events",
-    "history",
-    "items",
-    "rounds",
-  ]);
-  return records
-    .map((item, index) => {
-      if (!isRecord(item)) {
-        return undefined;
-      }
-      const frame = normalizeEventFrameFromRecord(item, index);
-      return frame ? normalizeThreadEvent(frame) : undefined;
-    })
-    .filter((item): item is NormalizedThreadEvent => Boolean(item));
-}
-
 function compareNormalizedThreadEvents(a: NormalizedThreadEvent, b: NormalizedThreadEvent) {
   if (typeof a.sequence === "number" && typeof b.sequence === "number" && a.sequence !== b.sequence) {
     return a.sequence - b.sequence;
@@ -2139,8 +2006,20 @@ function compareNormalizedThreadEvents(a: NormalizedThreadEvent, b: NormalizedTh
   return a.key.localeCompare(b.key, "zh-CN", { numeric: true });
 }
 
+function getNormalizedEventDedupeKey(event: NormalizedThreadEvent) {
+  return [
+    getStringField(event.payload, ["thread_id"]) || "",
+    typeof event.sequence === "number" ? String(event.sequence) : "",
+    event.taskId || "",
+    event.type,
+    event.timestamp || "",
+  ]
+    .filter(Boolean)
+    .join(":") || event.key;
+}
+
 function dedupeNormalizedEvents(events: NormalizedThreadEvent[]) {
-  return Array.from(new Map(events.map((item) => [item.key, item])).values()).sort(compareNormalizedThreadEvents);
+  return Array.from(new Map(events.map((item) => [getNormalizedEventDedupeKey(item), item])).values()).sort(compareNormalizedThreadEvents);
 }
 
 function getWorkflowStepIndex(stepId: WorkflowStepId | undefined) {
@@ -2174,19 +2053,25 @@ function buildWorkflowStepRuntimeFromEvents(events: NormalizedThreadEvent[], isS
   events.forEach((event) => {
     if (event.action === "finish") {
       snapshot.status = "done";
+      snapshot.progress = event.progress || getCompletedProgressSnapshot();
     } else if (event.action === "cancel") {
       snapshot.status = "canceled";
     } else if (event.action === "pause") {
       snapshot.status = "paused";
     } else {
       snapshot.status = "running";
+      snapshot.progress = event.progress || snapshot.progress;
     }
-    snapshot.progress = event.progress || snapshot.progress;
     snapshot.runtimeText = event.progress ? undefined : event.displayText;
   });
 
   if (isSuperseded && snapshot.status === "running") {
     snapshot.status = "done";
+    snapshot.progress = getCompletedProgressSnapshot();
+  }
+
+  if (snapshot.status === "done") {
+    snapshot.progress = getCompletedProgressSnapshot();
   }
 
   return snapshot;
@@ -2636,14 +2521,15 @@ function reduceWorkflowRuntimeState(
   const current = next[stepId];
   if (action === "finish") {
     current.status = "done";
+    current.progress = event.progress || getCompletedProgressSnapshot();
   } else if (action === "cancel") {
     current.status = "canceled";
   } else if (action === "pause") {
     current.status = "paused";
   } else {
     current.status = "running";
+    current.progress = event.progress || current.progress;
   }
-  current.progress = event.progress || current.progress;
   current.runtimeText = event.progress ? undefined : event.displayText;
   return next;
 }
@@ -2738,12 +2624,14 @@ export default function SelfEvolutionPage() {
   const [workflowResults, setWorkflowResults] = useState<WorkflowResultsState>(
     createInitialWorkflowResultsState,
   );
+  const [liveCheckpointWaitPrompt, setLiveCheckpointWaitPrompt] = useState<CheckpointWaitPrompt>();
   const [diffArtifactContent, setDiffArtifactContent] = useState<DiffArtifactContentState>({
     loading: false,
     key: "",
     content: "",
   });
   const [threadEvents, setThreadEvents] = useState<NormalizedThreadEvent[]>([]);
+  const threadEventsRef = useRef<NormalizedThreadEvent[]>([]);
   const [remoteThreadHistory, setRemoteThreadHistory] = useState<ThreadHistoryEntry[]>([]);
   const [chatSessions, setChatSessions] = useState<ChatSession[]>([
     {
@@ -2755,7 +2643,7 @@ export default function SelfEvolutionPage() {
   ]);
   const [activeSessionId, setActiveSessionId] = useState("session-1");
   const chatStreamRef = useRef<HTMLDivElement | null>(null);
-  const threadEventsAbortRef = useRef<AbortController | null>(null);
+  const threadEventsAbortRef = useRef<{ threadId: string; controller: AbortController } | null>(null);
   const processedThreadEventIdsRef = useRef<Set<string>>(new Set());
   const processedWorkflowEventKeysRef = useRef<Set<string>>(new Set());
   const restoreRequestIdRef = useRef(0);
@@ -2876,8 +2764,8 @@ export default function SelfEvolutionPage() {
   const analysisRunSummary = useMemo(() => buildAnalysisRunSummary(threadEvents), [threadEvents]);
   const applyRunSummary = useMemo(() => buildApplyRunSummary(threadEvents), [threadEvents]);
   const pendingCheckpointWaitPrompt = useMemo(
-    () => getPendingCheckpointWaitPrompt(threadEvents),
-    [threadEvents],
+    () => liveCheckpointWaitPrompt || getPendingCheckpointWaitPrompt(threadEvents),
+    [liveCheckpointWaitPrompt, threadEvents],
   );
   const activeStepText = useMemo(() => {
     const activeStep =
@@ -3290,7 +3178,7 @@ export default function SelfEvolutionPage() {
 
   useEffect(
     () => () => {
-      threadEventsAbortRef.current?.abort();
+      threadEventsAbortRef.current?.controller.abort();
       threadEventsAbortRef.current = null;
     },
     [],
@@ -3455,6 +3343,19 @@ export default function SelfEvolutionPage() {
     });
   };
 
+  const replaceThreadEvents = (events: NormalizedThreadEvent[]) => {
+    threadEventsRef.current = events;
+    setLiveCheckpointWaitPrompt(undefined);
+    setThreadEvents(events);
+  };
+
+  const mergeThreadEvents = (events: NormalizedThreadEvent[]) => {
+    const mergedEvents = dedupeNormalizedEvents([...threadEventsRef.current, ...events]);
+    threadEventsRef.current = mergedEvents;
+    setThreadEvents(mergedEvents);
+    return mergedEvents;
+  };
+
   const appendStreamDeltaToSession = (
     sessionId: string,
     kind: ChatStreamDeltaKind,
@@ -3515,7 +3416,23 @@ export default function SelfEvolutionPage() {
     }
 
     processedWorkflowEventKeysRef.current.add(event.key);
-    setThreadEvents((prev) => dedupeNormalizedEvents([...prev, event]));
+    mergeThreadEvents([event]);
+    if (event.checkpointWait) {
+      setLiveCheckpointWaitPrompt(event.checkpointWait);
+    } else {
+      setLiveCheckpointWaitPrompt((prev) => {
+        if (!prev) {
+          return prev;
+        }
+        if (event.type === "checkpoint.continue") {
+          return undefined;
+        }
+        if (prev.nextStage && event.stage === prev.nextStage) {
+          return undefined;
+        }
+        return prev;
+      });
+    }
 
     const chatStreamDeltaKind = getChatStreamDeltaKind(event.type);
     if (chatStreamDeltaKind) {
@@ -3592,10 +3509,19 @@ export default function SelfEvolutionPage() {
   };
 
   const subscribeThreadEvents = async (threadId: string, sessionId = activeSessionId) => {
-    threadEventsAbortRef.current?.abort();
-    const controller = new AbortController();
-    threadEventsAbortRef.current = controller;
+    const activeSubscription = threadEventsAbortRef.current;
+    if (activeSubscription?.threadId === threadId && !activeSubscription.controller.signal.aborted) {
+      return;
+    }
+
+    if (activeSubscription && !activeSubscription.controller.signal.aborted) {
+      activeSubscription.controller.abort();
+    }
     processedThreadEventIdsRef.current = new Set();
+
+    const controller = new AbortController();
+    const subscription = { threadId, controller };
+    threadEventsAbortRef.current = subscription;
 
     try {
       const response = await fetch(`${AGENT_API_BASE}/threads/${encodeURIComponent(threadId)}:events`, {
@@ -3620,7 +3546,7 @@ export default function SelfEvolutionPage() {
 
       while (true) {
         const { value, done } = await reader.read();
-        if (done) {
+        if (done || controller.signal.aborted) {
           break;
         }
 
@@ -3628,15 +3554,15 @@ export default function SelfEvolutionPage() {
         const frames = buffer.split(/\r?\n\r?\n/);
         buffer = frames.pop() || "";
 
-        frames.forEach((rawFrame) => {
+        for (const rawFrame of frames) {
           const frame = parseSSEFrame(rawFrame.trim());
           if (!frame) {
-            return;
+            continue;
           }
 
           if (frame.id) {
             if (processedThreadEventIdsRef.current.has(frame.id)) {
-              return;
+              continue;
             }
             processedThreadEventIdsRef.current.add(frame.id);
           }
@@ -3645,8 +3571,17 @@ export default function SelfEvolutionPage() {
           applyWorkflowEvent(event, sessionId);
           if (isTerminalThreadEvent(event.type)) {
             controller.abort();
+            break;
           }
-        });
+        }
+      }
+
+      const trailingText = buffer.trim();
+      if (!controller.signal.aborted && trailingText) {
+        const frame = parseSSEFrame(trailingText);
+        if (frame) {
+          applyWorkflowEvent(normalizeThreadEvent(frame), sessionId);
+        }
       }
     } catch (error) {
       if (controller.signal.aborted) {
@@ -3654,7 +3589,7 @@ export default function SelfEvolutionPage() {
       }
       message.error(getLocalizedErrorMessage(error, "线程事件流连接失败，请检查 SSE 接口。"), 2);
     } finally {
-      if (threadEventsAbortRef.current === controller) {
+      if (threadEventsAbortRef.current === subscription) {
         threadEventsAbortRef.current = null;
       }
     }
@@ -3666,10 +3601,11 @@ export default function SelfEvolutionPage() {
     setIsRestoringThread(true);
     setThreadRestoreError("");
     setIsWorkbenchVisible(true);
-    setThreadEvents([]);
+    replaceThreadEvents([]);
     processedWorkflowEventKeysRef.current = new Set();
 
     const restoredSessionId = `thread-${threadId}`;
+    subscribeThreadEvents(threadId, restoredSessionId);
     setActiveSessionId(restoredSessionId);
     setChatSessions([
       {
@@ -3690,84 +3626,45 @@ export default function SelfEvolutionPage() {
 
     try {
       const encodedThreadId = encodeURIComponent(threadId);
-      const coreAgentClient = createCoreAgentApiClient();
-      const [threadResult, historyResult, recordsResult, roundsResult] = await Promise.allSettled([
-        axiosInstance.get(`${AGENT_API_BASE}/threads/${encodedThreadId}`, { signal }),
-        coreAgentClient.apiCoreAgentThreadsThreadIdHistoryGet({ threadId }, { signal }),
-        axiosInstance.get(`${AGENT_API_BASE}/threads/${encodedThreadId}/records`, { signal }),
-        axiosInstance.get(`${AGENT_API_BASE}/threads/${encodedThreadId}/rounds`, { signal }),
-      ]);
+      const threadResult = await axiosInstance.get(`${AGENT_API_BASE}/threads/${encodedThreadId}`, { signal });
 
       if (signal?.aborted || restoreRequestIdRef.current !== requestId) {
         return;
       }
 
-      const fulfilledPayloads: ThreadRestorePayload[] = [];
-      [threadResult, historyResult, recordsResult, roundsResult].forEach((result) => {
-        if (result.status === "fulfilled") {
-          fulfilledPayloads.push(result.value.data as ThreadRestorePayload);
-        }
-      });
-
-      if (fulfilledPayloads.length === 0) {
-        const rejectedReason =
-          threadResult.status === "rejected"
-            ? threadResult.reason
-            : historyResult.status === "rejected"
-              ? historyResult.reason
-              : recordsResult.status === "rejected"
-                ? recordsResult.reason
-                : roundsResult.status === "rejected"
-                  ? roundsResult.reason
-                  : undefined;
-        throw rejectedReason || new Error("线程详情恢复失败");
-      }
-
-      const threadPayload = threadResult.status === "fulfilled" ? threadResult.value.data : undefined;
+      const threadPayload = threadResult.data as ThreadRestorePayload;
       const title =
         getThreadTitleFromPayload(threadPayload) ||
-        fulfilledPayloads.map(getThreadTitleFromPayload).find(Boolean) ||
         `自进化详情 ${threadId.slice(0, 8)}`;
-      const knowledgeBaseId = fulfilledPayloads.map(getThreadKnowledgeBaseId).find(Boolean);
+      const knowledgeBaseId = getThreadKnowledgeBaseId(threadPayload);
       if (knowledgeBaseId) {
         setSelectedKb(knowledgeBaseId);
       }
-      const restoredMode = fulfilledPayloads.map(getThreadModeFromPayload).find(Boolean);
+      const restoredMode = getThreadModeFromPayload(threadPayload);
       if (restoredMode) {
         setMode(restoredMode);
       }
-
-      const roundsPayload =
-        roundsResult.status === "fulfilled" ? (roundsResult.value.data as ThreadRestorePayload) : undefined;
-      const restoredEvents = dedupeNormalizedEvents(
-        fulfilledPayloads.flatMap(normalizeWorkflowEventsFromPayload),
-      );
-      const restoredMessages = dedupeAndSortChatMessages([
-        ...normalizeChatMessagesFromEvents(restoredEvents),
-        ...normalizeChatMessagesFromPayload(roundsPayload, threadId),
-      ]);
-      const dedupedMessages = restoredMessages;
-      const restoredWorkflowState = restoredEvents.reduce(
-        reduceWorkflowRuntimeState,
-        createInitialWorkflowRuntimeState(),
-      );
       const nowLabel = getTimeLabel();
 
-      setWorkflowRuntimeState(restoredWorkflowState);
-      setThreadEvents(restoredEvents);
-      processedWorkflowEventKeysRef.current = new Set(restoredEvents.map((event) => event.key));
-      setChatSessions([
-        {
-          id: restoredSessionId,
-          title,
-          updatedAt: nowLabel,
-          threadId,
-          messages: dedupedMessages,
-        },
-      ]);
+      setChatSessions((prev) =>
+        prev.map((session) =>
+          session.id === restoredSessionId
+            ? {
+                ...session,
+                title,
+                updatedAt: nowLabel,
+                threadId,
+                messages:
+                  session.messages.length === 1 &&
+                  session.messages[0]?.id === `${threadId}-restore-loading`
+                    ? []
+                    : session.messages,
+              }
+            : session,
+        ),
+      );
       setActiveSessionId(restoredSessionId);
       window.localStorage.setItem(SELF_EVOLUTION_LAST_THREAD_STORAGE_KEY, threadId);
-      void subscribeThreadEvents(threadId, restoredSessionId);
     } catch (error) {
       if (signal?.aborted || isCanceledRequest(error)) {
         return;
@@ -3939,7 +3836,7 @@ export default function SelfEvolutionPage() {
     try {
       const threadId = await createAndStartThread();
       setWorkflowRuntimeState(createInitialWorkflowRuntimeState());
-      setThreadEvents([]);
+      replaceThreadEvents([]);
       processedWorkflowEventKeysRef.current = new Set();
       void subscribeThreadEvents(threadId, activeSessionId);
       setIsWorkbenchVisible(true);
@@ -4057,7 +3954,7 @@ export default function SelfEvolutionPage() {
     setMode(nextMode);
     setHasLaunchValidationTriggered(false);
     setWorkflowRuntimeState(createInitialWorkflowRuntimeState());
-    setThreadEvents([]);
+    replaceThreadEvents([]);
     processedWorkflowEventKeysRef.current = new Set();
     setChatSessions((prev) => [...prev, newSession]);
     setActiveSessionId(newSessionId);
@@ -4150,7 +4047,7 @@ export default function SelfEvolutionPage() {
     setIsWorkbenchVisible(false);
     setWorkflowRuntimeState(createInitialWorkflowRuntimeState());
     setWorkflowResults(createInitialWorkflowResultsState());
-    setThreadEvents([]);
+    replaceThreadEvents([]);
     processedWorkflowEventKeysRef.current = new Set();
     setThreadRestoreError("");
     setPrompt("");
@@ -4175,7 +4072,7 @@ export default function SelfEvolutionPage() {
           window.localStorage.removeItem(SELF_EVOLUTION_LAST_THREAD_STORAGE_KEY);
         }
         if (entry.threadId === activeThreadId || entry.threadId === routeThreadId) {
-          threadEventsAbortRef.current?.abort();
+          threadEventsAbortRef.current?.controller.abort();
           threadEventsAbortRef.current = null;
           resetToEmptySession();
         }
