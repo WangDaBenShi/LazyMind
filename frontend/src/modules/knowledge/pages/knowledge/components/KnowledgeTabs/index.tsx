@@ -17,13 +17,21 @@ import QaTab from "../QaTab";
 import Rendering from "@/modules/knowledge/components/Rendering";
 import "./index.scss";
 
-enum GroupMapKey {
-  lazyllm_root = 1,
-  block = 2,
-  summary = 3,
-  qa = 4,
-  hybrid = 5,
-}
+const TAB_KEY_BY_PARSER_TYPE: Partial<Record<ParserConfigTypeEnum, string>> = {
+  [ParserConfigTypeEnum.ParseTypeSplit]: "3",
+  [ParserConfigTypeEnum.ParseTypeSummary]: "2",
+  [ParserConfigTypeEnum.ParseTypeQa]: "4",
+  [ParserConfigTypeEnum.ParseTypeImageCaption]: "5",
+};
+
+const FALLBACK_TAB_KEY_BY_GROUP: Record<string, string> = {
+  lazyllm_root: "3",
+  block: "3",
+  line: "3",
+  summary: "2",
+  qa: "4",
+  hybrid: "5",
+};
 
 const KnowledgeTabs = (props: {
   knowledgeDetail: Doc;
@@ -42,25 +50,34 @@ const KnowledgeTabs = (props: {
     return searchParams.get("group_name") || "";
   }, [searchParams]);
 
+  function getActiveKeyByGroup(configs: ParserConfig[], groupName: string) {
+    if (!groupName) {
+      return "";
+    }
+
+    const matchedParser = configs.find((parser) => parser.name === groupName);
+    if (matchedParser?.type) {
+      return TAB_KEY_BY_PARSER_TYPE[matchedParser.type] || "";
+    }
+
+    return FALLBACK_TAB_KEY_BY_GROUP[groupName] || "";
+  }
+
   useEffect(() => {
     setLoading(true);
     KnowledgeBaseServiceApi()
       .datasetServiceGetDataset({ dataset: knowledgeDetail.dataset_id || "" })
       .then((res) => {
-        const result = res.data.parsers || [];
+        const result = (res.data.parsers || []) as ParserConfig[];
         setParsers(result);
         const currentTabs = generateTabs(result);
         setTabs(currentTabs);
-        if (searchParams.get("group_name")) {
-          const groupName = searchParams.get("group_name") || "";
-          if (groupName === "block" || groupName === "line") {
-            setActiveKey("2");
-          } else {
-            setActiveKey(
-              GroupMapKey[groupName as keyof typeof GroupMapKey]?.toString() ||
-                "2",
-            );
-          }
+        const routeActiveKey = getActiveKeyByGroup(result, group);
+        if (
+          routeActiveKey &&
+          currentTabs.some((tab) => tab.key === routeActiveKey)
+        ) {
+          setActiveKey(routeActiveKey);
         } else {
           setActiveKey(currentTabs.length > 0 ? currentTabs[0].key : "");
         }
@@ -68,7 +85,7 @@ const KnowledgeTabs = (props: {
       .finally(() => {
         setLoading(false);
       });
-  }, [knowledgeDetail]);
+  }, [knowledgeDetail, group]);
 
   function generateTabs(configs: ParserConfig[]) {
     if (!configs || configs.length < 1) {

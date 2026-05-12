@@ -20,6 +20,9 @@ import GroupDetail from "@/modules/admin/pages/group/detail.tsx";
 import DataSourceManagement from "@/modules/dataSource";
 import DataSourceDetail from "@/modules/dataSource/detail";
 import DataSourceFeishuCallback from "@/modules/dataSource/feishuCallback";
+import DatasetManagement from "@/modules/datasetManagement";
+import DatasetDetailPage from "@/modules/datasetManagement/pages/detail";
+import DatasetDocumentDetailPage from "@/modules/datasetManagement/pages/documentDetail";
 import MemoryManagement from "@/modules/memory";
 import MemoryManagementListPage from "@/modules/memory/pages/list";
 import MemoryReviewPage from "@/modules/memory/pages/review";
@@ -65,6 +68,9 @@ export default function AppRouter() {
           </Route>
           <Route path="data-sources" element={<DataSourceManagement />} />
           <Route path="data-sources/:id" element={<DataSourceDetail />} />
+          <Route path="datasets" element={<DatasetManagement />} />
+          <Route path="datasets/:datasetId" element={<DatasetDetailPage />} />
+          <Route path="datasets/:datasetId/documents/:documentId" element={<DatasetDocumentDetailPage />} />
           <Route path="model-providers" element={<ModelProviderPage />} />
           <Route path="memory-management" element={<MemoryManagement />}>
             <Route index element={<MemoryManagementListPage />} />

@@ -99,6 +99,83 @@ function normalizeScheduleTime(scheduleTime?: string) {
   return SCHEDULE_TIME_PATTERN.test(value) ? value : DEFAULT_SCHEDULE_TIME;
 }
 
+function toScheduleHourMinute(scheduleTime?: string) {
+  return normalizeScheduleTime(scheduleTime).slice(0, 5);
+}
+
+function buildScanReconcileScheduleExpr(scheduleCycle?: string, scheduleTime?: string) {
+  const hourMinute = toScheduleHourMinute(scheduleTime);
+  if (scheduleCycle === "twoDays") {
+    return `every2d@${hourMinute}`;
+  }
+  if (scheduleCycle === "weekly") {
+    return `every7d@${hourMinute}`;
+  }
+  return `daily@${hourMinute}`;
+}
+
+function getScheduleCycleLabel(scheduleCycle: string, t: TFunction) {
+  if (scheduleCycle === "weekly") {
+    return t("admin.dataSourceCycleWeekly");
+  }
+  if (scheduleCycle === "twoDays") {
+    return t("admin.dataSourceCycleTwoDays");
+  }
+  return t("admin.dataSourceCycleDaily");
+}
+
+function parseScanReconcileScheduleExpr(expr?: string) {
+  const trimmed = `${expr || ""}`.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const normalized = trimmed.replace(/：/g, ":");
+  const dailyMatch = normalized.match(/^daily@(([01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?)$/i);
+  if (dailyMatch) {
+    return {
+      scheduleCycle: "daily",
+      scheduleTime: normalizeScheduleTime(dailyMatch[1]),
+    };
+  }
+
+  const everyDaysMatch = normalized.match(
+    /^every([1-9]\d*)d@(([01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?)$/i,
+  );
+  if (everyDaysMatch) {
+    const days = Number(everyDaysMatch[1]);
+    return {
+      scheduleCycle: days >= 7 ? "weekly" : days === 2 ? "twoDays" : "daily",
+      scheduleTime: normalizeScheduleTime(everyDaysMatch[2]),
+    };
+  }
+
+  return null;
+}
+
+function parseScanReconcileSeconds(reconcileSeconds?: number) {
+  const seconds = reconcileSeconds || 0;
+  if (seconds === 7 * 24 * 60 * 60) {
+    return {
+      scheduleCycle: "weekly",
+      scheduleTime: DEFAULT_SCHEDULE_TIME,
+    };
+  }
+  if (seconds === 2 * 24 * 60 * 60) {
+    return {
+      scheduleCycle: "twoDays",
+      scheduleTime: DEFAULT_SCHEDULE_TIME,
+    };
+  }
+  if (seconds === 24 * 60 * 60) {
+    return {
+      scheduleCycle: "daily",
+      scheduleTime: DEFAULT_SCHEDULE_TIME,
+    };
+  }
+  return null;
+}
+
 const sourceTypeOptions: Array<{
   type: SourceType;
   icon: ReactNode;
@@ -272,7 +349,7 @@ function parseFeishuScheduleExpr(expr?: string) {
 }
 
 function buildFeishuScheduleExpr(scheduleTime?: string) {
-  return `daily@${normalizeScheduleTime(scheduleTime)}`;
+  return `daily@${toScheduleHourMinute(scheduleTime)}`;
 }
 
 function buildFeishuScheduleLabel(binding: CloudSourceBinding | null, t: TFunction) {
@@ -494,22 +571,40 @@ export default function DataSourceManagement() {
       return t("admin.dataSourceSyncModeManual");
     }
 
+    const parsedSchedule = parseScanReconcileScheduleExpr(source.reconcile_schedule);
+    if (parsedSchedule) {
+      return t("admin.dataSourceScheduleLabel", {
+        cycle: getScheduleCycleLabel(parsedSchedule.scheduleCycle, t),
+        time: parsedSchedule.scheduleTime,
+      });
+    }
+
+    const fallbackSchedule = parseScanReconcileSeconds(source.reconcile_seconds);
+    if (fallbackSchedule) {
+      return t("admin.dataSourceScheduleLabel", {
+        cycle: getScheduleCycleLabel(fallbackSchedule.scheduleCycle, t),
+        time: fallbackSchedule.scheduleTime,
+      });
+    }
     const reconcileSeconds = source.reconcile_seconds || 0;
-    if (reconcileSeconds === 7 * 24 * 60 * 60) {
-      return `${t("admin.dataSourceCycleWeekly")} (${reconcileSeconds}s)`;
-    }
-    if (reconcileSeconds === 2 * 24 * 60 * 60) {
-      return `${t("admin.dataSourceCycleTwoDays")} (${reconcileSeconds}s)`;
-    }
-    if (reconcileSeconds === 24 * 60 * 60) {
-      return `${t("admin.dataSourceCycleDaily")} (${reconcileSeconds}s)`;
-    }
     return `${t("admin.dataSourceSyncModeScheduled")} (${reconcileSeconds}s)`;
   };
 
   const buildScanNextSyncLabel = (source: ScanSource) => {
     if (!source.watch_enabled) {
       return t("admin.dataSourceNextSyncManual");
+    }
+    const parsedSchedule = parseScanReconcileScheduleExpr(source.reconcile_schedule);
+    if (parsedSchedule) {
+      return t("admin.dataSourceNextSyncPlanned", {
+        time: parsedSchedule.scheduleTime,
+      });
+    }
+    const fallbackSchedule = parseScanReconcileSeconds(source.reconcile_seconds);
+    if (fallbackSchedule) {
+      return t("admin.dataSourceNextSyncPlanned", {
+        time: fallbackSchedule.scheduleTime,
+      });
     }
     const reconcileSeconds = source.reconcile_seconds || 0;
     const hourEstimate = Math.max(1, Math.round(reconcileSeconds / 3600));
@@ -1254,6 +1349,9 @@ export default function DataSourceManagement() {
     const sourceName = `${values.knowledgeBase || getSourceTypeTitle("local", t)}`.trim();
     const isScheduled = (values.syncMode || "scheduled") === "scheduled";
     const reconcileSeconds = getReconcileSeconds(values.scheduleCycle);
+    const reconcileSchedule = isScheduled
+      ? buildScanReconcileScheduleExpr(values.scheduleCycle, values.scheduleTime)
+      : undefined;
     const currentLocalSource =
       editingId && selectedType === "local"
         ? sources.find((item) => item.id === editingId && item.type === "local")
@@ -1289,6 +1387,7 @@ export default function DataSourceManagement() {
             name: sourceName,
             root_path: rootPath,
             reconcile_seconds: reconcileSeconds,
+            ...(reconcileSchedule ? { reconcile_schedule: reconcileSchedule } : {}),
             idle_window_seconds: 300,
           },
         });
@@ -1298,6 +1397,7 @@ export default function DataSourceManagement() {
             id: currentLocalSource.id,
             enableWatchRequest: {
               reconcile_seconds: reconcileSeconds,
+              reconcile_schedule: reconcileSchedule,
             },
           });
         } else {
@@ -1334,6 +1434,7 @@ export default function DataSourceManagement() {
             root_path: rootPath,
             watch_enabled: isScheduled,
             reconcile_seconds: reconcileSeconds,
+            ...(reconcileSchedule ? { reconcile_schedule: reconcileSchedule } : {}),
             idle_window_seconds: 300,
           },
         });
@@ -1349,6 +1450,7 @@ export default function DataSourceManagement() {
             id: createdSourceId,
             enableWatchRequest: {
               reconcile_seconds: reconcileSeconds,
+              reconcile_schedule: reconcileSchedule,
             },
           });
         } else {

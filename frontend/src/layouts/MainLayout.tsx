@@ -11,6 +11,7 @@ import {
   GlobalOutlined,
   DatabaseOutlined,
   ApiOutlined,
+  BarsOutlined,
   LeftOutlined,
   RightOutlined,
 } from "@ant-design/icons";
@@ -115,6 +116,7 @@ export default function MainLayout() {
       children: [
         { key: "/lib/knowledge", label: t("layout.knowledgeBase"), icon: <AppstoreOutlined /> },
         { key: "/data-sources", label: t("layout.dataSourceManagement"), icon: <DatabaseOutlined /> },
+        { key: "/datasets", label: t("layout.datasetManagement"), icon: <BarsOutlined /> },
         { key: "/model-providers", label: t("layout.modelProviderManagement"), icon: <ApiOutlined /> },
       ],
     },
@@ -214,6 +216,8 @@ export default function MainLayout() {
       key = "/lib/knowledge";
     } else if (pathname.startsWith("/data-sources")) {
       key = "/data-sources";
+    } else if (pathname.startsWith("/datasets")) {
+      key = "/datasets";
     } else if (pathname.startsWith("/model-providers")) {
       key = "/model-providers";
     } else if (pathname.startsWith("/memory-management")) {

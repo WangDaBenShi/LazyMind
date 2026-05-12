@@ -39,7 +39,6 @@ import {
   type DocumentStatusRow,
   formatBytes,
   formatDateTime,
-  isDataSourceUpdateState,
   normalizeDataSourceFileUpdateState,
   normalizeDataSourceParseStatus,
   normalizeDataSourceStatus,
@@ -356,7 +355,7 @@ function buildDetailSummaryFromSource(
     targetRef: binding?.target_ref,
     targetType: binding?.target_type,
     sourceType: isFeishuSource ? "feishu" : "local",
-    documentCount: summary?.total_document_count || documents.length,
+    documentCount: summary?.parsed_document_count ?? documents.length,
     status: normalizeDataSourceStatus(
       binding?.status || source.status,
       isFeishuSource ? true : source.watch_enabled,
@@ -373,8 +372,24 @@ function buildDetailSummaryFromSource(
   };
 }
 
-function isTreeNodeUpdated(node: ScanTreeNode) {
-  return isDataSourceUpdateState(node.update_type, node.has_update);
+function getTreeNodeUpdateState(node: ScanTreeNode) {
+  return normalizeDataSourceFileUpdateState(node.update_type, node.has_update);
+}
+
+function getSyncTreeUpdateLabel(
+  updateState: DocumentStatusRow["updateState"],
+  t: TFunction,
+) {
+  if (updateState === "new") {
+    return t("admin.dataSourceFileUpdateNew");
+  }
+  if (updateState === "changed") {
+    return t("admin.dataSourceFileUpdateChanged");
+  }
+  if (updateState === "deleted") {
+    return t("admin.dataSourceFileUpdateDeleted");
+  }
+  return "";
 }
 
 function filterScanTreeNodes(
@@ -897,7 +912,8 @@ export default function DataSourceDetail() {
     const toDataNode = (nodes: ScanTreeNode[]): DataNode[] =>
       nodes.map((node) => {
         const children = node.children ? toDataNode(node.children) : undefined;
-        const updated = isTreeNodeUpdated(node);
+        const updateState = getTreeNodeUpdateState(node);
+        const updateLabel = getSyncTreeUpdateLabel(updateState, t);
 
         return {
           key: node.key,
@@ -909,9 +925,11 @@ export default function DataSourceDetail() {
             <div className="data-source-sync-tree-file">
               <div className="data-source-sync-tree-file-main">
                 <span>{node.title}</span>
-                {updated ? (
-                  <span className="data-source-sync-tree-chip data-source-sync-tree-chip-changed">
-                    {t("admin.dataSourceFileUpdateChanged")}
+                {updateLabel ? (
+                  <span
+                    className={`data-source-sync-tree-chip data-source-sync-tree-chip-${updateState}`}
+                  >
+                    {updateLabel}
                   </span>
                 ) : null}
               </div>

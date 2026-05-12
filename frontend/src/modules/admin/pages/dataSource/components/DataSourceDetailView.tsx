@@ -14,6 +14,7 @@ import {
 import type { ColumnsType } from "antd/es/table";
 import { ArrowLeftOutlined, SearchOutlined } from "@ant-design/icons";
 import type { ReactNode } from "react";
+import { getLocalizedTablePagination } from "@/components/ui/pagination";
 import type { DataSourceSummary, DocumentStatusRow } from "../shared";
 import { getStatusMeta } from "../shared";
 
@@ -47,7 +48,6 @@ export default function DataSourceDetailView({
   detailSource,
   detailLoading,
   lastSync,
-  documents,
   lastOperation,
   keyword,
   setKeyword,
@@ -133,7 +133,7 @@ export default function DataSourceDetailView({
               {t("admin.dataSourceDetailParsedDocs")}
             </Text>
             <div className="data-source-detail-stat-value">
-              {documents.length}
+              {detailSource.documentCount}
               <span>{t("admin.dataSourceDetailFileUnit")}</span>
             </div>
           </Card>
@@ -191,7 +191,15 @@ export default function DataSourceDetailView({
           columns={columns}
           dataSource={filteredDocuments}
           loading={detailLoading}
-          pagination={{ pageSize: 8, showSizeChanger: false }}
+          pagination={getLocalizedTablePagination(
+            {
+              pageSize: 8,
+              showSizeChanger: true,
+              pageSizeOptions: [8, 16, 24, 50],
+              showTotal: (total) => t("common.totalItems", { total }),
+            },
+            t,
+          )}
           className="admin-page-table data-source-detail-table"
           locale={{ emptyText: t("admin.dataSourceDetailNoDocStatus") }}
           scroll={{ x: 1520, y: "max(280px, calc(100vh - 720px))" }}

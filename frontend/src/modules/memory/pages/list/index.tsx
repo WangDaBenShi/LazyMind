@@ -19,7 +19,7 @@ const defaultMemoryListPageSize = 6;
 const memoryListPageSizeOptions = [6, 12, 20, 50];
 
 export default function MemoryManagementListPage() {
-  const memoryTableScrollY = "clamp(360px, 42vh, 520px)";
+  const memoryTableScrollY = "calc(50vh - 124px)";
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState(defaultMemoryListPageSize);
   const {
@@ -278,8 +278,25 @@ export default function MemoryManagementListPage() {
           <Input.Search
             allowClear
             value={searchInput}
-            onChange={(event) => setSearchInput(event.target.value)}
-            onSearch={(value) => setQuery(value)}
+            onChange={(event) => {
+              const nextValue = event.target.value;
+              setSearchInput(nextValue);
+              if (!nextValue && query) {
+                setQuery("");
+                if (activeTab === "skills") {
+                  setSkillListPage(1);
+                  void refreshSkillAssets({ page: 1, keyword: "" });
+                }
+              }
+            }}
+            onSearch={(value) => {
+              const nextQuery = value.trim();
+              setQuery(nextQuery);
+              if (activeTab === "skills") {
+                setSkillListPage(1);
+                void refreshSkillAssets({ page: 1, keyword: nextQuery });
+              }
+            }}
             placeholder={t("admin.memorySearchPlaceholder", {
               unit: currentTabMeta.unit,
             })}

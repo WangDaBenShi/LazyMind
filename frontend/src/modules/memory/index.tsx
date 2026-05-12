@@ -342,6 +342,7 @@ export default function MemoryManagement() {
   const [shareStatusRecords, setShareStatusRecords] = useState<SkillShareRecord[]>([]);
   const handledShareKeyRef = useRef("");
   const skillShareRequestIdRef = useRef(0);
+  const skillAssetRequestIdRef = useRef(0);
   const shareStatusRequestIdRef = useRef(0);
   const glossaryRequestIdRef = useRef(0);
   const glossaryConflictRequestIdRef = useRef(0);
@@ -593,15 +594,30 @@ export default function MemoryManagement() {
     [refreshExperienceAssets, refreshExperienceSetting, t],
   );
   const refreshSkillAssets = useCallback(async (
-    options: { page?: number; pageSize?: number; preserveChangeProposals?: boolean } = {},
+    options: {
+      page?: number;
+      pageSize?: number;
+      keyword?: string;
+      category?: string;
+      tags?: string[];
+      preserveChangeProposals?: boolean;
+    } = {},
   ) => {
+    const requestId = skillAssetRequestIdRef.current + 1;
+    skillAssetRequestIdRef.current = requestId;
     setSkillLoading(true);
 
     try {
       const result = await listSkillAssetsPage({
         page: options.page ?? skillListPage,
         pageSize: options.pageSize ?? skillListPageSize,
+        keyword: options.keyword ?? query,
+        category: options.category ?? category,
+        tags: options.tags ?? (tag ? [tag] : []),
       });
+      if (skillAssetRequestIdRef.current !== requestId) {
+        return;
+      }
       const records = result.records;
       setSkillListTotal(result.total);
       setSkillListPage(result.page);
@@ -635,12 +651,17 @@ export default function MemoryManagement() {
         );
       }
     } catch (error) {
+      if (skillAssetRequestIdRef.current !== requestId) {
+        return;
+      }
       console.error("Load skill assets failed:", error);
     } finally {
-      setSkillLoading(false);
-      setSkillsInitialized(true);
+      if (skillAssetRequestIdRef.current === requestId) {
+        setSkillLoading(false);
+        setSkillsInitialized(true);
+      }
     }
-  }, [skillListPage, skillListPageSize]);
+  }, [category, query, skillListPage, skillListPageSize, tag]);
 
   const refreshGlossaryAssets = useCallback(
     async (options?: { keyword?: string; silent?: boolean; source?: GlossarySource }) => {
@@ -910,8 +931,12 @@ export default function MemoryManagement() {
   );
 
   useEffect(() => {
+    if (activeTab !== "skills") {
+      return;
+    }
+
     void refreshSkillAssets();
-  }, [refreshSkillAssets]);
+  }, [activeTab, refreshSkillAssets]);
 
   useEffect(() => {
     void refreshExperienceSection({ silent: true });
@@ -1680,6 +1705,17 @@ export default function MemoryManagement() {
     const rootSkills = skillAssets.filter(
       (item) => !item.parentId || !skillMap.has(item.parentId),
     );
+    if (activeTab === "skills") {
+      return rootSkills.map((parent) => {
+        const childItems = skillAssets.filter((item) => item.parentId === parent.id);
+
+        return {
+          ...parent,
+          children: childItems.length ? childItems : undefined,
+        };
+      });
+    }
+
     const matchedIds = new Set(
       skillAssets.filter((item) => matchesStructuredFilter(item)).map((item) => item.id),
     );
@@ -1704,7 +1740,7 @@ export default function MemoryManagement() {
         };
       })
       .filter((item): item is SkillTreeNode => Boolean(item));
-  }, [hasStructuredFilter, matchesStructuredFilter, skillAssets]);
+  }, [activeTab, hasStructuredFilter, matchesStructuredFilter, skillAssets]);
 
   const resetFilters = () => {
     setQuery("");
@@ -4058,7 +4094,13 @@ export default function MemoryManagement() {
               ) : null}
             </div>
             {!record.parentId ? (
-              <div className="memory-table-main-desc">{record.description}</div>
+              <Tooltip
+                placement="topLeft"
+                title={record.description}
+                overlayClassName="memory-summary-tooltip"
+              >
+                <div className="memory-table-main-desc">{record.description}</div>
+              </Tooltip>
             ) : null}
           </div>
         );
@@ -4303,9 +4345,15 @@ export default function MemoryManagement() {
       width: 520,
       className: "memory-content-summary-column",
       render: (value: string) => (
-        <div className="memory-content-preview memory-content-preview-single-line">
-          {value}
-        </div>
+        <Tooltip
+          placement="topLeft"
+          title={value}
+          overlayClassName="memory-summary-tooltip"
+        >
+          <div className="memory-content-preview memory-content-preview-single-line">
+            {value}
+          </div>
+        </Tooltip>
       ),
     },
     {

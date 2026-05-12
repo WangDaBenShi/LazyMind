@@ -368,7 +368,8 @@ const ChatInput = forwardRef<ChatInputImperativeProps, ChatInputProps>(
         preprocessUpload(newFiles, currentFiles, hasKB, t),
       [hasKB, t],
     );
-    const isSendDisabled = !value?.length || isUploading || isStreaming;
+    const trimmedValue = value.trim();
+    const isSendDisabled = !trimmedValue.length || isUploading || isStreaming;
 
     const handleSend = () => {
       if (isSendDisabled) {
@@ -376,7 +377,7 @@ const ChatInput = forwardRef<ChatInputImperativeProps, ChatInputProps>(
       }
       setNewMessage(false);
       const sendParams = {
-        text: value,
+        text: trimmedValue,
         fileList,
         fileListRef,
         files: fileListRef.current?.getFiles(),

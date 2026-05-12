@@ -114,7 +114,7 @@ export default function GlossaryListSection(props: GlossaryListSectionProps) {
             />
           ),
         }}
-        scroll={{ x: 1120, y: 420 }}
+        scroll={{ x: 1120, y: "calc(50vh - 124px)" }}
       />
     </>
   );

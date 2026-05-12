@@ -42,7 +42,19 @@
       min-height: 0;
       flex: 1;
       display: flex;
+    }
+
+    .ant-tabs-content {
+      width: 100%;
+    }
+
+    .ant-tabs-tabpane-hidden {
+      display: none;
+    }
+
+    .ant-tabs-tabpane {
       flex-direction: column;
+      width: 100%;
     }
   }
 
@@ -96,6 +108,7 @@
   .prompt-item {
     display: flex;
     width: 100%;
+    flex-shrink: 0;
     min-height: 80px;
     padding: 16px 8px;
     flex-direction: column;

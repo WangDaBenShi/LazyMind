@@ -59,6 +59,7 @@ import {
   WorkflowResultKind,
   WorkflowResultsState,
   DiffArtifactContentState,
+  DiffArtifactFile,
   AbComparisonRow,
   FIXED_EVAL_SET,
   FIXED_EXTRA_EVAL_STRATEGY,
@@ -545,6 +546,29 @@ export function SelfEvolutionPageController({
     () => buildCoreDownloadUrl(getResultDownloadPath(workflowResults.abtests.data)),
     [workflowResults.abtests.data],
   );
+  const fetchDiffArtifactContents = useCallback(
+    async (artifactFiles: DiffArtifactFile[], signal?: AbortSignal) => {
+      const contents = await Promise.all(
+        artifactFiles.map(async (file) => {
+          const response = await axiosInstance.post(
+            `${AGENT_API_BASE}/files:content`,
+            { path: file.diffPath },
+            signal ? { signal } : undefined,
+          );
+          const responseData = response.data;
+          const content =
+            typeof responseData === "string"
+              ? responseData
+              : getResultStringField(responseData, ["content", "diff", "patch", "text"]) ||
+                stringifyResultPayload(responseData);
+          return normalizeFetchedDiffArtifact(file, content);
+        }),
+      );
+
+      return contents.filter(Boolean).join("\n\n");
+    },
+    [],
+  );
 
   useEffect(() => {
     if (directFetchedDiffText) {
@@ -565,25 +589,8 @@ export function SelfEvolutionPageController({
       error: undefined,
     }));
 
-    Promise.all(
-      diffArtifactFiles.map(async (file) => {
-        const response = await axiosInstance.post(
-          `${AGENT_API_BASE}/files:content`,
-          { path: file.diffPath },
-          {
-            signal: controller.signal,
-          },
-        );
-        const responseData = response.data;
-        const content =
-          typeof responseData === "string"
-            ? responseData
-            : getResultStringField(responseData, ["content", "diff", "patch", "text"]) ||
-              stringifyResultPayload(responseData);
-        return normalizeFetchedDiffArtifact(file, content);
-      }),
-    )
-      .then((contents) => {
+    fetchDiffArtifactContents(diffArtifactFiles, controller.signal)
+      .then((content) => {
         if (controller.signal.aborted) {
           return;
         }
@@ -591,7 +598,7 @@ export function SelfEvolutionPageController({
         setDiffArtifactContent({
           loading: false,
           key: diffArtifactKey,
-          content: contents.filter(Boolean).join("\n\n"),
+          content,
         });
       })
       .catch((error) => {
@@ -610,7 +617,7 @@ export function SelfEvolutionPageController({
     return () => {
       controller.abort();
     };
-  }, [diffArtifactFiles, diffArtifactKey, directFetchedDiffText]);
+  }, [diffArtifactFiles, diffArtifactKey, directFetchedDiffText, fetchDiffArtifactContents]);
 
   const historySessionEntries = useMemo<HistorySessionEntry[]>(() => {
     const sessionEntries = chatSessions
@@ -669,7 +676,7 @@ export function SelfEvolutionPageController({
       }
 
       const currentState = workflowResults[kind];
-      if (!options?.force && (currentState.loading || currentState.loaded)) {
+      if (!options?.force && currentState.loaded) {
         return currentState.data;
       }
 
@@ -704,6 +711,26 @@ export function SelfEvolutionPageController({
     },
     [activeThreadId, getWorkflowResultUrl, workflowResults],
   );
+  const resolveDiffDownloadText = useCallback(
+    async (resultData: unknown) => {
+      const directDiffText =
+        getResultStringField(resultData, ["diff", "patch", "content", "text"]) ||
+        directFetchedDiffText ||
+        diffArtifactContent.content ||
+        fetchedDiffText;
+      if (directDiffText) {
+        return directDiffText;
+      }
+
+      const artifactFiles = getDiffArtifactFiles(resultData);
+      if (artifactFiles.length === 0) {
+        return "";
+      }
+
+      return fetchDiffArtifactContents(artifactFiles);
+    },
+    [diffArtifactContent.content, directFetchedDiffText, fetchDiffArtifactContents, fetchedDiffText],
+  );
   const handleWorkflowDownload = useCallback(
     async (
       kind: WorkflowResultKind,
@@ -716,9 +743,29 @@ export function SelfEvolutionPageController({
 
       const currentData = workflowResults[kind].data;
       const nextData = currentData ?? (await fetchWorkflowResult(kind));
-      const downloadUrl = kind === "diffs"
-        ? fallbackUrl
-        : buildCoreDownloadUrl(getResultDownloadPath(nextData)) || fallbackUrl;
+      if (kind === "diffs") {
+        const diffText = await resolveDiffDownloadText(nextData);
+        if (!diffText) {
+          message.warning(`${workflowResultLabels[kind]}暂无可下载文件。`, 1.5);
+          return;
+        }
+
+        const objectUrl = URL.createObjectURL(
+          new Blob([diffText], {
+            type: "text/x-diff;charset=utf-8",
+          }),
+        );
+        try {
+          triggerBrowserDownload(objectUrl, fallbackFileName);
+        } finally {
+          window.setTimeout(() => {
+            URL.revokeObjectURL(objectUrl);
+          }, 1000);
+        }
+        return;
+      }
+
+      const downloadUrl = buildCoreDownloadUrl(getResultDownloadPath(nextData)) || fallbackUrl;
 
       if (!downloadUrl) {
         message.warning(`${workflowResultLabels[kind]}暂无可下载文件。`, 1.5);
@@ -727,7 +774,7 @@ export function SelfEvolutionPageController({
 
       triggerBrowserDownload(downloadUrl, getDownloadFileName(downloadUrl, fallbackFileName));
     },
-    [fetchWorkflowResult, workflowResults],
+    [fetchWorkflowResult, resolveDiffDownloadText, workflowResults],
   );
   const handleWorkflowResultCollapseChange = useCallback(
     (kind: WorkflowResultKind) => (activeKeys: string | string[]) => {
