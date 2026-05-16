@@ -42,14 +42,14 @@ import {
   buildDocumentStatusDetail,
   formatBytes,
   formatDateTime,
-  getFileUpdateMeta,
+  getSourceStateMeta,
   getSyncStateMeta,
-  normalizeDataSourceFileUpdateState,
   normalizeDataSourceParseStatus,
   normalizeDataSourceStatus,
   normalizePendingAction,
   resolveSourceState,
   resolveSyncState,
+  sourceStateToFileUpdate,
 } from "./shared";
 
 const { Text } = Typography;
@@ -290,10 +290,7 @@ function mapScanSyncDetail(updateState: DocumentStatusRow["updateState"]) {
 function mapScanDocumentToDetail(item: ScanSourceDocumentItem): DocumentStatusRow {
   const sourceState = resolveSourceState(item);
   const syncState = resolveSyncState(item);
-  const updateState = normalizeDataSourceFileUpdateState(
-    item.update_type,
-    item.has_update,
-  );
+  const updateState = sourceStateToFileUpdate(sourceState);
   const parseState = [
     item.parse_state,
     item.core_task_state,
@@ -374,10 +371,6 @@ function collectScanTreeFileKeys(nodes: ScanTreeNode[]): string[] {
   };
   walk(nodes);
   return keys;
-}
-
-function getTreeNodeUpdateState(node: ScanTreeNode) {
-  return normalizeDataSourceFileUpdateState(node.update_type, node.has_update);
 }
 
 function shouldPollByParseStatus(items: DocumentStatusRow[]) {
@@ -941,11 +934,23 @@ export default function DataSourceDetail() {
     const toDataNode = (nodes: ScanTreeNode[]): DataNode[] =>
       nodes.map((node) => {
         const children = node.children ? toDataNode(node.children) : undefined;
-        const updateState = getTreeNodeUpdateState(node);
-        const updateMeta = getFileUpdateMeta(updateState, t);
-        const updateText = `${node.update_desc || ""}`.trim() || updateMeta.text;
-        const hasUpdateStatus =
-          typeof node.has_update === "boolean" || Boolean(node.update_type || node.update_desc);
+        const sourceState = resolveSourceState(node);
+        const syncState = resolveSyncState(node);
+        const sourceMeta =
+          sourceState !== "UNCHANGED" ? getSourceStateMeta(sourceState, t) : null;
+        const syncMeta =
+          syncState !== "IDLE"
+            ? getSyncStateMeta(
+                syncState,
+                {
+                  nextSyncAt: node.next_sync_at,
+                  lastError: node.last_error,
+                  knowledgeBasePresent: node.knowledge_base_present,
+                  sourceState,
+                },
+                t,
+              )
+            : null;
 
         return {
           key: node.key,
@@ -955,12 +960,19 @@ export default function DataSourceDetail() {
             <div className="data-source-sync-tree-file">
               <div className="data-source-sync-tree-file-main">
                 <span>{node.title}</span>
-                {hasUpdateStatus ? (
+                {sourceMeta ? (
                   <span
-                    className={`data-source-sync-tree-chip data-source-sync-tree-chip-${updateState}`}
-                    title={updateText}
+                    className={`data-source-sync-tree-chip data-source-sync-tree-chip-${sourceMeta.tone}`}
                   >
-                    {updateText}
+                    {sourceMeta.text}
+                  </span>
+                ) : null}
+                {syncMeta ? (
+                  <span
+                    className="data-source-sync-tree-chip data-source-sync-tree-chip-sync"
+                    title={syncMeta.text}
+                  >
+                    {syncMeta.text}
                   </span>
                 ) : null}
               </div>
@@ -1033,7 +1045,7 @@ export default function DataSourceDetail() {
       render: (_value, record) => {
         const sourceState: SourceStateValue = record.sourceState || "UNCHANGED";
         const syncState: SyncStateValue = record.syncState || "IDLE";
-        const updateMeta = getFileUpdateMeta(record.updateState, t);
+        const sourceMeta = getSourceStateMeta(sourceState, t);
         const syncMeta = getSyncStateMeta(
           syncState,
           {
@@ -1058,18 +1070,15 @@ export default function DataSourceDetail() {
             },
             t,
           );
-        const shouldShowSyncState = syncState !== "IDLE";
         return (
           <div className="data-source-detail-update-state">
-            <span className={`data-source-update-chip data-source-update-chip-${record.updateState}`}>
+            <span className={`data-source-update-chip data-source-update-chip-${sourceMeta.tone}`}>
               <span className="data-source-update-chip-dot" />
-              {updateMeta.text}
+              {sourceMeta.text}
             </span>
-            {shouldShowSyncState ? (
-              <Tag color={syncMeta.color} style={{ marginInlineEnd: 0 }}>
-                {syncMeta.text}
-              </Tag>
-            ) : null}
+            <Tag color={syncMeta.color} style={{ marginInlineEnd: 0 }}>
+              {syncMeta.text}
+            </Tag>
             <Text type="secondary" title={detail}>
               {detail}
             </Text>
