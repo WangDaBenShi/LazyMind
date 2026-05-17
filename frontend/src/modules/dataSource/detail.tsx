@@ -1043,7 +1043,14 @@ export default function DataSourceDetail() {
       key: "updateState",
       width: 240,
       render: (_value, record) => {
-        const sourceState: SourceStateValue = record.sourceState || "UNCHANGED";
+        const sourceState: SourceStateValue =
+          record.sourceState ||
+          (() => {
+            if (record.updateState === "new") return "NEW";
+            if (record.updateState === "changed") return "MODIFIED";
+            if (record.updateState === "deleted") return "DELETED";
+            return "UNCHANGED";
+          })();
         const syncState: SyncStateValue = record.syncState || "IDLE";
         const sourceMeta = getSourceStateMeta(sourceState, t);
         const syncMeta = getSyncStateMeta(
@@ -1070,15 +1077,18 @@ export default function DataSourceDetail() {
             },
             t,
           );
+        const shouldShowSyncState = syncState !== "IDLE";
         return (
           <div className="data-source-detail-update-state">
             <span className={`data-source-update-chip data-source-update-chip-${sourceMeta.tone}`}>
               <span className="data-source-update-chip-dot" />
               {sourceMeta.text}
             </span>
-            <Tag color={syncMeta.color} style={{ marginInlineEnd: 0 }}>
-              {syncMeta.text}
-            </Tag>
+            {shouldShowSyncState ? (
+              <Tag color={syncMeta.color} style={{ marginInlineEnd: 0 }}>
+                {syncMeta.text}
+              </Tag>
+            ) : null}
             <Text type="secondary" title={detail}>
               {detail}
             </Text>
