@@ -144,7 +144,7 @@ export default function MainLayout() {
       icon: <DatabaseOutlined />,
     },
     {
-      key: "/model-providers",
+      key: "/model-providers/models",
       label: t("layout.modelProviderManagement"),
       icon: <ApiOutlined />,
     },
