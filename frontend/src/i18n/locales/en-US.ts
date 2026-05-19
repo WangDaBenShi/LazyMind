@@ -1414,6 +1414,7 @@ const enUS = {
     memoryShareExperienceHint:
       "Experience memory is best shared with specific collaborators to sync preferences, tone, and accumulated know-how.",
     memoryAutoEvo: "Auto Evolution",
+    memoryAutoUpdate: "Auto Update",
     memoryAutoEvoToggleFailed: "Auto evolution toggle failed",
     memorySkillPendingRemoveTag: "Delete Suggested",
     memorySkillAutoEvoDisabledByRemove:
