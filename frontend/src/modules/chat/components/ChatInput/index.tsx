@@ -10,8 +10,12 @@ import {
   type ReactNode,
 } from "react";
 import { RcFile } from "antd/es/upload";
-import { Button, Input, message } from "antd";
-import { SettingOutlined } from "@ant-design/icons";
+import { Button, Input, message, Tooltip } from "antd";
+import {
+  CloseOutlined,
+  CommentOutlined,
+  SettingOutlined,
+} from "@ant-design/icons";
 import { debounce } from "lodash";
 import AttachmentIcon from "../../assets/icons/attachment_icon.svg?react";
 import SendIcon from "../../assets/icons/send_icon.svg?react";
@@ -105,6 +109,8 @@ function preprocessUpload(
 
 export interface SendMessageParams {
   text: string;
+  citeMessage?: string;
+  citeMessages?: string[];
   clearInput?: boolean;
   fileList?: ChatFileList[];
   fileListRef?: React.RefObject<ImageUploadImperativeProps | null>;
@@ -134,6 +140,10 @@ interface ChatInputProps {
   disabledReason?: string;
   disabledDescription?: string;
   disabledAction?: ReactNode;
+  citeMessage?: string;
+  citeMessages?: string[];
+  onRemoveCiteMessage?: (index: number) => void;
+  onClearCiteMessage?: () => void;
 }
 
 export interface ChatFileList {
@@ -195,6 +205,10 @@ const ChatInput = forwardRef<ChatInputImperativeProps, ChatInputProps>(
       disabledReason,
       disabledDescription,
       disabledAction,
+      citeMessage,
+      citeMessages,
+      onRemoveCiteMessage,
+      onClearCiteMessage,
     } = props;
     const fileListRef = useRef<ImageUploadImperativeProps | null>(null);
     const promptRef = useRef<PromptImperativeProps>(null);
@@ -393,6 +407,14 @@ const ChatInput = forwardRef<ChatInputImperativeProps, ChatInputProps>(
         preprocessUpload(newFiles, currentFiles, hasKB, t),
       [hasKB, t],
     );
+    const normalizedCiteMessages = useMemo(() => {
+      if (citeMessages) {
+        return citeMessages.map((item) => item.trim()).filter(Boolean);
+      }
+
+      const normalizedCiteMessage = citeMessage?.trim();
+      return normalizedCiteMessage ? [normalizedCiteMessage] : [];
+    }, [citeMessage, citeMessages]);
     const isSendDisabled =
       disabled || !value?.trim() || isUploading || isStreaming;
 
@@ -410,6 +432,8 @@ const ChatInput = forwardRef<ChatInputImperativeProps, ChatInputProps>(
       setNewMessage(false);
       const sendParams = {
         text: normalizedText,
+        citeMessage: normalizedCiteMessages.join("\n\n"),
+        citeMessages: normalizedCiteMessages,
         fileList,
         fileListRef,
         files: fileListRef.current?.getFiles(),
@@ -432,6 +456,7 @@ const ChatInput = forwardRef<ChatInputImperativeProps, ChatInputProps>(
       }
       onChange("");
       setText("");
+      onClearCiteMessage?.();
     };
 
     const handleInputChange = (text: string) => {
@@ -570,6 +595,53 @@ const ChatInput = forwardRef<ChatInputImperativeProps, ChatInputProps>(
           <div className="input-top">
             <div className="input-field">
               <ShowChatFileList fileList={fileList} onRemove={removeImage} />
+              {normalizedCiteMessages.length > 0 && (
+                <div className="cite-message-preview-list">
+                  {normalizedCiteMessages.map((messageText, index) => (
+                    <div
+                      className="cite-message-preview"
+                      key={`${index}-${messageText}`}
+                    >
+                      <CommentOutlined className="cite-message-preview-icon" />
+                      <Tooltip
+                        title={messageText}
+                        placement="topLeft"
+                        overlayClassName="cite-message-preview-tooltip"
+                      >
+                        <span
+                          className="cite-message-preview-text"
+                          tabIndex={0}
+                          aria-label={messageText}
+                        >
+                          {messageText}
+                        </span>
+                      </Tooltip>
+                      <Button
+                        type="text"
+                        size="small"
+                        className="cite-message-preview-close"
+                        icon={<CloseOutlined />}
+                        onClick={() =>
+                          onRemoveCiteMessage
+                            ? onRemoveCiteMessage(index)
+                            : onClearCiteMessage?.()
+                        }
+                        aria-label={t("chat.clearCitation")}
+                      />
+                    </div>
+                  ))}
+                  {normalizedCiteMessages.length > 1 && (
+                    <Button
+                      type="text"
+                      size="small"
+                      className="cite-message-preview-clear-all"
+                      onClick={onClearCiteMessage}
+                    >
+                      {t("chat.clearCitation")}
+                    </Button>
+                  )}
+                </div>
+              )}
               <TextArea
                 autoSize={{ minRows: 2, maxRows: 5 }}
                 className="message-input"

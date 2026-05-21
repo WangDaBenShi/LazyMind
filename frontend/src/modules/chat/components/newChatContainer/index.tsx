@@ -50,6 +50,20 @@ import {
 
 const ThinkIcon = new URL("../../assets/images/think.png", import.meta.url)
   .href;
+const MAX_CITE_MESSAGE_COUNT = 3;
+
+function buildCitedMessageText(text: string, citeMessages?: string[]) {
+  const normalizedText = text.trim();
+  const normalizedCiteMessages =
+    citeMessages?.map((item) => item.trim()).filter(Boolean) ?? [];
+  if (normalizedCiteMessages.length < 1) {
+    return normalizedText;
+  }
+  const citedText = normalizedCiteMessages
+    .map((citeMessage) => `<cite_message>${citeMessage}</cite_message>`)
+    .join("\n");
+  return `${citedText}\n${normalizedText}`;
+}
 
 export interface ChatImperativeProps {
   replaceMessageList: (id: string, data: any[]) => void;
@@ -117,6 +131,8 @@ export interface ChatMessage {
   answer_index?: number;
   create_time?: string;
   is_resumed?: boolean;
+  display_delta?: string;
+  cite_message?: string;
 }
 
 const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
@@ -184,6 +200,7 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
       Map<string, boolean>
     >(new Map());
     const [fileList, setFileList] = useState<ChatFileList[]>([]);
+    const [citeMessages, setCiteMessages] = useState<string[]>([]);
     const [showScrollButton, setShowScrollButton] = useState(false);
     const chatInputRef = useRef<ChatInputImperativeProps>(null);
     const [inputHeight, setInputHeight] = useState(120);
@@ -257,7 +274,13 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
     }
 
     function sendMessage(params: SendMessageParams) {
-      const { text, clearInput = true, create_time } = params;
+      const {
+        text,
+        citeMessage: paramsCiteMessage,
+        citeMessages: paramsCiteMessages,
+        clearInput = true,
+        create_time,
+      } = params;
       const normalizedText = text.trim();
       if (!canChat) {
         if (disabledReason) {
@@ -268,6 +291,16 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
       if (activeStreamRef.current || loading || !normalizedText) {
         return;
       }
+      const normalizedCiteMessages =
+        paramsCiteMessages
+          ?.map((item) => item.trim())
+          .filter(Boolean)
+          .slice(0, MAX_CITE_MESSAGE_COUNT) ??
+        (paramsCiteMessage?.trim() ? [paramsCiteMessage.trim()] : []);
+      const textWithCitation = buildCitedMessageText(
+        normalizedText,
+        normalizedCiteMessages,
+      );
 
       if (params?.fileList) {
         setFileList(params.fileList);
@@ -292,7 +325,7 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
         }) ?? {};
 
       const inputs = [
-        { input_type: "text", text: normalizedText },
+        { input_type: "text", text: textWithCitation },
         ...getFileUrls(tempFileGroup?.image, tempGroup?.image).map((image) => {
           return {
             input_type: "image",
@@ -315,6 +348,8 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
 
       const userMessage = {
         delta: normalizedText,
+        display_delta: normalizedText,
+        cite_message: normalizedCiteMessages.join("\n\n"),
         role: RoleTypes.USER,
         images: tempGroup?.image,
         files: tempGroup?.file,
@@ -951,6 +986,7 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
     function createNewChat() {
       chatInputRef.current?.clearFiles();
       setFileList([]);
+      setCiteMessages([]);
       clearStorePendingMessage();
 
       const previousConversationId = currentConversationIdRef.current;
@@ -1265,7 +1301,7 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
                 ChatConversationsResponseFinishReasonEnum.FinishReasonStop
               }
             >
-              {item.delta}
+              {item.display_delta || item.delta}
             </MarkdownViewer>
           </div>
         </Flex>
@@ -1374,6 +1410,35 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
       }
     };
 
+    const handleAddCiteMessage = useCallback(
+      (text: string) => {
+        const normalizedText = text.trim();
+        if (!normalizedText) {
+          return;
+        }
+
+        setCiteMessages((prev) => {
+          if (prev.length >= MAX_CITE_MESSAGE_COUNT) {
+            message.warning(
+              t("chat.maxCitationsWarning", {
+                count: MAX_CITE_MESSAGE_COUNT,
+              }),
+            );
+            return prev;
+          }
+
+          return [...prev, normalizedText];
+        });
+      },
+      [t],
+    );
+
+    const handleRemoveCiteMessage = useCallback((index: number) => {
+      setCiteMessages((prev) =>
+        prev.filter((_, itemIndex) => itemIndex !== index),
+      );
+    }, []);
+
     return (
       <div className="chat-chat-container">
         <div className="chat-box">
@@ -1387,6 +1452,7 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
             stopGeneration={stopGeneration}
             renderText={renderText}
             updateAssistantMessage={updateAssistantMessage}
+            onCiteMessage={handleAddCiteMessage}
             onScroll={handleScroll}
             chatContentRef={chatContentRef}
             sessionId={sessionId}
@@ -1441,6 +1507,9 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
             disabledReason={disabledReason}
             disabledDescription={disabledDescription}
             disabledAction={disabledAction}
+            citeMessages={citeMessages}
+            onRemoveCiteMessage={handleRemoveCiteMessage}
+            onClearCiteMessage={() => setCiteMessages([])}
           />
         </div>
       </div>
