@@ -1541,8 +1541,10 @@ const enUS = {
     memoryGlossaryAliasMaxLength: "Each word must not exceed {{count}} characters",
     memoryGlossaryContentMaxLength: "Content must not exceed {{count}} characters",
     memorySkillTagMaxCount: "A skill can have at most {{count}} tags",
+    memoryGlossaryTermAliasExactDuplicate:
+      "The phrase cannot be exactly the same as a word in this group: {{word}}. Please edit it before saving.",
     memoryGlossaryWordsAlreadyExist:
-      "This phrase or word already exists: {{words}}. Edit the existing glossary entry or choose another value.",
+      "This phrase or word already exists: {{words}}. Saving will continue; check whether it should be merged or edited.",
     memoryGlossaryInboxButton: "Message Center ({{count}})",
     memoryGlossaryInboxTitle: "Glossary Message Center",
     memoryGlossaryInboxEmpty: "No pending glossary messages",
