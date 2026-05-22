@@ -1,4 +1,5 @@
 import {
+  Alert,
   message,
   Button,
   Badge,
@@ -77,6 +78,7 @@ const Detail = () => {
   const [detail, setDetail] = useState<Dataset>();
   const [importingTotal, setImportingTotal] = useState(0);
   const [developerActive, setDeveloperActive] = useState(isDeveloperModeActive);
+  const [parsingNoticeVisible, setParsingNoticeVisible] = useState(false);
 
   const { id = "" } = useParams();
 
@@ -143,6 +145,7 @@ const Detail = () => {
         }
         compareTaskChange(newTaskList, importingTaskListRef.current);
         setImportingTotal(newTaskList.length);
+        setParsingNoticeVisible(newTaskList.length > 0);
         importingTaskListRef.current = newTaskList;
       },
     });
@@ -370,6 +373,14 @@ const Detail = () => {
           }
         }}
       />
+      {parsingNoticeVisible && (
+        <Alert
+          className="knowledge-parsing-notice"
+          message={t("knowledge.documentParsingKeepTabOpen")}
+          type="warning"
+          showIcon
+        />
+      )}
       <div className="toolbar my-4 mt-6 w-full">
         <Search
           className="search-input"
@@ -577,6 +588,8 @@ const Detail = () => {
 
       <ImportKnowledgeModal
         ref={importKnowledgeRef}
+        onParsingStart={() => setParsingNoticeVisible(true)}
+        onParsingSettled={() => setParsingNoticeVisible(false)}
         onOk={({ pId } = {}) => {
           importingTaskListRef.current = [];
           getImportingTotal();
