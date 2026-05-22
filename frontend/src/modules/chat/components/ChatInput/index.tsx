@@ -135,7 +135,7 @@ interface ChatInputProps {
   rerankReady?: boolean | null;
   disabled?: boolean;
   disabledReason?: string;
-  disabledDescription?: string;
+  disabledDescription?: ReactNode;
   disabledAction?: ReactNode;
 }
 
