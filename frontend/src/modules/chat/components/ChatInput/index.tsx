@@ -136,6 +136,9 @@ interface ChatInputProps {
   knowledgeRefreshKey?: number | string;
   sessionId?: string;
   isStreaming?: boolean;
+  embeddingReady?: boolean | null;
+  multimodalEmbeddingReady?: boolean | null;
+  rerankReady?: boolean | null;
   disabled?: boolean;
   disabledReason?: string;
   disabledDescription?: string;
@@ -201,6 +204,9 @@ const ChatInput = forwardRef<ChatInputImperativeProps, ChatInputProps>(
       knowledgeRefreshKey,
       sessionId,
       isStreaming = false,
+      embeddingReady,
+      multimodalEmbeddingReady,
+      rerankReady,
       disabled = false,
       disabledReason,
       disabledDescription,
@@ -686,6 +692,9 @@ const ChatInput = forwardRef<ChatInputImperativeProps, ChatInputProps>(
                   <ChatSelector
                     chatConfig={chatConfig ?? {}}
                     refreshKey={knowledgeRefreshKey}
+                    embeddingReady={embeddingReady}
+                    multimodalEmbeddingReady={multimodalEmbeddingReady}
+                    rerankReady={rerankReady}
                     onChange={onKnowledgeBaseChange}
                   />
                   {/* <ModelSelector sessionId={sessionId} disabled={isStreaming} /> */}
