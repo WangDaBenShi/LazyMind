@@ -20,6 +20,7 @@ from evo.checkpoints import CheckpointState, checkpoint_state_from_run, frontend
 from evo.checkpoints.manager import _lifecycle_payload
 from evo.checkpoints.models import RESUME_FROM_SNAPSHOT, RESUME_WITH_INTERVENTIONS
 from evo.projections import rebuild_frontend_state
+from evo.projections.traces import build_trace_compare_view, build_trace_detail_view
 from evo.service.flow import EvoFlowService, FlowMessageResult, TARGET_MEAN_DELTA, result_dict
 from evo.store import Event, StoreRunLifecycle
 
@@ -240,6 +241,14 @@ def create_app() -> FastAPI:
         hub.get_thread(thread_id)
         last = request.headers.get('last-event-id') or ''
         return EventSourceResponse(hub.events(thread_id, int(last) if last.isdigit() else since))
+
+    @app.get('/v1/evo/threads/{thread_id}/results/traces/{trace_id}')
+    def trace_detail(thread_id: str, trace_id: str) -> dict:
+        return hub.trace_detail(thread_id, trace_id)
+
+    @app.get('/v1/evo/threads/{thread_id}/results/traces-compare')
+    def trace_compare(thread_id: str, a: str, b: str) -> dict:
+        return hub.trace_compare(thread_id, a, b)
 
     @app.get('/v1/evo/threads/{thread_id}/results/{kind}')
     def results(thread_id: str, kind: str) -> list[dict]:
@@ -642,6 +651,21 @@ class EvoMessageHub:
         if rows is not None:
             return rows
         raise HTTPException(404, f'unknown result kind: {kind}')
+
+    def trace_detail(self, thread_id: str, trace_id: str) -> dict:
+        self._meta(thread_id)
+        return build_trace_detail_view(
+            trace_id,
+            lambda artifact_id: self._thread_artifact_payload(thread_id, artifact_id),
+        )
+
+    def trace_compare(self, thread_id: str, a: str, b: str) -> dict:
+        self._meta(thread_id)
+        return build_trace_compare_view(
+            a,
+            b,
+            lambda artifact_id: self._thread_artifact_payload(thread_id, artifact_id),
+        )
 
     def artifact(self, thread_id: str, artifact_id: str) -> dict:
         row = _artifact_row(self._service(thread_id), artifact_id)
