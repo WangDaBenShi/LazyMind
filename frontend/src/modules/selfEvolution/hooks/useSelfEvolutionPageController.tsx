@@ -1096,6 +1096,13 @@ export function SelfEvolutionPageController({
   );
   const openWorkflowArtifact = useCallback(
     (kind: WorkflowResultKind) => {
+      const step = workflowSteps.find((candidate) => candidate.id === artifactStepIdMap[kind]);
+      const resultState = workflowResults[kind];
+      const hasLoadedArtifact = resultState.loaded && !isEmptyResultPayload(resultState.data);
+      if (step && step.status !== "done" && !hasLoadedArtifact) {
+        message.info(`${step.title}仍在执行，完成后可查看结果。`, 2);
+        return;
+      }
       setCaseArtifact(undefined);
       setActiveWorkbenchTab("processes");
       setActiveArtifactKind(kind);
@@ -1106,7 +1113,7 @@ export function SelfEvolutionPageController({
       setHistoryPreviewError("");
       void fetchWorkflowResult(kind, { force: true });
     },
-    [fetchWorkflowResult],
+    [fetchWorkflowResult, workflowResults, workflowSteps],
   );
 
   const openCaseArtifact = useCallback(
