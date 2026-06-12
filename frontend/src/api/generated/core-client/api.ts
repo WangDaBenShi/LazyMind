@@ -1642,10 +1642,11 @@ export const AgentApiAxiosParamCreator = function (configuration?: Configuration
          * @summary List agent threads
          * @param {number} [pageSize] 
          * @param {string} [pageToken] 
+         * @param {string} [keyword] 
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        apiCoreAgentThreadsGet: async (pageSize?: number, pageToken?: string, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+        apiCoreAgentThreadsGet: async (pageSize?: number, pageToken?: string, keyword?: string, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
             const localVarPath = `/api/core/agent/threads`;
             // use dummy base URL string because the URL constructor only accepts absolute URLs.
             const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
@@ -1664,6 +1665,10 @@ export const AgentApiAxiosParamCreator = function (configuration?: Configuration
 
             if (pageToken !== undefined) {
                 localVarQueryParameter['page_token'] = pageToken;
+            }
+
+            if (keyword !== undefined) {
+                localVarQueryParameter['keyword'] = keyword;
             }
 
             localVarHeaderParameter['Accept'] = 'application/json';
@@ -1704,11 +1709,12 @@ export const AgentApiFp = function(configuration?: Configuration) {
          * @summary List agent threads
          * @param {number} [pageSize] 
          * @param {string} [pageToken] 
+         * @param {string} [keyword] 
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        async apiCoreAgentThreadsGet(pageSize?: number, pageToken?: string, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<AgentThreadListOpenAPIResponse>> {
-            const localVarAxiosArgs = await localVarAxiosParamCreator.apiCoreAgentThreadsGet(pageSize, pageToken, options);
+        async apiCoreAgentThreadsGet(pageSize?: number, pageToken?: string, keyword?: string, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<AgentThreadListOpenAPIResponse>> {
+            const localVarAxiosArgs = await localVarAxiosParamCreator.apiCoreAgentThreadsGet(pageSize, pageToken, keyword, options);
             const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
             const localVarOperationServerBasePath = operationServerMap['AgentApi.apiCoreAgentThreadsGet']?.[localVarOperationServerIndex]?.url;
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
@@ -1740,7 +1746,7 @@ export const AgentApiFactory = function (configuration?: Configuration, basePath
          * @throws {RequiredError}
          */
         apiCoreAgentThreadsGet(requestParameters: AgentApiApiCoreAgentThreadsGetRequest = {}, options?: RawAxiosRequestConfig): AxiosPromise<AgentThreadListOpenAPIResponse> {
-            return localVarFp.apiCoreAgentThreadsGet(requestParameters.pageSize, requestParameters.pageToken, options).then((request) => request(axios, basePath));
+            return localVarFp.apiCoreAgentThreadsGet(requestParameters.pageSize, requestParameters.pageToken, requestParameters.keyword, options).then((request) => request(axios, basePath));
         },
     };
 };
@@ -1759,6 +1765,8 @@ export interface AgentApiApiCoreAgentThreadsGetRequest {
     readonly pageSize?: number
 
     readonly pageToken?: string
+
+    readonly keyword?: string
 }
 
 /**
@@ -1784,7 +1792,7 @@ export class AgentApi extends BaseAPI {
      * @throws {RequiredError}
      */
     public apiCoreAgentThreadsGet(requestParameters: AgentApiApiCoreAgentThreadsGetRequest = {}, options?: RawAxiosRequestConfig) {
-        return AgentApiFp(this.configuration).apiCoreAgentThreadsGet(requestParameters.pageSize, requestParameters.pageToken, options).then((request) => request(this.axios, this.basePath));
+        return AgentApiFp(this.configuration).apiCoreAgentThreadsGet(requestParameters.pageSize, requestParameters.pageToken, requestParameters.keyword, options).then((request) => request(this.axios, this.basePath));
     }
 }
 
