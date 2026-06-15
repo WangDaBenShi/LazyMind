@@ -498,6 +498,33 @@ type agentTraceCompareOpenAPIResponse struct {
 	B     agentTraceDetailOpenAPIResponse `json:"b"`
 }
 
+type agentResultDetailCaseOpenAPIResponse struct {
+	CaseID        string         `json:"case_id"`
+	Query         string         `json:"query,omitempty"`
+	Reference     string         `json:"reference,omitempty"`
+	Answer        string         `json:"answer,omitempty"`
+	Score         *float64       `json:"score,omitempty"`
+	FailureType   string         `json:"failure_type,omitempty"`
+	FailureReason string         `json:"failure_reason,omitempty"`
+	ExecutionMode string         `json:"execution_mode,omitempty"`
+	TraceID       string         `json:"trace_id,omitempty"`
+	TraceLinked   bool           `json:"trace_linked"`
+	LatencyMS     *float64       `json:"latency_ms,omitempty"`
+	Metrics       map[string]any `json:"metrics,omitempty"`
+	MissingFields []string       `json:"missing_fields,omitempty"`
+}
+
+type agentResultDetailOpenAPIResponse struct {
+	ThreadID        string                                 `json:"thread_id"`
+	Kind            string                                 `json:"kind"`
+	Report          map[string]any                         `json:"report"`
+	Summary         map[string]any                         `json:"summary"`
+	Cases           []agentResultDetailCaseOpenAPIResponse `json:"cases"`
+	SelectedCase    map[string]any                         `json:"selected_case,omitempty"`
+	SourceArtifacts map[string]any                         `json:"source_artifacts,omitempty"`
+	MissingFields   []string                               `json:"missing_fields,omitempty"`
+}
+
 type skillPathParams struct {
 	SkillID string `path:"skill_id"`
 }
@@ -2120,6 +2147,24 @@ func registeredCoreOperations() []openAPIOperation {
 			Tags:        []string{"agent"},
 			PathParams:  agentTracePathParams{},
 			Responses:   map[int]openAPIResponse{200: resp("Agent trace detail", agentTraceDetailOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/agent/threads/{thread_id}/results/eval-reports/detail",
+			Summary:     "Get eval report display detail",
+			Description: "Get structured eval report detail for frontend display, including report summary and case rows.",
+			Tags:        []string{"agent"},
+			PathParams:  agentThreadPathParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Agent eval report display detail", agentResultDetailOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/agent/threads/{thread_id}/results/abtests/detail",
+			Summary:     "Get ABTest display detail",
+			Description: "Get structured ABTest detail for frontend display, including comparison summary and case rows.",
+			Tags:        []string{"agent"},
+			PathParams:  agentThreadPathParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Agent ABTest display detail", agentResultDetailOpenAPIResponse{})},
 		},
 		{
 			Method:      "GET",
