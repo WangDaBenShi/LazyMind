@@ -252,6 +252,8 @@ export default function DataSourceWizardModal({
   const isEditMode = wizardMode === "edit";
   const [localPathSearchValue, setLocalPathSearchValue] = useState("");
   const [feishuTargetSearchValue, setFeishuTargetSearchValue] = useState("");
+  const localPathValue = Form.useWatch("path", form);
+  const selectedLocalPathValues = normalizeTreeSelectValues(localPathValue);
   const feishuTargetPathMap = useMemo(
     () => buildTreeValuePathMap(feishuTargetTreeData as CollapsibleTreeNode[]),
     [feishuTargetTreeData],
@@ -559,7 +561,11 @@ export default function DataSourceWizardModal({
                           setLocalPathSearchValue("");
                         }
                         if (open && !isEditMode) {
-                          onLoadLocalPathOptions?.("");
+                          onLoadLocalPathOptions?.(
+                            selectedLocalPathValues.length === 1
+                              ? selectedLocalPathValues[0]
+                              : "",
+                          );
                         }
                       }}
                       onSearch={(value) => {
