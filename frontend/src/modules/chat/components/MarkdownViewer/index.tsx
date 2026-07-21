@@ -6,7 +6,7 @@ import classnames from "classnames";
 import "katex/dist/katex.min.css";
 import { Popover } from "antd";
 import rehypeSanitize from "rehype-sanitize";
-import "./markdown.scss";
+import "../../../../components/MarkdownViewer/markdown.scss";
 import "./index.scss";
 import {
   createContext,
