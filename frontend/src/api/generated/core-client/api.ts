@@ -1300,6 +1300,11 @@ export interface ManagedStateOpenAPIResponse {
     'title': string;
     'version': number;
 }
+export interface MarketDeleteOpenAPIResponse {
+    'deleted': boolean;
+    'market_item_id': string;
+    'source_skill_id': string;
+}
 export interface MarketEditOpenAPIRequest {
     /**
      * Deprecated compatibility field; converted to one marketplace tag when tags is omitted.
@@ -27199,6 +27204,40 @@ export const SkillMarketApiAxiosParamCreator = function (configuration?: Configu
     return {
         /**
          * 
+         * @summary Permanently delete market skill item
+         * @param {string} marketItemId
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        apiCoreAdminSkillMarketMarketItemIdDelete: async (marketItemId: string, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+            // verify required parameter 'marketItemId' is not null or undefined
+            assertParamExists('apiCoreAdminSkillMarketMarketItemIdDelete', 'marketItemId', marketItemId)
+            const localVarPath = `/api/core/admin/skill-market/{market_item_id}`
+                .replace(`{${"market_item_id"}}`, encodeURIComponent(String(marketItemId)));
+            // use dummy base URL string because the URL constructor only accepts absolute URLs.
+            const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
+            let baseOptions;
+            if (configuration) {
+                baseOptions = configuration.baseOptions;
+            }
+
+            const localVarRequestOptions = { method: 'DELETE', ...baseOptions, ...options};
+            const localVarHeaderParameter = {} as any;
+            const localVarQueryParameter = {} as any;
+
+            localVarHeaderParameter['Accept'] = 'application/json';
+
+            setSearchParams(localVarUrlObj, localVarQueryParameter);
+            let headersFromBaseOptions = baseOptions && baseOptions.headers ? baseOptions.headers : {};
+            localVarRequestOptions.headers = {...localVarHeaderParameter, ...headersFromBaseOptions, ...options.headers};
+
+            return {
+                url: toPathString(localVarUrlObj),
+                options: localVarRequestOptions,
+            };
+        },
+        /**
+         *
          * @summary Unpublish market skill item
          * @param {string} marketItemId 
          * @param {*} [options] Override http request option.
@@ -27307,6 +27346,40 @@ export const SkillMarketApiAxiosParamCreator = function (configuration?: Configu
         },
         /**
          * 
+         * @summary Permanently delete market skill item
+         * @param {string} marketItemId
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        apiCoreSkillMarketAdminItemsMarketItemIdDelete: async (marketItemId: string, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+            // verify required parameter 'marketItemId' is not null or undefined
+            assertParamExists('apiCoreSkillMarketAdminItemsMarketItemIdDelete', 'marketItemId', marketItemId)
+            const localVarPath = `/api/core/skill-market/admin/items/{market_item_id}`
+                .replace(`{${"market_item_id"}}`, encodeURIComponent(String(marketItemId)));
+            // use dummy base URL string because the URL constructor only accepts absolute URLs.
+            const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
+            let baseOptions;
+            if (configuration) {
+                baseOptions = configuration.baseOptions;
+            }
+
+            const localVarRequestOptions = { method: 'DELETE', ...baseOptions, ...options};
+            const localVarHeaderParameter = {} as any;
+            const localVarQueryParameter = {} as any;
+
+            localVarHeaderParameter['Accept'] = 'application/json';
+
+            setSearchParams(localVarUrlObj, localVarQueryParameter);
+            let headersFromBaseOptions = baseOptions && baseOptions.headers ? baseOptions.headers : {};
+            localVarRequestOptions.headers = {...localVarHeaderParameter, ...headersFromBaseOptions, ...options.headers};
+
+            return {
+                url: toPathString(localVarUrlObj),
+                options: localVarRequestOptions,
+            };
+        },
+        /**
+         *
          * @summary Edit market skill item
          * @param {string} marketItemId 
          * @param {MarketEditOpenAPIRequest} marketEditOpenAPIRequest 
@@ -27612,6 +27685,19 @@ export const SkillMarketApiFp = function(configuration?: Configuration) {
     return {
         /**
          * 
+         * @summary Permanently delete market skill item
+         * @param {string} marketItemId
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        async apiCoreAdminSkillMarketMarketItemIdDelete(marketItemId: string, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<MarketDeleteOpenAPIResponse>> {
+            const localVarAxiosArgs = await localVarAxiosParamCreator.apiCoreAdminSkillMarketMarketItemIdDelete(marketItemId, options);
+            const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
+            const localVarOperationServerBasePath = operationServerMap['SkillMarketApi.apiCoreAdminSkillMarketMarketItemIdDelete']?.[localVarOperationServerIndex]?.url;
+            return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
+        },
+        /**
+         *
          * @summary Unpublish market skill item
          * @param {string} marketItemId 
          * @param {*} [options] Override http request option.
@@ -27652,6 +27738,19 @@ export const SkillMarketApiFp = function(configuration?: Configuration) {
         },
         /**
          * 
+         * @summary Permanently delete market skill item
+         * @param {string} marketItemId
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        async apiCoreSkillMarketAdminItemsMarketItemIdDelete(marketItemId: string, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<MarketDeleteOpenAPIResponse>> {
+            const localVarAxiosArgs = await localVarAxiosParamCreator.apiCoreSkillMarketAdminItemsMarketItemIdDelete(marketItemId, options);
+            const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
+            const localVarOperationServerBasePath = operationServerMap['SkillMarketApi.apiCoreSkillMarketAdminItemsMarketItemIdDelete']?.[localVarOperationServerIndex]?.url;
+            return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
+        },
+        /**
+         *
          * @summary Edit market skill item
          * @param {string} marketItemId 
          * @param {MarketEditOpenAPIRequest} marketEditOpenAPIRequest 
@@ -27769,6 +27868,16 @@ export const SkillMarketApiFactory = function (configuration?: Configuration, ba
     return {
         /**
          * 
+         * @summary Permanently delete market skill item
+         * @param {SkillMarketApiApiCoreAdminSkillMarketMarketItemIdDeleteRequest} requestParameters Request parameters.
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        apiCoreAdminSkillMarketMarketItemIdDelete(requestParameters: SkillMarketApiApiCoreAdminSkillMarketMarketItemIdDeleteRequest, options?: RawAxiosRequestConfig): AxiosPromise<MarketDeleteOpenAPIResponse> {
+            return localVarFp.apiCoreAdminSkillMarketMarketItemIdDelete(requestParameters.marketItemId, options).then((request) => request(axios, basePath));
+        },
+        /**
+         *
          * @summary Unpublish market skill item
          * @param {SkillMarketApiApiCoreAdminSkillMarketMarketItemIdOfflinePostRequest} requestParameters Request parameters.
          * @param {*} [options] Override http request option.
@@ -27799,6 +27908,16 @@ export const SkillMarketApiFactory = function (configuration?: Configuration, ba
         },
         /**
          * 
+         * @summary Permanently delete market skill item
+         * @param {SkillMarketApiApiCoreSkillMarketAdminItemsMarketItemIdDeleteRequest} requestParameters Request parameters.
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        apiCoreSkillMarketAdminItemsMarketItemIdDelete(requestParameters: SkillMarketApiApiCoreSkillMarketAdminItemsMarketItemIdDeleteRequest, options?: RawAxiosRequestConfig): AxiosPromise<MarketDeleteOpenAPIResponse> {
+            return localVarFp.apiCoreSkillMarketAdminItemsMarketItemIdDelete(requestParameters.marketItemId, options).then((request) => request(axios, basePath));
+        },
+        /**
+         *
          * @summary Edit market skill item
          * @param {SkillMarketApiApiCoreSkillMarketAdminItemsMarketItemIdPatchRequest} requestParameters Request parameters.
          * @param {*} [options] Override http request option.
@@ -27880,6 +27999,13 @@ export const SkillMarketApiFactory = function (configuration?: Configuration, ba
 };
 
 /**
+ * Request parameters for apiCoreAdminSkillMarketMarketItemIdDelete operation in SkillMarketApi.
+ */
+export interface SkillMarketApiApiCoreAdminSkillMarketMarketItemIdDeleteRequest {
+    readonly marketItemId: string
+}
+
+/**
  * Request parameters for apiCoreAdminSkillMarketMarketItemIdOfflinePost operation in SkillMarketApi.
  */
 export interface SkillMarketApiApiCoreAdminSkillMarketMarketItemIdOfflinePostRequest {
@@ -27900,6 +28026,13 @@ export interface SkillMarketApiApiCoreAdminSkillMarketMarketItemIdPatchRequest {
  */
 export interface SkillMarketApiApiCoreAdminSkillMarketPostRequest {
     readonly marketPublishOpenAPIRequest: MarketPublishOpenAPIRequest
+}
+
+/**
+ * Request parameters for apiCoreSkillMarketAdminItemsMarketItemIdDelete operation in SkillMarketApi.
+ */
+export interface SkillMarketApiApiCoreSkillMarketAdminItemsMarketItemIdDeleteRequest {
+    readonly marketItemId: string
 }
 
 /**
@@ -27967,6 +28100,17 @@ export interface SkillMarketApiApiCoreSkillMarketMarketItemIdInstallPostRequest 
 export class SkillMarketApi extends BaseAPI {
     /**
      * 
+     * @summary Permanently delete market skill item
+     * @param {SkillMarketApiApiCoreAdminSkillMarketMarketItemIdDeleteRequest} requestParameters Request parameters.
+     * @param {*} [options] Override http request option.
+     * @throws {RequiredError}
+     */
+    public apiCoreAdminSkillMarketMarketItemIdDelete(requestParameters: SkillMarketApiApiCoreAdminSkillMarketMarketItemIdDeleteRequest, options?: RawAxiosRequestConfig) {
+        return SkillMarketApiFp(this.configuration).apiCoreAdminSkillMarketMarketItemIdDelete(requestParameters.marketItemId, options).then((request) => request(this.axios, this.basePath));
+    }
+
+    /**
+     *
      * @summary Unpublish market skill item
      * @param {SkillMarketApiApiCoreAdminSkillMarketMarketItemIdOfflinePostRequest} requestParameters Request parameters.
      * @param {*} [options] Override http request option.
@@ -28000,6 +28144,17 @@ export class SkillMarketApi extends BaseAPI {
 
     /**
      * 
+     * @summary Permanently delete market skill item
+     * @param {SkillMarketApiApiCoreSkillMarketAdminItemsMarketItemIdDeleteRequest} requestParameters Request parameters.
+     * @param {*} [options] Override http request option.
+     * @throws {RequiredError}
+     */
+    public apiCoreSkillMarketAdminItemsMarketItemIdDelete(requestParameters: SkillMarketApiApiCoreSkillMarketAdminItemsMarketItemIdDeleteRequest, options?: RawAxiosRequestConfig) {
+        return SkillMarketApiFp(this.configuration).apiCoreSkillMarketAdminItemsMarketItemIdDelete(requestParameters.marketItemId, options).then((request) => request(this.axios, this.basePath));
+    }
+
+    /**
+     *
      * @summary Edit market skill item
      * @param {SkillMarketApiApiCoreSkillMarketAdminItemsMarketItemIdPatchRequest} requestParameters Request parameters.
      * @param {*} [options] Override http request option.

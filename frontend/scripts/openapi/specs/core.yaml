@@ -4095,6 +4095,19 @@ components:
                 - title
                 - version
             type: object
+        marketDeleteOpenAPIResponse:
+            properties:
+                deleted:
+                    type: boolean
+                market_item_id:
+                    type: string
+                source_skill_id:
+                    type: string
+            required:
+                - deleted
+                - market_item_id
+                - source_skill_id
+            type: object
         marketEditOpenAPIRequest:
             properties:
                 category:
@@ -5882,6 +5895,23 @@ paths:
             tags:
                 - skill-market
     /api/core/admin/skill-market/{market_item_id}:
+        delete:
+            parameters:
+                - in: path
+                  name: market_item_id
+                  required: true
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/marketDeleteOpenAPIResponse'
+                    description: Deleted market skill
+            summary: Permanently delete market skill item
+            tags:
+                - skill-market
         patch:
             parameters:
                 - in: path
@@ -11860,6 +11890,23 @@ paths:
             tags:
                 - skill-market
     /api/core/skill-market/admin/items/{market_item_id}:
+        delete:
+            parameters:
+                - in: path
+                  name: market_item_id
+                  required: true
+                  schema:
+                    type: string
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/marketDeleteOpenAPIResponse'
+                    description: Deleted market skill
+            summary: Permanently delete market skill item
+            tags:
+                - skill-market
         patch:
             parameters:
                 - in: path

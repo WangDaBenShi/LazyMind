@@ -82,14 +82,16 @@ const buildRevisionDiffTreeData = (
   type MutableNode = DataNode & { children: MutableNode[] };
   const roots: MutableNode[] = [];
   const nodes = new Map<string, MutableNode>();
+  const filesByPath = new Map(files.map((file) => [file.path, file]));
 
   files.forEach((file) => {
     const parts = file.path.split("/").filter(Boolean);
     parts.forEach((part, index) => {
       const path = parts.slice(0, index + 1).join("/");
       if (nodes.has(path)) return;
-      const isFile = index === parts.length - 1 && file.type !== "dir";
-      const status = isFile ? file.status : "";
+      const diffFile = filesByPath.get(path);
+      const isFile = Boolean(diffFile && diffFile.type !== "dir");
+      const status = diffFile?.status || "";
       const node: MutableNode = {
         key: path,
         children: [],
@@ -309,6 +311,8 @@ function SkillRevisionDiffPanel({
           <Alert showIcon type="error" message={error} />
         ) : selectedFile?.binary ? (
           <Alert showIcon type="info" message={t("admin.memoryVersionBinaryFileHint")} />
+        ) : selectedFile?.tooLarge ? (
+          <Alert showIcon type="warning" message={t("admin.memorySkillPackageDiffTooLarge")} />
         ) : lines.length ? (
           <div className="memory-version-diff" aria-label={t("admin.memoryVersionTabDiff")}>
             {lines.map((line, index) => (
@@ -785,8 +789,10 @@ export default function ResourceVersionDrawer({
             diffEntryLines: [],
           }));
           const defaultDiffPath =
-            nextDiffFiles.find((file) => file.status !== "unchanged")?.path ||
-            nextDiffFiles[0]?.path ||
+            nextDiffFiles.find(
+              (file) => file.type !== "dir" && file.status !== "unchanged",
+            )?.path ||
+            nextDiffFiles.find((file) => file.type !== "dir")?.path ||
             "";
           setDiffFiles(nextDiffFiles);
           setDiffRevisionId(selectedRevisionId);
@@ -847,88 +853,78 @@ export default function ResourceVersionDrawer({
   ]);
 
   useEffect(() => {
+    const selectedDiffFile = diffFiles.find(
+      (file) => file.path === selectedDiffPath,
+    );
+    const selectedStatus = selectedDiffFile?.status?.toLowerCase();
+    const requestId = diffRequestIdRef.current + 1;
+    diffRequestIdRef.current = requestId;
+
     if (
       !open ||
       !isSkillResource ||
       !selectedRevisionId ||
       diffRevisionId !== selectedRevisionId ||
       !selectedDiffPath ||
-      !diffFiles.some((file) => file.path === selectedDiffPath)
+      !selectedDiffFile ||
+      selectedDiffFile.type === "dir" ||
+      selectedStatus === "unchanged"
     ) {
       setSelectedDiffLines([]);
+      setDiffLoading(false);
+      setDiffError("");
       return undefined;
     }
 
-    const requestId = diffRequestIdRef.current + 1;
-    diffRequestIdRef.current = requestId;
+    if (selectedDiffFile.binary || selectedDiffFile.tooLarge) {
+      setSelectedDiffLines([]);
+      setDiffLoading(false);
+      setDiffError("");
+      return undefined;
+    }
+
+    if (selectedDiffFile.diffEntryLines.length) {
+      setSelectedDiffLines(mapDiffEntryLines(selectedDiffFile.diffEntryLines));
+      setDiffLoading(false);
+      setDiffError("");
+      return undefined;
+    }
+
+    if (!diffBaseRevisionId) {
+      setSelectedDiffLines([]);
+      setDiffLoading(false);
+      setDiffError("");
+      return undefined;
+    }
+
     let ignore = false;
     setDiffLoading(true);
     setDiffError("");
     void (async () => {
       try {
-        const selectedDiffFile = diffFiles.find(
-          (file) => file.path === selectedDiffPath,
-        );
-        const selectedStatus = selectedDiffFile?.status?.toLowerCase();
-
-        if (selectedDiffFile?.binary || selectedDiffFile?.tooLarge) {
-          if (!ignore && diffRequestIdRef.current === requestId) {
-            setSelectedDiffLines([]);
-          }
-          return;
-        }
-
-        if (selectedStatus === "added") {
-          const fileContent = await getSkillRevisionFile(
-            resourceId,
-            selectedRevisionId,
-            selectedDiffPath,
-          );
-          if (!ignore && diffRequestIdRef.current === requestId) {
-            setSelectedDiffLines(buildDiffLinesWithInline("", fileContent));
-          }
-          return;
-        }
-
-        if (selectedStatus === "deleted" && diffBaseRevisionId) {
-          const fileContent = await getSkillRevisionFile(
-            resourceId,
-            diffBaseRevisionId,
-            selectedDiffPath,
-          );
-          if (!ignore && diffRequestIdRef.current === requestId) {
-            setSelectedDiffLines(buildDiffLinesWithInline(fileContent, ""));
-          }
-          return;
-        }
-
-        if (selectedStatus === "unchanged") {
-          if (!ignore && diffRequestIdRef.current === requestId) {
-            setSelectedDiffLines([]);
-          }
-          return;
-        }
-
-        if (diffBaseRevisionId) {
-          const file = await compareSkillRevisionFileDiff(
-            resourceId,
-            diffBaseRevisionId,
-            selectedRevisionId,
-            selectedDiffPath,
-          );
-          if (!ignore && diffRequestIdRef.current === requestId) {
-            setSelectedDiffLines(mapDiffEntryLines(file.diffEntryLines));
-          }
-          return;
-        }
-
-        const fileContent = await getSkillRevisionFile(
+        const file = await compareSkillRevisionFileDiff(
           resourceId,
+          diffBaseRevisionId,
           selectedRevisionId,
           selectedDiffPath,
         );
         if (!ignore && diffRequestIdRef.current === requestId) {
-          setSelectedDiffLines(buildDiffLinesWithInline("", fileContent));
+          if (file.binary || file.tooLarge) {
+            setDiffFiles((previous) =>
+              previous.map((item) =>
+                item.path === selectedDiffPath
+                  ? {
+                      ...item,
+                      binary: file.binary,
+                      tooLarge: file.tooLarge,
+                    }
+                  : item,
+              ),
+            );
+            setSelectedDiffLines([]);
+          } else {
+            setSelectedDiffLines(mapDiffEntryLines(file.diffEntryLines));
+          }
         }
       } catch (error) {
         if (!ignore && diffRequestIdRef.current === requestId) {
