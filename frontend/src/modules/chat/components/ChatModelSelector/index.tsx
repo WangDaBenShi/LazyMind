@@ -68,21 +68,15 @@ function isModelAvailable(model: ChatModelOption): boolean {
 function resolveStoredSelection(
   selection: ChatModelSelection,
   providers: ChatModelProvider[],
-  autoAvailable: boolean,
 ): ChatModelSelection {
-  if (selection.mode === "auto") {
-    return {
-      ...selection,
-      availability: autoAvailable ? "available" : "unavailable",
-    };
-  }
   const provider = modelProviderForSelection(providers, selection);
   const model = provider?.models.find((item) => item.id === selection.model_id);
   if (!provider || !model) {
-    return { ...selection, availability: "unavailable" };
+    return { ...selection, mode: "fixed", availability: "unavailable" };
   }
   return {
     ...selection,
+    mode: "fixed",
     provider_name: provider.name,
     model_name: model.name,
     group_name: model.group_name,
@@ -169,19 +163,21 @@ const ChatModelSelector = ({
       const storedNewChatSelection = !normalizedConversationId
         ? useModelSelectionStore.getState().selections[selectionKey]
         : undefined;
-      const preservedSelection = storedNewChatSelection
-        ? resolveStoredSelection(
-            storedNewChatSelection,
-            providers,
-            nextCatalog.auto_available,
-          )
+      const preservedSelection = storedNewChatSelection?.model_id
+        ? resolveStoredSelection(storedNewChatSelection, providers)
         : undefined;
-      const normalizedCatalog = {
+      const normalizedCatalog: ChatModelCatalog = {
         ...nextCatalog,
         providers,
         selection: preservedSelection
           ? { ...preservedSelection, version: nextCatalog.selection.version }
-          : nextCatalog.selection,
+          : {
+              ...nextCatalog.selection,
+              mode: "fixed",
+              availability: nextCatalog.selection.model_id
+                ? nextCatalog.selection.availability
+                : "unavailable",
+            },
       };
       setCatalog(normalizedCatalog);
       setLoadStatus("ready");
@@ -324,11 +320,6 @@ const ChatModelSelector = ({
 
   const selectionLabel = (() => {
     if (loadStatus === "loading") return t("chat.modelSelectorLoading");
-    if (currentSelection?.mode === "auto") {
-      return currentSelection.provider_name && currentSelection.model_name
-        ? `Auto · ${currentSelection.provider_name} · ${currentSelection.model_name}`
-        : "Auto";
-    }
     if (currentSelection?.provider_name && currentSelection.model_name) {
       return `${currentSelection.provider_name} · ${currentSelection.model_name}`;
     }
@@ -353,8 +344,7 @@ const ChatModelSelector = ({
       if (!catalog || savingRef.current) return;
       const isSameSelection =
         catalog.selection.mode === request.mode &&
-        (request.mode === "auto" ||
-          catalog.selection.model_id === request.model_id);
+        catalog.selection.model_id === request.model_id;
       if (isSameSelection) {
         closeAndRestoreFocus();
         return;
@@ -431,15 +421,6 @@ const ChatModelSelector = ({
     ],
   );
 
-  const chooseAuto = () => {
-    if (!catalog) return;
-    void applySelection(
-      { mode: "auto" },
-      { mode: "auto", version: catalog.selection.version },
-      "Auto",
-    );
-  };
-
   const chooseModel = (provider: ChatModelProvider, model: ChatModelOption) => {
     if (!catalog || !isModelAvailable(model)) return;
     void applySelection(
@@ -502,31 +483,6 @@ const ChatModelSelector = ({
                 onChange={(event) => setSearchQuery(event.target.value)}
               />
             </label>
-          ) : null}
-
-          {catalog.auto_available || currentSelection?.mode === "auto" ? (
-            <button
-              type="button"
-              className={`chat-model-auto-option${
-                currentSelection?.mode === "auto" ? " is-current" : ""
-              }`}
-              aria-pressed={currentSelection?.mode === "auto"}
-              aria-label={`Auto，${t("chat.modelSelectorAutoDescription")}`}
-              data-current={currentSelection?.mode === "auto"}
-              title={t("chat.modelSelectorAutoDescription")}
-              disabled={saving || !catalog.auto_available}
-              onClick={chooseAuto}
-            >
-              <strong>Auto</strong>
-              {!catalog.auto_available ? (
-                <small className="chat-model-option-unavailable">
-                  {t("chat.modelSelectorUnavailable")}
-                </small>
-              ) : null}
-              {currentSelection?.mode === "auto" ? (
-                <CheckOutlined aria-hidden="true" />
-              ) : null}
-            </button>
           ) : null}
 
           {hasProviderModels ? (
@@ -628,11 +584,11 @@ const ChatModelSelector = ({
                 </div>
               )}
             </div>
-          ) : !catalog.auto_available ? (
+          ) : (
             <div className="chat-model-selector-empty" role="status">
               {t("chat.modelSelectorEmpty")}
             </div>
-          ) : null}
+          )}
 
           {switchError ? (
             <div className="chat-model-selector-error" role="alert">

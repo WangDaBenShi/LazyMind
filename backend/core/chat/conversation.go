@@ -493,7 +493,7 @@ func ChatConversations(w http.ResponseWriter, r *http.Request) {
 	// applyChatRuntimeConfigs is called later, so we first apply it to get DB-resolved values,
 	// then override with any explicit body value.
 	if target.IsRegeneration && target.Existing != nil {
-		if route := chatModelRouteFromHistoryExt(target.Existing.Ext); route != nil && route.Mode == chatModelModeAuto {
+		if route := chatModelRouteFromHistoryExt(target.Existing.Ext); route != nil {
 			reqBody[chatModelRetryRouteBodyKey] = route
 		}
 	}

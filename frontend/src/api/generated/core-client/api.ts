@@ -705,8 +705,7 @@ export const ChatModelSelectionOpenAPIAvailabilityEnum = {
 
 export type ChatModelSelectionOpenAPIAvailabilityEnum = typeof ChatModelSelectionOpenAPIAvailabilityEnum[keyof typeof ChatModelSelectionOpenAPIAvailabilityEnum];
 export const ChatModelSelectionOpenAPIModeEnum = {
-    Fixed: 'fixed',
-    Auto: 'auto'
+    Fixed: 'fixed'
 } as const;
 
 export type ChatModelSelectionOpenAPIModeEnum = typeof ChatModelSelectionOpenAPIModeEnum[keyof typeof ChatModelSelectionOpenAPIModeEnum];
@@ -718,7 +717,6 @@ export const ChatModelSelectionOpenAPISourceEnum = {
 export type ChatModelSelectionOpenAPISourceEnum = typeof ChatModelSelectionOpenAPISourceEnum[keyof typeof ChatModelSelectionOpenAPISourceEnum];
 
 export interface ChatModelsOpenAPIResponse {
-    'auto_available': boolean;
     'default_selection': ChatModelSelectionOpenAPI;
     'providers'?: Array<ChatModelProviderOpenAPIItem>;
     'selection': ChatModelSelectionOpenAPI;
@@ -2115,14 +2113,13 @@ export interface PatchConversationModelOpenAPIRequest {
     'expected_version': number;
     'mode': PatchConversationModelOpenAPIRequestModeEnum;
     /**
-     * Required only when mode is fixed.
+     * ID of the configured chat model selected for this conversation.
      */
-    'model_id'?: string;
+    'model_id': string;
 }
 
 export const PatchConversationModelOpenAPIRequestModeEnum = {
-    Fixed: 'fixed',
-    Auto: 'auto'
+    Fixed: 'fixed'
 } as const;
 
 export type PatchConversationModelOpenAPIRequestModeEnum = typeof PatchConversationModelOpenAPIRequestModeEnum[keyof typeof PatchConversationModelOpenAPIRequestModeEnum];
@@ -2626,8 +2623,7 @@ export interface SidechatConversationOpenAPI {
 }
 
 export const SidechatConversationOpenAPIChatModelModeEnum = {
-    Fixed: 'fixed',
-    Auto: 'auto'
+    Fixed: 'fixed'
 } as const;
 
 export type SidechatConversationOpenAPIChatModelModeEnum = typeof SidechatConversationOpenAPIChatModelModeEnum[keyof typeof SidechatConversationOpenAPIChatModelModeEnum];

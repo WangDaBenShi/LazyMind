@@ -1783,8 +1783,6 @@ const zhCN = {
     modelSelectorSearchLabel: "搜索对话模型",
     modelSelectorSearchPlaceholder: "搜索模型",
     modelSelectorSearchEmpty: "没有匹配的模型",
-    modelSelectorAutoDescription:
-      "根据思考深度、上下文长度、附件、Workflow 和模型可用性自动选择对话模型",
     modelRouteAutoLabel: "Auto · {{model}}",
     modelRouteFixedLabel: "{{model}}",
     modelRouteReason: {

@@ -4936,7 +4936,6 @@ components:
                 mode:
                     enum:
                         - fixed
-                        - auto
                     type: string
                 model_id:
                     type: string
@@ -4961,8 +4960,6 @@ components:
             type: object
         chatModelsOpenAPIResponse:
             properties:
-                auto_available:
-                    type: boolean
                 default_selection:
                     $ref: '#/components/schemas/chatModelSelectionOpenAPI'
                 providers:
@@ -4980,7 +4977,6 @@ components:
                         - background_task_running
                     type: string
             required:
-                - auto_available
                 - default_selection
                 - selection
                 - switch_allowed
@@ -5865,14 +5861,14 @@ components:
                 mode:
                     enum:
                         - fixed
-                        - auto
                     type: string
                 model_id:
-                    description: Required only when mode is fixed.
+                    description: ID of the configured chat model selected for this conversation.
                     type: string
             required:
                 - expected_version
                 - mode
+                - model_id
             type: object
         patchConversationModelOpenAPIResponse:
             properties:
@@ -6373,7 +6369,6 @@ components:
                 chat_model_mode:
                     enum:
                         - fixed
-                        - auto
                     type: string
                 chat_model_version:
                     format: int64

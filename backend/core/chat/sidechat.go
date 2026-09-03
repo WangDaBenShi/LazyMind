@@ -503,6 +503,14 @@ func createSidechatConversation(
 				return err
 			}
 			applyResolvedChatModelBinding(&child, binding)
+		} else if strings.ToLower(strings.TrimSpace(*parent.ChatModelMode)) == legacyChatModelModeAuto {
+			mode := chatModelModeFixed
+			modelID := savedConversationChatModelID(&parent)
+			child.ChatModelMode = &mode
+			child.ChatModelID = nil
+			if modelID != "" {
+				child.ChatModelID = &modelID
+			}
 		}
 		if source != nil {
 			sourceID := source.ID
@@ -571,13 +579,22 @@ func mergeConversationRelationMetadata(item map[string]any, c orm.Conversation, 
 }
 
 func sidechatConversationPayload(c orm.Conversation, parentDisplayName string) map[string]any {
+	mode, modelID := c.ChatModelMode, c.ChatModelID
+	if mode != nil && strings.ToLower(strings.TrimSpace(*mode)) == legacyChatModelModeAuto {
+		fixedMode := chatModelModeFixed
+		mode = &fixedMode
+		modelID = nil
+		if savedModelID := savedConversationChatModelID(&c); savedModelID != "" {
+			modelID = &savedModelID
+		}
+	}
 	payload := map[string]any{
 		"id":                 c.ID,
 		"conversation_id":    c.ID,
 		"display_name":       c.DisplayName,
 		"search_config":      decodedJSON(c.SearchConfig),
-		"chat_model_mode":    c.ChatModelMode,
-		"chat_model_id":      c.ChatModelID,
+		"chat_model_mode":    mode,
+		"chat_model_id":      modelID,
 		"chat_model_version": c.ChatModelVersion,
 		"thinking_depth":     c.ThinkingDepth,
 		"is_ephemeral":       c.IsEphemeral,

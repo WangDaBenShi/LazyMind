@@ -13,6 +13,7 @@ import {
   NEW_CHAT_MODEL_SELECTION_KEY,
   useModelSelectionStore,
   type ChatModelCatalog,
+  type ChatModelSelection,
 } from "@/modules/chat/store/modelSelection";
 import ChatModelSelector from ".";
 import {
@@ -38,7 +39,6 @@ vi.mock("react-i18next", () => ({
         "chat.modelSelectorSearchLabel": "搜索对话模型",
         "chat.modelSelectorSearchPlaceholder": "搜索模型",
         "chat.modelSelectorSearchEmpty": "没有匹配的模型",
-        "chat.modelSelectorAutoDescription": "自动选择",
         "chat.modelSelectorCurrent": "当前使用",
         "chat.modelSelectorDefault": "默认",
         "chat.modelSelectorRecommended": "推荐",
@@ -120,7 +120,6 @@ function catalog(modelName = "DeepSeek-V3", version = 3): ChatModelCatalog {
       },
     ],
     switch_allowed: true,
-    auto_available: true,
   };
 }
 
@@ -131,7 +130,7 @@ describe("ChatModelSelector", () => {
     vi.restoreAllMocks();
   });
 
-  it("loads the historical selection and persists a provider-scoped model switch", async () => {
+  it.each(["conversation-1", "child-1"])("loads the saved selection and persists a provider-scoped switch for %s", async (conversationId) => {
     fetchCatalogMock.mockResolvedValue(catalog());
     updateSelectionMock.mockResolvedValue({
       mode: "fixed",
@@ -150,7 +149,7 @@ describe("ChatModelSelector", () => {
 
     render(
       <ChatModelSelector
-        conversationId="conversation-1"
+        conversationId={conversationId}
         onSavingChange={onSavingChange}
         onSelectionChange={onSelectionChange}
       />,
@@ -160,7 +159,7 @@ describe("ChatModelSelector", () => {
       name: "当前模型：DeepSeek · DeepSeek-V3",
     });
     expect(fetchCatalogMock).toHaveBeenCalledWith(
-      "conversation-1",
+      conversationId,
       expect.any(AbortSignal),
     );
 
@@ -169,7 +168,7 @@ describe("ChatModelSelector", () => {
 
     await waitFor(() =>
       expect(updateSelectionMock).toHaveBeenCalledWith(
-        "conversation-1",
+        conversationId,
         { mode: "fixed", model_id: "gpt-4o" },
         3,
         expect.any(AbortSignal),
@@ -250,7 +249,7 @@ describe("ChatModelSelector", () => {
     expect(fetchCatalogMock).toHaveBeenCalledTimes(2);
   });
 
-  it("keeps a new-chat Auto choice local for the first request", async () => {
+  it("starts from the default and keeps a new-chat fixed choice local without an Auto option", async () => {
     fetchCatalogMock.mockResolvedValue(catalog("DeepSeek-V3", 0));
     const onSelectionChange = vi.fn();
     vi.spyOn(message, "success").mockImplementation(() => undefined as never);
@@ -261,36 +260,77 @@ describe("ChatModelSelector", () => {
         name: "当前模型：DeepSeek · DeepSeek-V3",
       }),
     );
-    fireEvent.click(screen.getByRole("button", { name: /Auto/ }));
+    expect(screen.queryByRole("button", { name: /Auto/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /GPT-4o/ }));
 
     expect(updateSelectionMock).not.toHaveBeenCalled();
     expect(onSelectionChange).toHaveBeenLastCalledWith(
-      { mode: "auto" },
-      expect.objectContaining({ mode: "auto", version: 0 }),
+      { mode: "fixed", model_id: "gpt-4o" },
+      expect.objectContaining({ mode: "fixed", model_id: "gpt-4o", version: 0 }),
     );
     expect(
-      await screen.findByRole("button", { name: "当前模型：Auto" }),
+      await screen.findByRole("button", { name: "当前模型：OpenAI · GPT-4o" }),
     ).toBeInTheDocument();
   });
 
-  it("shows the most recently resolved model beside Auto", async () => {
+  it("uses a legacy Auto catalog's saved model as a fixed selection", async () => {
     const nextCatalog = catalog();
     nextCatalog.selection = {
       mode: "auto",
+      model_id: "deepseek-v3",
       provider_name: "DeepSeek",
       model_name: "DeepSeek-V3",
       availability: "available",
       version: 4,
-    };
+    } as unknown as ChatModelSelection;
     fetchCatalogMock.mockResolvedValue(nextCatalog);
+    const onSelectionChange = vi.fn();
 
-    render(<ChatModelSelector conversationId="conversation-1" />);
+    render(
+      <ChatModelSelector
+        conversationId="conversation-1"
+        onSelectionChange={onSelectionChange}
+      />,
+    );
 
     expect(
       await screen.findByRole("button", {
-        name: "当前模型：Auto · DeepSeek · DeepSeek-V3",
+        name: "当前模型：DeepSeek · DeepSeek-V3",
       }),
     ).toBeInTheDocument();
+    expect(onSelectionChange).toHaveBeenLastCalledWith(
+      { mode: "fixed", model_id: "deepseek-v3" },
+      expect.objectContaining({ mode: "fixed", version: 4 }),
+    );
+  });
+
+  it("requires a manual choice for a legacy Auto conversation without a saved model", async () => {
+    fetchCatalogMock.mockResolvedValue({
+      ...catalog(),
+      selection: {
+        mode: "auto",
+        availability: "available",
+        version: 4,
+      } as unknown as ChatModelSelection,
+    });
+    const onSelectionChange = vi.fn();
+
+    render(
+      <ChatModelSelector
+        conversationId="conversation-1"
+        onSelectionChange={onSelectionChange}
+      />,
+    );
+
+    const trigger = await screen.findByRole("button", {
+      name: "当前模型：选择模型 · 模型不可用",
+    });
+    expect(onSelectionChange).not.toHaveBeenCalled();
+    expect(useModelSelectionStore.getState().selections["conversation-1"])
+      .toMatchObject({ mode: "fixed", availability: "unavailable" });
+    fireEvent.click(trigger);
+    expect(screen.queryByRole("button", { name: /Auto/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /GPT-4o/ })).toBeEnabled();
   });
 
   it("preserves an available new-chat choice when another selector loads", async () => {
@@ -404,38 +444,67 @@ describe("ChatModelSelector", () => {
     expect(currentModel).toHaveTextContent("模型不可用");
   });
 
-  it("preserves new-chat Auto and derives availability from the catalog", async () => {
+  it("replaces a stale new-chat Auto choice without a model with the fixed default", async () => {
     useModelSelectionStore.getState().setSelection(
       NEW_CHAT_MODEL_SELECTION_KEY,
-      { mode: "auto", availability: "available", version: 0 },
+      { mode: "auto", availability: "available", version: 0 } as unknown as ChatModelSelection,
     );
-    fetchCatalogMock.mockResolvedValue({
-      ...catalog("DeepSeek-V3", 0),
-      auto_available: false,
-    });
+    fetchCatalogMock.mockResolvedValue(catalog("DeepSeek-V3", 0));
     const onSelectionChange = vi.fn();
 
     render(<ChatModelSelector onSelectionChange={onSelectionChange} />);
 
     const trigger = await screen.findByRole("button", {
-      name: "当前模型：Auto · 模型不可用",
+      name: "当前模型：DeepSeek · DeepSeek-V3",
     });
     expect(
       useModelSelectionStore.getState().selections[
         NEW_CHAT_MODEL_SELECTION_KEY
       ],
-    ).toMatchObject({ mode: "auto", availability: "unavailable" });
+    ).toMatchObject({ mode: "fixed", model_id: "deepseek-v3" });
     expect(onSelectionChange).toHaveBeenLastCalledWith(
-      { mode: "auto" },
-      expect.objectContaining({ mode: "auto", availability: "unavailable" }),
+      { mode: "fixed", model_id: "deepseek-v3" },
+      expect.objectContaining({ mode: "fixed", model_id: "deepseek-v3" }),
     );
 
     fireEvent.click(trigger);
-    const autoOption = within(
-      screen.getByRole("dialog", { name: "对话模型选择" }),
-    ).getByRole("button", { name: /Auto/ });
-    expect(autoOption).toBeDisabled();
-    expect(autoOption).toHaveTextContent("模型不可用");
+    expect(screen.queryByRole("button", { name: /Auto/ })).not.toBeInTheDocument();
+  });
+
+  it("preserves a stale new-chat Auto choice with a model as fixed", async () => {
+    useModelSelectionStore.getState().setSelection(
+      NEW_CHAT_MODEL_SELECTION_KEY,
+      { mode: "auto", model_id: "gpt-4o", version: 0 } as unknown as ChatModelSelection,
+    );
+    fetchCatalogMock.mockResolvedValue(catalog("DeepSeek-V3", 0));
+    const onSelectionChange = vi.fn();
+
+    render(<ChatModelSelector onSelectionChange={onSelectionChange} />);
+
+    expect(await screen.findByRole("button", {
+      name: "当前模型：OpenAI · GPT-4o",
+    })).toBeInTheDocument();
+    expect(onSelectionChange).toHaveBeenLastCalledWith(
+      { mode: "fixed", model_id: "gpt-4o" },
+      expect.objectContaining({ mode: "fixed", availability: "available" }),
+    );
+  });
+
+  it("shows an empty state when no provider has a chat model", async () => {
+    fetchCatalogMock.mockResolvedValue({
+      ...catalog(),
+      providers: [],
+      selection: { mode: "fixed", availability: "unavailable", version: 0 },
+    });
+
+    render(<ChatModelSelector />);
+
+    fireEvent.click(await screen.findByRole("button", {
+      name: "当前模型：选择模型 · 模型不可用",
+    }));
+    const dialog = screen.getByRole("dialog", { name: "对话模型选择" });
+    expect(within(dialog).getByRole("status")).toHaveTextContent("暂无可用的对话模型");
+    expect(within(dialog).queryByRole("button", { name: /Auto/ })).not.toBeInTheDocument();
   });
 
   it("sends only one persisted switch when a model is clicked twice", async () => {

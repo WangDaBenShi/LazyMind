@@ -163,7 +163,7 @@ describe("ChatInput model switch save lock", () => {
   it.each<{
     label: string;
     stored: ChatModelSelection;
-    expected: ChatModelSelectionRequest;
+    expected?: ChatModelSelectionRequest;
   }>([
     {
       label: "fixed",
@@ -171,9 +171,13 @@ describe("ChatInput model switch save lock", () => {
       expected: { mode: "fixed", model_id: "model-1" },
     },
     {
-      label: "Auto",
-      stored: { mode: "auto", version: 0 },
-      expected: { mode: "auto" },
+      label: "legacy Auto with a saved model",
+      stored: { mode: "auto", model_id: "model-2", version: 0 } as unknown as ChatModelSelection,
+      expected: { mode: "fixed", model_id: "model-2" },
+    },
+    {
+      label: "legacy Auto without a saved model",
+      stored: { mode: "auto", version: 0 } as unknown as ChatModelSelection,
     },
   ])(
     "reads the latest $label selection from the new-chat store when sending",
@@ -199,9 +203,8 @@ describe("ChatInput model switch save lock", () => {
 
       fireEvent.click(screen.getByRole("button", { name: "chat.send" }));
 
-      expect(onSend).toHaveBeenCalledWith(
-        expect.objectContaining({ initial_model_selection: expected }),
-      );
+      expect(onSend).toHaveBeenCalledTimes(1);
+      expect(onSend.mock.calls[0][0].initial_model_selection).toEqual(expected);
     },
   );
 

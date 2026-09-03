@@ -119,6 +119,38 @@ func TestOpenAPIChatSelectionAndSidechatHaveOneClientOwner(t *testing.T) {
 	}
 }
 
+func TestOpenAPIChatModelSelectionOnlySupportsFixedModels(t *testing.T) {
+	router := mux.NewRouter()
+	registerCoreRoutes(router)
+	specJSON, err := buildOpenAPISpecFromRouter(router)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var spec map[string]any
+	if err := json.Unmarshal(specJSON, &spec); err != nil {
+		t.Fatal(err)
+	}
+	schemas := spec["components"].(map[string]any)["schemas"].(map[string]any)
+	for schemaName, propertyName := range map[string]string{
+		"chatModelSelectionOpenAPI":            "mode",
+		"patchConversationModelOpenAPIRequest": "mode",
+		"sidechatConversationOpenAPI":          "chat_model_mode",
+	} {
+		property := schemaPropertiesForTest(t, schemas, schemaName)[propertyName].(map[string]any)
+		if !reflect.DeepEqual(property["enum"], []any{"fixed"}) {
+			t.Errorf("%s.%s enum = %#v, want fixed only", schemaName, propertyName, property["enum"])
+		}
+	}
+	if _, exists := schemaPropertiesForTest(t, schemas, "chatModelsOpenAPIResponse")["auto_available"]; exists {
+		t.Error("chat model catalog still exposes auto_available")
+	}
+	request := schemas["patchConversationModelOpenAPIRequest"].(map[string]any)
+	required := request["required"].([]any)
+	if !reflect.DeepEqual(required, []any{"expected_version", "mode", "model_id"}) {
+		t.Errorf("model selection required fields = %#v", required)
+	}
+}
+
 func TestOpenAPIConversationItemIncludesThinkingDepthEnum(t *testing.T) {
 	router := mux.NewRouter()
 	registerCoreRoutes(router)

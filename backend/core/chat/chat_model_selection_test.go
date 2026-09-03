@@ -96,25 +96,6 @@ func seedSelectedChatModel(t *testing.T, db *gorm.DB, owner, modelID string, sha
 	}
 }
 
-func setChatModelAutoMetadata(
-	t *testing.T,
-	db *gorm.DB,
-	modelID, maxInputTokens string,
-	freePriority int,
-	freeBaseURLs string,
-) {
-	t.Helper()
-	if err := db.Model(&orm.UserModelProviderGroupModel{}).
-		Where("id = ?", modelID).
-		Updates(map[string]any{
-			"max_input_tokens":           maxInputTokens,
-			"free_auto_select_priority":  freePriority,
-			"free_auto_select_base_urls": freeBaseURLs,
-		}).Error; err != nil {
-		t.Fatalf("set auto metadata for %s: %v", modelID, err)
-	}
-}
-
 func TestAvailableChatModelsUseUserSelectionAsDefault(t *testing.T) {
 	database := newPromptTestDB(t)
 	db := database.DB
@@ -224,229 +205,168 @@ func TestConversationFixedModelOverridesOnlyLLMAndNeverFallsBack(t *testing.T) {
 	}
 }
 
-func TestEnsureConversationSnapshotsDefaultAndAutoRoutesPerRequest(t *testing.T) {
+func TestEnsureConversationSnapshotsDefaultModel(t *testing.T) {
 	database := newPromptTestDB(t)
 	db := database.DB
 	seedAvailableChatModel(t, db, "user-1", "provider-default", "group-default", "model-default", "OpenAI", "Default", "gpt-default", "llm", true, "secret-default")
-	seedAvailableChatModel(t, db, "user-1", "provider-free", "group-free", "model-free", "Fast", "Free", "fast-free", "llm", true, "secret-free")
-	seedAvailableChatModel(t, db, "user-1", "provider-long", "group-long", "model-long", "LongContext", "Long", "long-context", "llm", true, "secret-long")
-	setChatModelAutoMetadata(t, db, "model-default", "16K", 0, "")
-	setChatModelAutoMetadata(t, db, "model-free", "8K", 1, `["https://provider-free.example/v1"]`)
-	setChatModelAutoMetadata(t, db, "model-long", "128K", 0, "")
 	seedSelectedChatModel(t, db, "user-1", "model-default", false)
 
-	fixed, _, err := ensureConversation(
+	conversation, _, err := ensureConversation(
 		context.Background(), db, "conversation-default", "Default", nil, nil,
 		"user-1", "User", false, "", nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("create default conversation: %v", err)
 	}
-	if fixed.ChatModelMode == nil || *fixed.ChatModelMode != chatModelModeFixed ||
-		fixed.ChatModelID == nil || *fixed.ChatModelID != "model-default" ||
-		fixed.ChatModelVersion != 1 || len(fixed.ChatModelSnapshot) == 0 {
-		t.Fatalf("default binding=%#v", fixed)
+	if conversation.ChatModelMode == nil || *conversation.ChatModelMode != chatModelModeFixed ||
+		conversation.ChatModelID == nil || *conversation.ChatModelID != "model-default" ||
+		conversation.ChatModelVersion != 1 || len(conversation.ChatModelSnapshot) == 0 {
+		t.Fatalf("default binding=%#v", conversation)
 	}
-
-	auto, _, err := ensureConversation(
-		context.Background(), db, "conversation-auto", "Auto", nil, nil,
-		"user-1", "User", false, "", nil,
-		&initialChatModelSelection{Mode: chatModelModeAuto},
-	)
-	if err != nil {
-		t.Fatalf("create auto conversation: %v", err)
-	}
-	if auto.ChatModelMode == nil || *auto.ChatModelMode != chatModelModeAuto ||
-		auto.ChatModelID != nil || auto.ChatModelVersion != 1 {
-		t.Fatalf("auto binding=%#v", auto)
-	}
-	applyAuto := func(body map[string]any) (*chatModelRoute, map[string]any) {
-		t.Helper()
-		body["conversation_id"] = auto.ID
-		body["llm_config"] = map[string]any{"llm": map[string]any{"model": "legacy"}}
-		if err := applyConversationChatModelConfig(context.Background(), db, "user-1", body); err != nil {
-			t.Fatalf("apply auto route: %v", err)
-		}
-		route := chatModelRouteFromBody(body)
-		if route == nil {
-			t.Fatal("auto route metadata was not recorded")
-		}
-		return route, body["llm_config"].(map[string]any)["llm"].(map[string]any)
-	}
-
-	route, llm := applyAuto(map[string]any{
-		"query":          "把这句话翻译成英文",
-		"thinking_depth": "low",
-	})
-	if llm["model"] != "fast-free" || route.ModelID != "model-free" || route.Reason != "simple_task" {
-		t.Fatalf("simple auto route=%#v config=%#v, want verified free model", route, llm)
-	}
-	simpleRoute := *route
-
-	route, llm = applyAuto(map[string]any{
-		"query":          "分析这个跨文件并发死锁并给出修复方案",
-		"thinking_depth": "high",
-	})
-	if llm["model"] != "gpt-default" || route.ModelID != "model-default" || route.Reason != "complex_task" {
-		t.Fatalf("complex auto route=%#v config=%#v, want user default", route, llm)
-	}
-
-	route, llm = applyAuto(map[string]any{"query": strings.Repeat("上下文", 5000)})
-	if llm["model"] != "long-context" || route.ModelID != "model-long" || route.Reason != "long_context" {
-		t.Fatalf("long-context auto route=%#v config=%#v, want largest known window", route, llm)
-	}
-
-	route, llm = applyAuto(map[string]any{
-		"query":                    "现在改做复杂架构分析",
-		"thinking_depth":           "max",
-		chatModelRetryRouteBodyKey: &simpleRoute,
-	})
-	if llm["model"] != "fast-free" || route.ModelID != "model-free" || route.Reason != "retry_same_model" {
-		t.Fatalf("retry auto route=%#v config=%#v, want the original route", route, llm)
-	}
-
-	if err := db.Model(&orm.UserSelectedModel{}).
-		Where("user_id = ? AND model_type = ?", "user-1", "llm").
-		Delete(&orm.UserSelectedModel{}).Error; err != nil {
-		t.Fatalf("clear user default: %v", err)
-	}
-	route, llm = applyAuto(map[string]any{"query": "继续"})
-	if llm["model"] != "fast-free" || route.ModelID != "model-free" || route.Reason != "session_sticky" {
-		t.Fatalf("balanced auto route=%#v config=%#v, want previous available route", route, llm)
-	}
-
-	var stored orm.Conversation
-	if err := db.Where("id = ?", auto.ID).Take(&stored).Error; err != nil {
-		t.Fatalf("reload auto conversation: %v", err)
-	}
-	if strings.Contains(string(stored.ChatModelSnapshot), "secret-") {
-		t.Fatalf("auto snapshot leaked credentials: %s", stored.ChatModelSnapshot)
+	if strings.Contains(string(conversation.ChatModelSnapshot), "secret-default") {
+		t.Fatalf("snapshot leaked credentials: %s", conversation.ChatModelSnapshot)
 	}
 }
 
-func TestResolveAutoChatModelHonorsFreeEndpointScopeAndStableTieBreak(t *testing.T) {
-	models := []availableChatModel{
-		{ID: "free-wrong-scope", Source: "own", BaseURL: "https://wrong.example/v1", FreeAutoPriority: 1, FreeAutoBaseURLs: `["https://allowed.example/v1"]`},
-		{ID: "free-b", Source: "own", BaseURL: "https://b.example/v1", FreeAutoPriority: 2},
-		{ID: "free-a", Source: "own", BaseURL: "https://a.example/v1", FreeAutoPriority: 2},
-	}
-	selected, route := resolveAutoChatModel(
-		map[string]any{"thinking_depth": "low"},
-		models,
-		nil,
-		nil,
-	)
-	if selected == nil || route == nil || selected.ID != "free-a" || route.ModelID != "free-a" {
-		t.Fatalf("simple route selected=%#v route=%#v, want scoped stable free-a", selected, route)
-	}
-	if taskClass := classifyAutoChatTask(
-		map[string]any{
-			"thinking_depth": "low",
-			"files":          map[string][]string{"1": {"/uploads/report.pdf"}},
-		},
-		nil,
-		models,
-	); taskClass != autoChatTaskComplex {
-		t.Fatalf("attachment task class=%q, want complex", taskClass)
-	}
-	if taskClass := classifyAutoChatTask(
-		map[string]any{
-			"thinking_depth": "low",
-			"explicit_resource_bindings": map[string]any{
-				"workflow_refs": []string{"video/workflow"},
-			},
-		},
-		nil,
-		models,
-	); taskClass != autoChatTaskComplex {
-		t.Fatalf("workflow task class=%q, want complex", taskClass)
-	}
-}
-
-func TestClassifyAutoChatTaskDoesNotInferIntentFromPromptWording(t *testing.T) {
-	tests := []string{
-		"debug this race condition and refactor the architecture across files",
-		"调试这个跨文件并发死锁并重构架构",
-		"translate summarize rewrite extract format what is",
-		"翻译总结改写提取格式化润色是什么",
-		"```go\nfunc main() {}\n```",
-	}
-	for _, query := range tests {
-		if taskClass := classifyAutoChatTask(
-			map[string]any{"query": query, "thinking_depth": "medium"},
-			nil,
-			nil,
-		); taskClass != autoChatTaskBalanced {
-			t.Fatalf("query %q classified as %q, want language-independent balanced fallback", query, taskClass)
-		}
-	}
-}
-
-func TestResolveAutoChatModelRejectsKnownTooSmallLowCostModel(t *testing.T) {
-	defaultCapacity := "128K"
-	freeCapacity := "8K"
-	defaultModel := availableChatModel{
-		ID: "default", Source: "own", MaxInputTokens: &defaultCapacity,
-	}
-	models := []availableChatModel{
-		defaultModel,
-		{
-			ID: "free", Source: "own", MaxInputTokens: &freeCapacity,
-			FreeAutoPriority: 1,
-		},
-	}
-	selected, route := resolveAutoChatModel(
-		map[string]any{
-			"thinking_depth": "low",
-			"query":          strings.Repeat("context", 2_000),
-		},
-		models,
-		nil,
-		&defaultModel,
-	)
-	if selected == nil || route == nil || selected.ID != defaultModel.ID || route.Reason != "default_balanced" {
-		t.Fatalf("selected=%#v route=%#v, want the fitting default model", selected, route)
-	}
-}
-
-func TestApplyAutoChatModelUsesDatabaseWorkflowSignal(t *testing.T) {
+func TestChatConversationRejectsInitialAutoSelection(t *testing.T) {
 	database := newPromptTestDB(t)
 	db := database.DB
-	seedAvailableChatModel(t, db, "user-1", "provider-default", "group-default", "model-default", "Default", "Default", "default-model", "llm", true, "secret-default")
-	seedAvailableChatModel(t, db, "user-1", "provider-free", "group-free", "model-free", "Free", "Free", "free-model", "llm", true, "secret-free")
-	setChatModelAutoMetadata(t, db, "model-free", "128K", 1, "")
-	seedSelectedChatModel(t, db, "user-1", "model-default", false)
+	store.Init(db, nil, nil)
+	t.Cleanup(func() { store.Init(nil, nil, nil) })
+	seedAvailableChatModel(t, db, "user-1", "provider-a", "group-a", "model-a", "OpenAI", "A", "gpt-a", "llm", true, "secret-a")
+	seedSelectedChatModel(t, db, "user-1", "model-a", false)
 
-	conversation, _, err := ensureConversation(
-		context.Background(), db, "conversation-workflow-auto", "Workflow Auto", nil, nil,
-		"user-1", "User", false, "", nil,
-		&initialChatModelSelection{Mode: chatModelModeAuto},
-	)
-	if err != nil {
-		t.Fatalf("create auto conversation: %v", err)
+	for _, selection := range []string{`{"mode":"auto"}`, `{"mode":"auto","model_id":"model-a"}`} {
+		request := httptest.NewRequest(http.MethodPost, "/api/core/conversations:chat", strings.NewReader(
+			`{"conversation_id":"rejected-auto","input":[{"input_type":"text","text":"hello"}],"initial_model_selection":`+selection+`}`,
+		))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-User-Id", "user-1")
+		recorder := httptest.NewRecorder()
+		ChatConversations(recorder, request)
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("initial selection %s status=%d body=%s", selection, recorder.Code, recorder.Body.String())
+		}
 	}
-	now := time.Now().UTC()
-	if err := db.Create(&orm.WorkflowSession{
-		ID: "workflow-active-auto", ConversationID: conversation.ID, WorkflowID: "workflow-1",
-		Status: workflow.SessionStatusActive, CreateUserID: "user-1", CreatedAt: now, UpdatedAt: now,
+	if _, err := resolveInitialChatModelBinding(context.Background(), db, "user-1", &initialChatModelSelection{Mode: "auto"}); !errors.Is(err, errInvalidChatModelSelection) {
+		t.Fatalf("resolve auto selection error=%v, want invalid selection", err)
+	}
+	var count int64
+	if err := db.Model(&orm.Conversation{}).Where("id = ?", "rejected-auto").Count(&count).Error; err != nil || count != 0 {
+		t.Fatalf("invalid selection created a conversation: count=%d err=%v", count, err)
+	}
+}
+
+func TestLegacyAutoUsesSavedModelWithoutUpdatingConversation(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		snapshot      json.RawMessage
+		deleteModel   bool
+		wantModelID   string
+		wantAvailable bool
+	}{
+		{name: "available snapshot", snapshot: json.RawMessage(`{"model_id":"model-saved","model_name":"previous-name"}`), wantModelID: "model-saved", wantAvailable: true},
+		{name: "deleted snapshot model", snapshot: json.RawMessage(`{"model_id":"model-saved","model_name":"previous-name"}`), deleteModel: true, wantModelID: "model-saved"},
+		{name: "no snapshot"},
+		{name: "invalid snapshot", snapshot: json.RawMessage(`{`)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			database := newPromptTestDB(t)
+			db := database.DB
+			seedAvailableChatModel(t, db, "user-1", "provider-default", "group-default", "model-default", "Default", "Default", "default-chat", "llm", true, "secret-default")
+			seedAvailableChatModel(t, db, "user-1", "provider-saved", "group-saved", "model-saved", "Saved", "Saved", "saved-chat", "llm", true, "secret-saved")
+			seedSelectedChatModel(t, db, "user-1", "model-default", false)
+			if test.deleteModel {
+				if err := db.Model(&orm.UserModelProviderGroupModel{}).Where("id = ?", "model-saved").Update("deleted_at", time.Now().UTC()).Error; err != nil {
+					t.Fatalf("delete saved model: %v", err)
+				}
+			}
+			mode := legacyChatModelModeAuto
+			conversation := orm.Conversation{
+				ID: "legacy-auto", ChatModelMode: &mode, ChatModelSnapshot: test.snapshot, ChatModelVersion: 4,
+				BaseModel: orm.BaseModel{CreateUserID: "user-1", CreateUserName: "User", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()},
+			}
+			if err := db.Create(&conversation).Error; err != nil {
+				t.Fatalf("create legacy conversation: %v", err)
+			}
+			response, err := buildChatModelsResponse(context.Background(), db, "user-1", &conversation)
+			if err != nil {
+				t.Fatalf("build selection response: %v", err)
+			}
+			selection := response.Selection
+			if selection.Mode != chatModelModeFixed || selection.ModelID != test.wantModelID || selection.Version != 4 ||
+				(selection.Availability == chatModelAvailabilityAvailable) != test.wantAvailable {
+				t.Fatalf("resolved selection=%#v", selection)
+			}
+			for _, body := range []map[string]any{
+				{"conversation_id": conversation.ID, "query": "hello", "thinking_depth": "low"},
+				{"conversation_id": conversation.ID, "query": strings.Repeat("context", 10000), "thinking_depth": "high", "context_usage_preview": true},
+			} {
+				err := applyChatRuntimeConfigs(context.Background(), db, "user-1", body)
+				if !test.wantAvailable {
+					if !errors.Is(err, errChatModelUnavailable) {
+						t.Fatalf("unavailable saved model error=%v, want no default fallback", err)
+					}
+					continue
+				}
+				if err != nil {
+					t.Fatalf("apply saved model: %v", err)
+				}
+				llm := body["llm_config"].(map[string]any)["llm"].(map[string]any)
+				route := chatModelRouteFromBody(body)
+				if llm["model"] != "saved-chat" || route == nil || route.Mode != chatModelModeFixed || route.ModelID != "model-saved" {
+					t.Fatalf("runtime config=%#v route=%#v, want fixed saved model", llm, route)
+				}
+			}
+			var stored orm.Conversation
+			if err := db.Where("id = ?", conversation.ID).Take(&stored).Error; err != nil {
+				t.Fatalf("reload conversation: %v", err)
+			}
+			if stored.ChatModelMode == nil || *stored.ChatModelMode != legacyChatModelModeAuto || stored.ChatModelID != nil || stored.ChatModelVersion != 4 ||
+				!bytes.Equal(stored.ChatModelSnapshot, test.snapshot) || !stored.UpdatedAt.Equal(conversation.UpdatedAt) {
+				t.Fatalf("resolving saved selection changed conversation state: %#v", stored)
+			}
+		})
+	}
+}
+
+func TestLegacyAutoRetryKeepsOriginalModelUntilManualSwitch(t *testing.T) {
+	database := newPromptTestDB(t)
+	db := database.DB
+	seedAvailableChatModel(t, db, "user-1", "provider-old", "group-old", "model-old", "Old", "Old", "old-chat", "llm", true, "secret-old")
+	seedAvailableChatModel(t, db, "user-1", "provider-saved", "group-saved", "model-saved", "Saved", "Saved", "saved-chat", "llm", true, "secret-saved")
+	mode := legacyChatModelModeAuto
+	conversation := orm.Conversation{
+		ID: "legacy-auto-retry", ChatModelMode: &mode, ChatModelSnapshot: json.RawMessage(`{"model_id":"model-saved"}`), ChatModelVersion: 4,
+		BaseModel: orm.BaseModel{CreateUserID: "user-1", CreateUserName: "User", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()},
+	}
+	if err := db.Create(&conversation).Error; err != nil {
+		t.Fatalf("create legacy conversation: %v", err)
+	}
+	retryRoute := chatModelRouteFromHistoryExt(json.RawMessage(`{"model_route":{"mode":"auto","strategy":"structured_policy_v1","model_id":"model-old"}}`))
+	body := map[string]any{"conversation_id": conversation.ID, chatModelRetryRouteBodyKey: retryRoute}
+	if err := applyConversationChatModelConfig(context.Background(), db, "user-1", body); err != nil {
+		t.Fatalf("apply legacy retry: %v", err)
+	}
+	if route := chatModelRouteFromBody(body); route == nil || route.Mode != chatModelModeFixed || route.ModelID != "model-old" || route.Reason != "retry_same_model" {
+		t.Fatalf("legacy retry changed model: %#v", route)
+	}
+	if err := db.Model(&orm.UserModelProviderGroupModel{}).Where("id = ?", "model-old").Update("deleted_at", time.Now().UTC()).Error; err != nil {
+		t.Fatalf("delete retry model: %v", err)
+	}
+	if err := applyConversationChatModelConfig(context.Background(), db, "user-1", body); !errors.Is(err, errChatModelUnavailable) {
+		t.Fatalf("missing retry model error=%v, want no saved model fallback", err)
+	}
+	if err := db.Model(&orm.Conversation{}).Where("id = ?", conversation.ID).Updates(map[string]any{
+		"chat_model_mode": chatModelModeFixed, "chat_model_id": "model-saved",
 	}).Error; err != nil {
-		t.Fatalf("create active workflow: %v", err)
-	}
-
-	body := map[string]any{
-		"conversation_id": conversation.ID,
-		"query":           "continue",
-		"thinking_depth":  "low",
+		t.Fatalf("save manual model selection: %v", err)
 	}
 	if err := applyConversationChatModelConfig(context.Background(), db, "user-1", body); err != nil {
-		t.Fatalf("apply auto route: %v", err)
+		t.Fatalf("apply manually selected recovery model: %v", err)
 	}
-	route := chatModelRouteFromBody(body)
-	if route == nil || route.ModelID != "model-default" || route.TaskClass != autoChatTaskComplex || route.Reason != "complex_task" {
-		t.Fatalf("workflow auto route=%#v, want DB workflow to select default complex route", route)
-	}
-	if _, leaked := body[chatModelWorkflowRouteBodyKey]; leaked {
-		t.Fatalf("internal workflow route signal leaked into request body: %#v", body)
+	if route := chatModelRouteFromBody(body); route == nil || route.Mode != chatModelModeFixed || route.ModelID != "model-saved" {
+		t.Fatalf("manual selection was overridden by old retry route: %#v", route)
 	}
 }
 
@@ -587,12 +507,6 @@ func TestChatConversationPersistsUnavailableInitialSelection(t *testing.T) {
 			wantModelID:        "missing-model",
 			seedRecoveryBefore: true,
 		},
-		{
-			name:           "auto without usable models",
-			conversationID: "new-invalid-auto",
-			selection:      `{"mode":"auto"}`,
-			wantMode:       chatModelModeAuto,
-		},
 	}
 
 	for _, test := range tests {
@@ -643,11 +557,7 @@ func TestChatConversationPersistsUnavailableInitialSelection(t *testing.T) {
 			if conversation.ChatModelMode == nil || *conversation.ChatModelMode != test.wantMode || conversation.ChatModelVersion != 1 {
 				t.Fatalf("persisted unavailable binding=%#v", conversation)
 			}
-			if test.wantModelID == "" {
-				if conversation.ChatModelID != nil {
-					t.Fatalf("auto binding unexpectedly stored model id: %#v", conversation.ChatModelID)
-				}
-			} else if conversation.ChatModelID == nil || *conversation.ChatModelID != test.wantModelID {
+			if conversation.ChatModelID == nil || *conversation.ChatModelID != test.wantModelID {
 				t.Fatalf("fixed binding model id=%#v, want %q", conversation.ChatModelID, test.wantModelID)
 			}
 			if len(conversation.ChatModelSnapshot) != 0 {
@@ -773,6 +683,9 @@ func TestConversationModelHandlersPersistVersionAndBlockActiveRuns(t *testing.T)
 	if err := json.Unmarshal(listRecorder.Body.Bytes(), &listPayload); err != nil {
 		t.Fatalf("decode list response: %v", err)
 	}
+	if strings.Contains(listRecorder.Body.String(), `"auto_available"`) || listPayload.Data.Selection.Mode != chatModelModeFixed {
+		t.Fatalf("list response exposed auto selection: %s", listRecorder.Body.String())
+	}
 	if listPayload.Data.SwitchAllowed || listPayload.Data.SwitchBlockedReason != "generating" {
 		t.Fatalf("generating switch state=%#v", listPayload.Data)
 	}
@@ -830,7 +743,11 @@ func TestConversationModelHandlersPersistVersionAndBlockActiveRuns(t *testing.T)
 		t.Fatalf("stored binding=%#v", stored)
 	}
 
-	stale := patch(`{"mode":"auto","expected_version":1}`)
+	rejectedAuto := patch(`{"mode":"auto","expected_version":2}`)
+	if rejectedAuto.Code != http.StatusBadRequest {
+		t.Fatalf("auto patch status=%d body=%s", rejectedAuto.Code, rejectedAuto.Body.String())
+	}
+	stale := patch(`{"mode":"fixed","model_id":"model-a","expected_version":1}`)
 	if stale.Code != http.StatusConflict {
 		t.Fatalf("stale patch status=%d body=%s", stale.Code, stale.Body.String())
 	}
@@ -841,7 +758,7 @@ func TestConversationModelHandlersPersistVersionAndBlockActiveRuns(t *testing.T)
 	}).Error; err != nil {
 		t.Fatalf("create active workflow: %v", err)
 	}
-	workflowBusy := patch(`{"mode":"auto","expected_version":2}`)
+	workflowBusy := patch(`{"mode":"fixed","model_id":"model-a","expected_version":2}`)
 	if workflowBusy.Code != http.StatusConflict {
 		t.Fatalf("workflow patch status=%d body=%s", workflowBusy.Code, workflowBusy.Body.String())
 	}
@@ -856,7 +773,7 @@ func TestConversationModelHandlersPersistVersionAndBlockActiveRuns(t *testing.T)
 	}).Error; err != nil {
 		t.Fatalf("create active background task: %v", err)
 	}
-	backgroundBusy := patch(`{"mode":"auto","expected_version":2}`)
+	backgroundBusy := patch(`{"mode":"fixed","model_id":"model-a","expected_version":2}`)
 	if backgroundBusy.Code != http.StatusConflict {
 		t.Fatalf("background patch status=%d body=%s", backgroundBusy.Code, backgroundBusy.Body.String())
 	}

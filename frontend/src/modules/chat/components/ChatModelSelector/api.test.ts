@@ -14,7 +14,7 @@ describe("chat model API", () => {
 
   it.each([false, true])("loads catalogs with envelope=%s", async (envelope) => {
     const catalog = {
-      selection, providers: [], auto_available: true, switch_allowed: true,
+      selection, providers: [], switch_allowed: true,
     };
     request.mockResolvedValue({ data: envelope ? { data: catalog } : catalog });
     const signal = new AbortController().signal;
@@ -56,7 +56,7 @@ describe("chat model API", () => {
     const conflict = { response: { status: 409 } };
     request.mockRejectedValueOnce(conflict);
     await expect(
-      updateConversationChatModel("chat-1", { mode: "auto" }, 2),
+      updateConversationChatModel("chat-1", { mode: "fixed", model_id: "model-1" }, 2),
     ).rejects.toBe(conflict);
     expect(request).toHaveBeenCalledTimes(1);
   });

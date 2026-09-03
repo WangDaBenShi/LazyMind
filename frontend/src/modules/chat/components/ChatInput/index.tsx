@@ -1079,7 +1079,8 @@ const ChatInput = forwardRef<ChatInputImperativeProps, ChatInputProps>(
           )
         : undefined;
       const effectiveInitialModelSelection =
-        storedInitialModelSelection ?? initialModelSelection;
+        storedInitialModelSelection ??
+        toChatModelSelectionRequest(initialModelSelection);
       setNewMessage(false);
       const sendParams: SendMessageParams = {
         text: normalizedText,

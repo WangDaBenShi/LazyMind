@@ -459,7 +459,7 @@ type chatModelsQueryParams struct {
 }
 
 type chatModelSelectionOpenAPI struct {
-	Mode         string `json:"mode" enum:"fixed,auto"`
+	Mode         string `json:"mode" enum:"fixed"`
 	ModelID      string `json:"model_id,omitempty"`
 	ProviderID   string `json:"provider_id,omitempty"`
 	ProviderName string `json:"provider_name,omitempty"`
@@ -498,12 +498,11 @@ type chatModelsOpenAPIResponse struct {
 	Providers           []chatModelProviderOpenAPIItem `json:"providers"`
 	SwitchAllowed       bool                           `json:"switch_allowed"`
 	SwitchBlockedReason string                         `json:"switch_blocked_reason,omitempty" enum:"generating,workflow_running,background_task_running"`
-	AutoAvailable       bool                           `json:"auto_available"`
 }
 
 type patchConversationModelOpenAPIRequest struct {
-	Mode            string `json:"mode" enum:"fixed,auto"`
-	ModelID         string `json:"model_id,omitempty" desc:"Required only when mode is fixed."`
+	Mode            string `json:"mode" enum:"fixed"`
+	ModelID         string `json:"model_id" desc:"ID of the configured chat model selected for this conversation."`
 	ExpectedVersion int64  `json:"expected_version"`
 }
 
@@ -542,7 +541,7 @@ type sidechatConversationOpenAPI struct {
 	SourceContext        *sidechatPublicSourceContextOpenAPI `json:"source_context,omitempty"`
 	ParentDisplayName    string                              `json:"parent_display_name,omitempty"`
 	SearchConfig         map[string]any                      `json:"search_config,omitempty"`
-	ChatModelMode        *string                             `json:"chat_model_mode,omitempty" enum:"fixed,auto"`
+	ChatModelMode        *string                             `json:"chat_model_mode,omitempty" enum:"fixed"`
 	ChatModelID          *string                             `json:"chat_model_id,omitempty"`
 	ChatModelVersion     int64                               `json:"chat_model_version"`
 	ThinkingDepth        string                              `json:"thinking_depth,omitempty" enum:"low,medium,high,max"`

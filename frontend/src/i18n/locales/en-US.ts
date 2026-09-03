@@ -1840,8 +1840,6 @@ const enUS = {
     modelSelectorSearchLabel: "Search chat models",
     modelSelectorSearchPlaceholder: "Search models",
     modelSelectorSearchEmpty: "No matching models",
-    modelSelectorAutoDescription:
-      "Choose a chat model using thinking depth, context length, attachments, workflows, and availability",
     modelRouteAutoLabel: "Auto · {{model}}",
     modelRouteFixedLabel: "{{model}}",
     modelRouteReason: {

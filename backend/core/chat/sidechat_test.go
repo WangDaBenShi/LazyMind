@@ -735,22 +735,54 @@ func TestSidechatNestingAuthSettingsAndFamilyLifecycle(t *testing.T) {
 	}
 }
 
-func TestSidechatPreservesExplicitAutoModelBinding(t *testing.T) {
-	db := newSidechatTestDB(t)
-	parent := sidechatTestConversation(t, db, "parent-auto", "user-1", "Auto parent")
-	mode := chatModelModeAuto
-	if err := db.Model(&orm.Conversation{}).Where("id = ?", parent.ID).Updates(map[string]any{
-		"chat_model_mode": mode, "chat_model_id": nil, "chat_model_version": int64(4),
-	}).Error; err != nil {
-		t.Fatalf("configure auto parent: %v", err)
+func TestSidechatInheritsLegacyAutoAsFixedBinding(t *testing.T) {
+	for _, modelID := range []string{"model-saved", ""} {
+		t.Run("saved-model-"+modelID, func(t *testing.T) {
+			db := newSidechatTestDB(t)
+			parent := sidechatTestConversation(t, db, "parent-auto", "user-1", "Auto parent")
+			var snapshot json.RawMessage
+			if modelID != "" {
+				snapshot = json.RawMessage(`{"model_id":"model-saved","model_name":"Saved"}`)
+			}
+			if err := db.Model(&orm.Conversation{}).Where("id = ?", parent.ID).Updates(map[string]any{
+				"chat_model_mode": legacyChatModelModeAuto, "chat_model_id": nil,
+				"chat_model_snapshot": snapshot, "chat_model_version": int64(4),
+			}).Error; err != nil {
+				t.Fatalf("configure legacy auto parent: %v", err)
+			}
+			sidechatTestHistory(t, db, "parent-auto-history", parent.ID, 1, "source", "answer", "completed")
+			child, _, err := createSidechatConversation(context.Background(), db, "user-1", "user-1", parent.ID, createSidechatRequest{})
+			if err != nil {
+				t.Fatalf("create sidechat: %v", err)
+			}
+			if child.ChatModelMode == nil || *child.ChatModelMode != chatModelModeFixed || child.ChatModelVersion != 4 || string(child.ChatModelSnapshot) != string(snapshot) {
+				t.Fatalf("legacy binding not inherited as fixed: %#v", child)
+			}
+			if modelID == "" {
+				if child.ChatModelID != nil {
+					t.Fatalf("missing parent snapshot must require manual selection: %#v", child.ChatModelID)
+				}
+			} else if child.ChatModelID == nil || *child.ChatModelID != modelID {
+				t.Fatalf("saved parent model not inherited: %#v", child.ChatModelID)
+			}
+		})
 	}
-	sidechatTestHistory(t, db, "parent-auto-history", parent.ID, 1, "source", "answer", "completed")
-	child, _, err := createSidechatConversation(context.Background(), db, "user-1", "user-1", parent.ID, createSidechatRequest{})
-	if err != nil {
-		t.Fatalf("create auto sidechat: %v", err)
+}
+
+func TestSidechatPayloadReadsLegacyAutoAsFixed(t *testing.T) {
+	mode := legacyChatModelModeAuto
+	conversation := orm.Conversation{
+		ChatModelMode: &mode, ChatModelSnapshot: json.RawMessage(`{"model_id":"model-saved"}`), ChatModelVersion: 4,
 	}
-	if child.ChatModelMode == nil || *child.ChatModelMode != chatModelModeAuto || child.ChatModelID != nil || child.ChatModelVersion != 4 {
-		t.Fatalf("auto binding was not preserved: %#v", child)
+	payload := sidechatConversationPayload(conversation, "Parent")
+	if gotMode, _ := payload["chat_model_mode"].(*string); gotMode == nil || *gotMode != chatModelModeFixed {
+		t.Fatalf("legacy sidechat mode=%#v, want fixed", payload["chat_model_mode"])
+	}
+	if modelID, _ := payload["chat_model_id"].(*string); modelID == nil || *modelID != "model-saved" {
+		t.Fatalf("legacy sidechat model=%#v, want saved snapshot", payload["chat_model_id"])
+	}
+	if *conversation.ChatModelMode != legacyChatModelModeAuto || conversation.ChatModelID != nil {
+		t.Fatalf("public payload mutated stored binding: %#v", conversation)
 	}
 }
 

@@ -437,11 +437,11 @@ const ChatLayout: FC<IChatLayoutProps> = (props) => {
       }
     }
     const initialModelSelection = !sessionId
-      ? pendingInitialModelSelectionRef.current ??
-        toChatModelSelectionRequest(
-          useModelSelectionStore.getState().selections[
-            NEW_CHAT_MODEL_SELECTION_KEY
-          ],
+      ? toChatModelSelectionRequest(
+          pendingInitialModelSelectionRef.current ??
+            useModelSelectionStore.getState().selections[
+              NEW_CHAT_MODEL_SELECTION_KEY
+            ],
         )
       : undefined;
     pendingInitialModelSelectionRef.current = null;

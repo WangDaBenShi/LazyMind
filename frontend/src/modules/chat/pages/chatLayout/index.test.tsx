@@ -364,6 +364,38 @@ describe("ChatLayout conversation loading", () => {
     expect(historicalPayload).not.toHaveProperty("initial_model_selection");
   });
 
+  it.each([undefined, "model-1"])("does not submit a legacy pending Auto request with model_id=%s", async (modelId) => {
+    mocks.pendingMessage = {
+      text: "hello",
+      initial_model_selection: { mode: "auto", model_id: modelId },
+    };
+
+    render(
+      <ChatLayout
+        setIsChatContent={vi.fn()}
+        initchatConfig={{}}
+        setChatConfigFn={vi.fn()}
+        canChat
+      />,
+    );
+    await waitFor(() => {
+      expect(mocks.sendMessage).toHaveBeenCalledWith(mocks.pendingMessage);
+    });
+
+    await act(async () => {
+      await mocks.latestChatContainerProps.onOpenSSE(
+        [],
+        "chat_action_next",
+        {},
+      );
+    });
+
+    const payload = JSON.parse(mocks.sseConstructor.mock.calls[0][1].payload);
+    expect(payload.initial_model_selection).toEqual(
+      modelId ? { mode: "fixed", model_id: modelId } : undefined,
+    );
+  });
+
   it("shows the parent source and return action for a child conversation", async () => {
     mocks.getConversationDetail.mockResolvedValue({
       data: {

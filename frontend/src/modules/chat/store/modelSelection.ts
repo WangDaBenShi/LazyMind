@@ -78,10 +78,9 @@ export const useModelSelectionStore = create<ModelSelectionStore>()((set) => ({
 }));
 
 export function toChatModelSelectionRequest(
-  selection?: ChatModelSelection,
+  selection?: Pick<ChatModelSelection, "mode" | "model_id">,
 ): ChatModelSelectionRequest | undefined {
   if (!selection) return undefined;
-  if (selection.mode === "auto") return { mode: "auto" };
   return selection.model_id
     ? { mode: "fixed", model_id: selection.model_id }
     : undefined;
