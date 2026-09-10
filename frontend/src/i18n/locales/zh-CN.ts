@@ -6833,6 +6833,7 @@ const zhCN = {
     newWorkflowModeAiTitle: "描述需求",
     newWorkflowModeAiDesc: "用自然语言描述目标，AI 帮你生成",
     newWorkflowModeSkillTitle: "从技能转化",
+    newWorkflowSkillLoadFailed: "技能列表加载失败，请重试。",
     newWorkflowModeSkillDesc: "选择已有技能，AI 将其转化为可执行工作流",
     newWorkflowModeBlankTitle: "空白创建",
     newWorkflowModeBlankDesc: "从空白开始，手动搭建工作流",

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Modal, Input, Button, Select, Tooltip, message } from 'antd';
 import { FileTextOutlined, ThunderboltOutlined, BulbOutlined, QuestionCircleOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
@@ -9,6 +9,7 @@ import { createEmptyWorkflowModel } from '../StateGraphEditor/core/workflowModel
 import './index.scss';
 
 const WORKFLOW_ID_REGEX = /^[a-zA-Z][a-zA-Z0-9-_]*$/;
+const SKILL_PAGE_SIZE = 20;
 
 type CreateMode = 'blank' | 'ai' | 'skill';
 
@@ -49,6 +50,9 @@ export default function NewWorkflowModal({ open, onCancel, onCreated }: NewWorkf
   const [skillName, setSkillName] = useState('');
   const [skillOptions, setSkillOptions] = useState<{ label: string; value: string }[]>([]);
   const [skillLoading, setSkillLoading] = useState(false);
+  const [skillLoadFailed, setSkillLoadFailed] = useState(false);
+  const skillRequestId = useRef(0);
+  const skillPagination = useRef({ keyword: '', nextPage: 1, hasMore: true, loading: false });
 
   // fields shown after skill is selected (or always for ai/blank)
   const [workflowId, setWorkflowId] = useState('');
@@ -91,17 +95,44 @@ export default function NewWorkflowModal({ open, onCancel, onCreated }: NewWorkf
     onCancel();
   };
 
-  const handleSkillSearch = async (keyword: string) => {
+  const loadSkillPage = useCallback(async (keyword?: string) => {
+    const resetSearch = keyword !== undefined;
+    if (!resetSearch && (skillPagination.current.loading || !skillPagination.current.hasMore)) return;
+
+    const requestId = ++skillRequestId.current;
+    const pagination = resetSearch
+      ? { keyword, nextPage: 1, hasMore: true, loading: true }
+      : { ...skillPagination.current, loading: true };
+    skillPagination.current = pagination;
     setSkillLoading(true);
+    setSkillLoadFailed(false);
+    if (resetSearch) setSkillOptions([]);
     try {
-      const result = await listSkillAssetsPage({ keyword, page: 1, pageSize: 20, excludeBuiltinTemplates: true });
-      setSkillOptions(result.records.map((r) => ({ label: r.name, value: r.id })));
+      const result = await listSkillAssetsPage({
+        keyword: pagination.keyword, page: pagination.nextPage, pageSize: SKILL_PAGE_SIZE,
+      });
+      if (requestId !== skillRequestId.current) return;
+      setSkillOptions((previous) => {
+        const options = new Map(previous.map((option) => [option.value, option]));
+        result.records.forEach((record) => options.set(record.id, { label: record.name, value: record.id }));
+        return [...options.values()];
+      });
+      pagination.hasMore = result.records.length > 0 && pagination.nextPage * SKILL_PAGE_SIZE < result.total;
+      pagination.nextPage += 1;
     } catch {
-      // ignore
+      if (requestId === skillRequestId.current) setSkillLoadFailed(true);
     } finally {
-      setSkillLoading(false);
+      if (requestId === skillRequestId.current) {
+        pagination.loading = false;
+        setSkillLoading(false);
+      }
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    if (open && mode === 'skill') void loadSkillPage('');
+    return () => { skillRequestId.current += 1; };
+  }, [open, mode, loadSkillPage]);
 
   const handleSkillChange = (val: string, option: { label: string; value: string } | { label: string; value: string }[]) => {
     setSkillId(val);
@@ -170,6 +201,16 @@ export default function NewWorkflowModal({ open, onCancel, onCreated }: NewWorkf
   };
 
   const canCreate = showFields && workflowId.trim() !== '' && !idError;
+  const skillListStatus = (skillLoading || skillLoadFailed) && (
+    <div className="npm-skill-list-status" role={skillLoadFailed ? 'alert' : 'status'}>
+      {skillLoadFailed ? t('selfEvolutionRun.newWorkflowSkillLoadFailed') : t('common.loading')}
+      {skillLoadFailed && (
+        <Button type="link" onMouseDown={(event) => event.preventDefault()} onClick={() => void loadSkillPage()}>
+          {t('common.retry')}
+        </Button>
+      )}
+    </div>
+  );
 
   return (
     <Modal
@@ -212,15 +253,26 @@ export default function NewWorkflowModal({ open, onCancel, onCreated }: NewWorkf
           <div className="npm-expand">
             <Select
               showSearch
+              aria-label={t('selfEvolutionRun.newWorkflowSkillSearchPlaceholder')}
               placeholder={t('selfEvolutionRun.newWorkflowSkillSearchPlaceholder')}
               value={skillId}
               onChange={handleSkillChange}
-              onSearch={handleSkillSearch}
+              onSearch={loadSkillPage}
+              onPopupScroll={(event) => {
+                const { scrollTop, scrollHeight, clientHeight } = event.currentTarget;
+                if (!skillLoadFailed && scrollHeight - scrollTop <= clientHeight + 24) void loadSkillPage();
+              }}
               loading={skillLoading}
               options={skillOptions}
               filterOption={false}
+              notFoundContent={skillListStatus || t('common.noData')}
+              popupRender={(menu) => (
+                <>
+                  {menu}
+                  {skillOptions.length > 0 && skillListStatus}
+                </>
+              )}
               style={{ width: '100%' }}
-              onFocus={() => skillOptions.length === 0 && void handleSkillSearch('')}
             />
           </div>
         )}

@@ -7076,6 +7076,7 @@ const enUS = {
     newWorkflowModeAiTitle: "Describe requirements",
     newWorkflowModeAiDesc: "Describe your goal in natural language, AI will generate it",
     newWorkflowModeSkillTitle: "Convert from skill",
+    newWorkflowSkillLoadFailed: "Unable to load skills. Please try again.",
     newWorkflowModeSkillDesc: "Select an existing skill, AI will convert it to an executable workflow",
     newWorkflowModeBlankTitle: "Start from scratch",
     newWorkflowModeBlankDesc: "Build the workflow manually from a blank canvas",
