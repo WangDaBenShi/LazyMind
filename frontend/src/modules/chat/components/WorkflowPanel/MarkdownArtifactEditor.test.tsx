@@ -6,6 +6,8 @@ const mdxMocks = vi.hoisted(() => ({
   imagePreviewHandler: undefined as ((url: string) => Promise<string>) | undefined,
 }));
 
+vi.mock('./writerEmptyHeadingPlugin', () => ({ writerEmptyHeadingPlugin: () => ({}) }));
+
 vi.mock('@mdxeditor/editor', async () => {
   const React = await import('react');
   const { flushSync } = await import('react-dom');
@@ -198,6 +200,10 @@ const rangeClientRectsDescriptor = Object.getOwnPropertyDescriptor(
 );
 
 beforeEach(() => {
+  vi.stubGlobal('ResizeObserver', class {
+    observe() {}
+    disconnect() {}
+  });
   mdxMocks.imagePreviewHandler = undefined;
   Object.defineProperty(window.Range.prototype, 'getBoundingClientRect', {
     configurable: true,
@@ -282,6 +288,7 @@ function BackendUpdateHarness() {
 }
 
 afterEach(() => {
+  vi.unstubAllGlobals();
   window.getSelection()?.removeAllRanges();
   vi.restoreAllMocks();
   if (rangeBoundingRectDescriptor) {
@@ -301,6 +308,56 @@ afterEach(() => {
 });
 
 describe('MarkdownArtifactEditor MDX compatibility', () => {
+  it('provides a labeled numbering button only for editable unordered headings', async () => {
+    const props = {
+      markdown: '<a id="block-sec-1"></a>\n## Heading',
+      sourceRevision: 1,
+      onSave: async () => 1,
+    };
+    const unordered = {
+      ordered_style: 'hierarchical' as const,
+      entries: { 'sec-1': { mode: 'unordered' as const, label: '' } },
+    };
+    const { rerender } = render(<MarkdownArtifactEditor {...props} numbering={unordered} />);
+    const heading = document.createElement('h2');
+    heading.textContent = 'Heading';
+    screen.getByTestId('markdown-editable').append(heading);
+
+    const control = await screen.findByRole('button', { name: 'chat.writerIR.numberingSettings' });
+    expect(screen.getByTestId('markdown-editable')).not.toContainElement(control);
+    expect(control).toHaveAttribute('aria-haspopup', 'dialog');
+    expect(control).toHaveAttribute('data-writer-numbering-control', 'block-sec-1');
+    expect(heading.textContent).toBe('Heading');
+
+    rerender(<MarkdownArtifactEditor {...props} numbering={unordered} readOnly />);
+    await waitFor(() => expect(control).not.toBeInTheDocument());
+    rerender(<MarkdownArtifactEditor {...props} numbering={unordered} />);
+    await screen.findByRole('button', { name: 'chat.writerIR.numberingSettings' });
+    rerender(<MarkdownArtifactEditor {...props} numbering={{
+      ...unordered,
+      entries: { 'sec-1': { mode: 'ordered', label: '1' } },
+    }} />);
+    await waitFor(() => expect(screen.queryByRole('button', {
+      name: 'chat.writerIR.numberingSettings',
+    })).not.toBeInTheDocument());
+  });
+
+  it('shows the level on empty headings and removes the hint when text is entered', async () => {
+    render(<MarkdownArtifactEditor markdown='# Title' sourceRevision={1} onSave={async () => 1} />);
+    const editable = screen.getByTestId('markdown-editable');
+    const heading = document.createElement('h2');
+    heading.innerHTML = '<br><button data-writer-outline-control="sec-1" contenteditable="false">Instructions</button>';
+    editable.append(heading);
+
+    await waitFor(() => expect(heading).toHaveAttribute('data-writer-heading-placeholder', 'chat.writerMarkdown.headingPlaceholders.h2'));
+    const text = document.createTextNode(' ');
+    heading.prepend(text);
+    text.data = 'New heading';
+    await waitFor(() => expect(heading).not.toHaveAttribute('data-writer-heading-placeholder'));
+    text.data = '';
+    await waitFor(() => expect(heading).toHaveAttribute('data-writer-heading-placeholder', 'chat.writerMarkdown.headingPlaceholders.h2'));
+  });
+
   it('renders PDF text without passing HTML page comments to the MDX parser', () => {
     const { container } = render(
       <MarkdownArtifactEditor

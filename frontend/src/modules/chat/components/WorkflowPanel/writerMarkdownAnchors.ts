@@ -5,6 +5,7 @@ const HEADING_NUMBERING_CONFIG_LINE_RE = /^\s*<!--\s*heading-numbering:[^\r\n]*-
 const OUTLINE_INSTRUCTION_LINE_RE = /^\s*<!--\s*writer:outline\s+(\{.*\})\s*-->\s*$/;
 const SOURCE_PAGE_MARKER_RE = /^([ \t]*)<!--[ \t]*第[ \t]*(\d+)[ \t]*页[ \t]*-->[ \t]*$/i;
 const EDITOR_PAGE_MARKER_RE = /^([ \t]*)<a\s+id=(["'])writer-page-marker-(\d+)\2\s*(?:\/>|>\s*<\/a>)[ \t]*$/i;
+const HEADING_LINE_RE = /^(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+[ \t]*)?$/;
 
 export interface WriterMarkdownOutlineInstruction {
   node_id: string;
@@ -196,7 +197,7 @@ function writerMarkdownTargetBindings(markdown: string): WriterMarkdownTargetBin
     }
     if (!trimmed) return;
 
-    const heading = trimmed.match(/^(#{1,6})[ \t]+(.+?)(?:[ \t]+#+[ \t]*)?$/);
+    const heading = trimmed.match(HEADING_LINE_RE);
     if (heading) {
       bindings.push({
         lineIndex,
@@ -205,7 +206,7 @@ function writerMarkdownTargetBindings(markdown: string): WriterMarkdownTargetBin
         anchorAttributes: pendingAnchor?.attributes,
         type: 'heading',
         level: heading[1].length,
-        signature: `${heading[1].length}:${heading[2].trim()}`,
+        signature: `${heading[1].length}:${heading[2]?.trim() ?? ''}`,
       });
       currentHeadingIndex = bindings.length - 1;
     } else {
@@ -578,9 +579,9 @@ export function collectWriterMarkdownOutline(markdown: string): WriterMarkdownOu
     }
     if (!trimmed) continue;
 
-    const heading = trimmed.match(/^(#{1,6})[ \t]+(.+?)(?:[ \t]+#+[ \t]*)?$/);
+    const heading = trimmed.match(HEADING_LINE_RE);
     if (heading) {
-      const label = heading[2].trim();
+      const label = heading[2]?.trim() || `H${heading[1].length}`;
       title ??= label;
       if (pendingAnchorId) {
         items.push({
@@ -634,11 +635,11 @@ export function collectWriterMarkdownReferenceTargets(
     }
     if (!trimmed) continue;
 
-    const heading = trimmed.match(/^(#{1,6})[ \t]+(.+?)(?:[ \t]+#+[ \t]*)?$/);
+    const heading = trimmed.match(HEADING_LINE_RE);
     if (heading && pendingAnchorId) {
       targets.push({
         anchorId: pendingAnchorId,
-        label: heading[2].trim(),
+        label: heading[2]?.trim() || `H${heading[1].length}`,
         type: 'heading',
       });
     } else if (pendingAnchorId) {

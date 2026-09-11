@@ -7,6 +7,7 @@ import {
   useState,
 } from "react";
 import {
+  ApiOutlined,
   CheckOutlined,
   DownOutlined,
   ReloadOutlined,
@@ -15,6 +16,7 @@ import {
 import { Popover, Spin, Tooltip, message } from "antd";
 import { useTranslation } from "react-i18next";
 import { CHAT_OPEN_MODEL_SELECTOR_EVENT } from "@/modules/chat/constants/chat";
+import { getProviderLogoUrl } from "@/modules/modelProvider/providerBranding";
 import {
   chatModelSelectionKey,
   toChatModelSelectionRequest,
@@ -517,6 +519,22 @@ const ChatModelSelector = ({
               disabled={saving || !catalog.auto_available}
               onClick={chooseAuto}
             >
+              <span className="chat-model-option-icon" aria-hidden="true">
+                <svg
+                  width="20"
+                  height="20"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.7"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  focusable="false"
+                >
+                  <path d="M20 8A9 9 0 0 0 3.3 7M3 3v4h4M4 16a9 9 0 0 0 16.7 1M21 21v-4h-4" />
+                  <path d="m8.5 16 3.5-9 3.5 9M10 12.5h4" />
+                </svg>
+              </span>
               <strong>Auto</strong>
               {!catalog.auto_available ? (
                 <small className="chat-model-option-unavailable">
@@ -545,6 +563,7 @@ const ChatModelSelector = ({
                       ) : null}
                     </div>
                     {provider.models.map((model) => {
+                      const logoUrl = getProviderLogoUrl(provider.name);
                       const isCurrent =
                         currentSelection?.mode === "fixed" &&
                         (currentSelection.model_id
@@ -584,6 +603,13 @@ const ChatModelSelector = ({
                           disabled={saving || !isModelAvailable(model)}
                           onClick={() => chooseModel(provider, model)}
                         >
+                          <span className="chat-model-option-icon" aria-hidden="true">
+                            {logoUrl ? (
+                              <img src={logoUrl} alt="" width={20} height={20} />
+                            ) : (
+                              <ApiOutlined />
+                            )}
+                          </span>
                           <span className="chat-model-option-copy">
                             <strong>{model.name}</strong>
                             {model.group_name &&

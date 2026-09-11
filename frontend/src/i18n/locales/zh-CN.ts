@@ -2311,6 +2311,14 @@ const zhCN = {
     writerMarkdown: {
       documentRegion: "Markdown 文档",
       readOnly: "只读",
+      headingPlaceholders: {
+        h1: "输入一级标题…",
+        h2: "输入二级标题…",
+        h3: "输入三级标题…",
+        h4: "输入四级标题…",
+        h5: "输入五级标题…",
+        h6: "输入六级标题…",
+      },
       blockTypes: {
         paragraph: "正文",
         quote: "引用",
@@ -3234,6 +3242,8 @@ const zhCN = {
     allStatuses: "全部状态",
     uninstalled: "未安装",
     installed: "已安装",
+    installing: "安装中",
+    updating: "更新中",
     updateAvailable: "可更新",
     upToDate: "已是最新",
     latestVersion: "最新版本",

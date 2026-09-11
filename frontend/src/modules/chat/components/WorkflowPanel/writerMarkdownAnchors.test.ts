@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { isWriterSystemAnchorBlock } from './writerIR';
 import {
   applyWriterMarkdownInternalReference,
+  collectWriterMarkdownDomAnchors,
   collectWriterMarkdownOutline,
   collectWriterMarkdownReferenceTargets,
   protectWriterMarkdownHeadingAnchors,
@@ -14,6 +15,33 @@ import {
 } from './writerMarkdownAnchors';
 
 describe('Writer Markdown system anchors', () => {
+  it.each(['#', '##', '###', '####', '#####', '######'])('preserves %s numbering when its text is cleared and retyped', (prefix) => {
+    const source = `<a id="block-sec-1" numbering="restart"></a>\n${prefix} 1 章节\n\n<a id="block-sec-2"></a>\n## 后续章节`;
+    const cleared = `${prefix}\n\n## 后续章节`;
+    const saved = writerMarkdownForSave(protectWriterMarkdownHeadingAnchors(source, cleared));
+
+    expect(saved).toBe(`<a id="block-sec-1" numbering="restart"></a>\n${prefix}\n\n<a id="block-sec-2"></a>\n## 后续章节`);
+    expect(collectWriterMarkdownDomAnchors(saved)).toEqual([
+      { anchorId: 'block-sec-1', type: 'heading', targetIndex: 0 },
+      { anchorId: 'block-sec-2', type: 'heading', targetIndex: 1 },
+    ]);
+    expect(collectWriterMarkdownOutline(saved).items[0]).toMatchObject({
+      anchorId: 'block-sec-1', label: `H${prefix.length}`, level: prefix.length,
+    });
+    expect(collectWriterMarkdownReferenceTargets(saved)[0]).toMatchObject({
+      anchorId: 'block-sec-1', label: `H${prefix.length}`,
+    });
+    expect(writerMarkdownForSave(protectWriterMarkdownHeadingAnchors(
+      saved, `${prefix} 新标题\n\n## 后续章节`,
+    ))).toContain(`<a id="block-sec-1" numbering="restart"></a>\n${prefix} 新标题`);
+  });
+
+  it('counts empty headings without assigning later anchors to the wrong DOM heading', () => {
+    expect(collectWriterMarkdownDomAnchors('#\n\n##\n\n<a id="block-sec-2"></a>\n## 章节')).toEqual([
+      { anchorId: 'block-sec-2', type: 'heading', targetIndex: 2 },
+    ]);
+  });
+
   it('keeps system anchors round-trippable through MDXEditor', () => {
     const source = '# 标题\n\n<a id="block-sec-1"></a>\n## 1 章节';
     const editorValue = writerMarkdownForEditor(source);

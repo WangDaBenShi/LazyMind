@@ -34,6 +34,7 @@ import {
   PictureOutlined,
 } from '@ant-design/icons';
 import { Dropdown } from 'antd';
+import { createPortal } from 'react-dom';
 import '@mdxeditor/editor/style.css';
 import {
   useCallback,
@@ -68,6 +69,7 @@ import {
   type MarkdownImageResolver,
 } from '@/modules/knowledge/utils/imageUrl';
 import { WriterHeadingNumberingMenu } from './WriterHeadingNumberingMenu';
+import { writerEmptyHeadingPlugin } from './writerEmptyHeadingPlugin';
 import {
   applyWriterMarkdownInternalReference,
   collectWriterMarkdownDomAnchors,
@@ -85,6 +87,19 @@ import './MarkdownArtifactEditor.scss';
 /** Idle debounce after the latest edit before a silent draft save. */
 const MARKDOWN_AUTOSAVE_IDLE_MS = 1_000;
 const CHAT_PARAGRAPH_HOVER_MS = 1_000;
+
+function isEmptyMarkdownHeading(heading: HTMLElement): boolean {
+  const content = heading.cloneNode(true) as HTMLElement;
+  content.querySelectorAll('[data-writer-outline-control]').forEach((control) => control.remove());
+  return !content.textContent?.trim() && !content.querySelector('img, [data-lexical-decorator]');
+}
+
+function unorderedHeadingAnchor(target: EventTarget | null): string | null {
+  const element = target instanceof Element ? target.closest<HTMLElement>(
+    '[data-writer-heading-mode="unordered"], [data-writer-numbering-control]',
+  ) : null;
+  return element?.dataset.writerNumberingControl || element?.id || null;
+}
 
 function WriterAnchorEditor(props: JsxEditorProps) {
   const id = props.mdastNode.attributes.find(
@@ -518,7 +533,7 @@ function isMarkdownToolbarInteractionTarget(node: Node | null | undefined): bool
 }
 
 function markdownNumberingMarkerClicked(heading: HTMLElement, clientX: number): boolean {
-  if (!heading.dataset.writerNumberingLabel) return false;
+  if (!heading.dataset.writerNumberingLabel || heading.dataset.writerHeadingPlaceholder) return false;
   const start = markdownTextBoundary(heading, 0);
   const range = globalThis.document.createRange();
   range.setStart(start.node, start.offset);
@@ -577,6 +592,15 @@ export function MarkdownArtifactEditor({
   const [pageWidth, setPageWidth] = useState<'default' | 'wide'>('default');
   const [selection, setSelection] = useState<MarkdownSelection | null>(null);
   const [selectionToolbar, setSelectionToolbar] = useState<FloatingToolbarAnchor | null>(null);
+  const [emptyHeadingLevel, setEmptyHeadingLevel] = useState<string | null>(null);
+  const [numberingControlHost, setNumberingControlHost] = useState<HTMLElement | null>(null);
+  const [numberingControls, setNumberingControls] = useState<Array<{
+    anchorId: string;
+    top: number;
+    left: number;
+    width: number;
+  }>>([]);
+  const [hoveredNumberingId, setHoveredNumberingId] = useState<string | null>(null);
   const [numberingMenu, setNumberingMenu] = useState<{
     anchorId: string;
     x: number;
@@ -697,6 +721,15 @@ export function MarkdownArtifactEditor({
         delete element.dataset.writerImageCaption;
       });
       const headings = editable.querySelectorAll<HTMLElement>('h1, h2, h3, h4, h5, h6');
+      headings.forEach((heading) => {
+        if (isEmptyMarkdownHeading(heading)) {
+          heading.dataset.writerHeadingPlaceholder = t(
+            `chat.writerMarkdown.headingPlaceholders.${heading.tagName.toLowerCase()}`,
+          );
+        } else {
+          delete heading.dataset.writerHeadingPlaceholder;
+        }
+      });
       const images = editable.querySelectorAll<HTMLElement>('img');
       images.forEach((image) => {
         const caption = image.getAttribute('alt') ?? '';
@@ -718,6 +751,31 @@ export function MarkdownArtifactEditor({
           if (label) target.dataset.writerNumberingLabel = label;
         }
       });
+      const surface = root.querySelector<HTMLElement>('.writer-markdown-editor__surface');
+      setNumberingControlHost(surface);
+      const surfaceRect = surface?.getBoundingClientRect();
+      const controls = !readOnly && surface && surfaceRect ? Array.from(headings)
+        .filter((heading) => heading.dataset.writerHeadingMode === 'unordered' && heading.tagName !== 'H1')
+        .map((heading) => {
+          const rect = heading.getBoundingClientRect();
+          const headingStyle = getComputedStyle(heading);
+          const lineHeight = parseFloat(headingStyle.lineHeight)
+            || parseFloat(headingStyle.fontSize) * 1.4 || 22;
+          const width = Math.min(24, Math.max(0, rect.left - surfaceRect.left - 4));
+          return {
+            anchorId: heading.id,
+            top: rect.top - surfaceRect.top + surface.scrollTop + Math.max(0, (lineHeight - 22) / 2),
+            left: rect.left - surfaceRect.left + surface.scrollLeft - width - 4,
+            width,
+          };
+        }) : [];
+      setNumberingControls((current) => (
+        current.length === controls.length && current.every((control, index) => (
+          control.anchorId === controls[index].anchorId
+          && control.top === controls[index].top && control.left === controls[index].left
+          && control.width === controls[index].width
+        )) ? current : controls
+      ));
       markdownOutline.items.forEach((item) => {
         const heading = Array.from(headings).find(
           (candidate) => candidate.id === item.anchorId,
@@ -774,16 +832,24 @@ export function MarkdownArtifactEditor({
     const observer = new MutationObserver(scheduleDomAnchors);
     observer.observe(root, {
       childList: true,
+      characterData: true,
       subtree: true,
       // Image previews resolve asynchronously. Reconcile again when the
       // editor updates the real image node after the Markdown render.
       attributes: true,
       attributeFilter: ['src', 'alt'],
     });
+    const resizeObserver = typeof ResizeObserver === 'undefined'
+      ? undefined : new ResizeObserver(scheduleDomAnchors);
+    const content = root.querySelector('.mdxeditor-root-contenteditable');
+    if (content) resizeObserver?.observe(content);
+    window.addEventListener('resize', scheduleDomAnchors);
     applyDomAnchors();
     scheduleDomAnchors();
     return () => {
       observer.disconnect();
+      resizeObserver?.disconnect();
+      window.removeEventListener('resize', scheduleDomAnchors);
       if (frame !== undefined) window.cancelAnimationFrame(frame);
     };
   }, [
@@ -791,6 +857,7 @@ export function MarkdownArtifactEditor({
     markdownOutline,
     materializedDraftMarkdown,
     numbering,
+    readOnly,
     sourceReferenceMap,
     syncOutlineInstructionsExpanded,
     t,
@@ -851,6 +918,10 @@ export function MarkdownArtifactEditor({
   const dismissSelectionToolbar = useCallback(() => {
     selectionToolbarDismissedRef.current = true;
     setSelectionToolbar(null);
+    setEmptyHeadingLevel(null);
+    rootRef.current?.querySelectorAll('[data-writer-heading-controls]').forEach((heading) => {
+      heading.removeAttribute('data-writer-heading-controls');
+    });
     setReferenceDropdownOpen(false);
     setCompactActionsOpen(false);
   }, []);
@@ -869,6 +940,38 @@ export function MarkdownArtifactEditor({
     const keepToolbarForInteraction = isMarkdownToolbarInteractionTarget(document.activeElement)
       || isMarkdownToolbarDropdownOpen();
     const browserSelection = globalThis.getSelection();
+    const anchorNode = browserSelection?.anchorNode;
+    const anchorElement = anchorNode instanceof Element ? anchorNode : anchorNode?.parentElement;
+    const emptyHeading = browserSelection?.isCollapsed
+      ? anchorElement?.closest<HTMLElement>('h1, h2, h3, h4, h5, h6')
+      : null;
+    if (
+      root && surface && editable && toolbar && emptyHeading
+      && editable.contains(emptyHeading) && isEmptyMarkdownHeading(emptyHeading)
+    ) {
+      const surfaceRect = surface.getBoundingClientRect();
+      const headingRect = emptyHeading.getBoundingClientRect();
+      const inside = headingRect.left - surfaceRect.left < 64;
+      root.querySelectorAll('[data-writer-heading-controls]').forEach((heading) => {
+        if (heading !== emptyHeading) heading.removeAttribute('data-writer-heading-controls');
+      });
+      emptyHeading.dataset.writerHeadingControls = inside ? 'inside' : 'outside';
+      const style = window.getComputedStyle(emptyHeading);
+      const lineHeight = parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.2;
+      setEmptyHeadingLevel(emptyHeading.tagName);
+      setSelectionToolbar({
+        top: headingRect.top - surfaceRect.top + surface.scrollTop + (lineHeight - 26) / 2,
+        left: headingRect.left - surfaceRect.left + surface.scrollLeft - (inside ? 0 : 64),
+        maxWidth: 56,
+        placement: 'top',
+      });
+      return;
+    }
+    if (keepToolbarForInteraction) return;
+    setEmptyHeadingLevel(null);
+    root?.querySelectorAll('[data-writer-heading-controls]').forEach((heading) => {
+      heading.removeAttribute('data-writer-heading-controls');
+    });
     const hasValidSelection = Boolean(
       browserSelection
       && !browserSelection.isCollapsed
@@ -1486,6 +1589,7 @@ export function MarkdownArtifactEditor({
       '--writer-markdown-selection-toolbar-top': `${selectionToolbar.top}px`,
       '--writer-markdown-selection-toolbar-left': `${selectionToolbar.left}px`,
       '--writer-markdown-selection-toolbar-max-width': `${selectionToolbar.maxWidth}px`,
+      '--writer-markdown-empty-heading-level': JSON.stringify(emptyHeadingLevel),
     } as CSSProperties
     : undefined;
   const editorStyle: CSSProperties | undefined = selectionToolbarStyle || maxHeight !== undefined
@@ -1500,6 +1604,8 @@ export function MarkdownArtifactEditor({
         !chatPresentation && !hasOutline ? ' writer-markdown-editor--no-outline' : ''
       }${
         selectionToolbar ? ' writer-markdown-editor--selection-toolbar-visible' : ''
+      }${
+        emptyHeadingLevel ? ' writer-markdown-editor--empty-heading-toolbar' : ''
       }${chatPresentation ? ' writer-markdown-editor--chat' : ''}`}
       aria-label={t('chat.writerMarkdown.documentRegion')}
       ref={rootRef}
@@ -1515,6 +1621,11 @@ export function MarkdownArtifactEditor({
       }}
       onMouseDownCapture={(event) => {
         const target = event.target instanceof Element ? event.target : null;
+        if (target?.closest('[data-writer-numbering-control]')) {
+          event.preventDefault();
+          event.stopPropagation();
+          return;
+        }
         if (target?.closest('.mdxeditor-toolbar')) {
           // Browsers dispatch selectionchange before toolbar focus/click. Keep
           // the editor selection alive until MDXEditor has applied its command.
@@ -1530,11 +1641,13 @@ export function MarkdownArtifactEditor({
         event.stopPropagation();
       }}
       onMouseOverCapture={(event) => {
+        setHoveredNumberingId(unorderedHeadingAnchor(event.target));
         if (!chatPresentation) return;
         const sourceLink = sourceReferenceLink(event.target);
         if (sourceLink) showSourceReferencePopover(sourceLink);
       }}
       onMouseOutCapture={(event) => {
+        setHoveredNumberingId(unorderedHeadingAnchor(event.relatedTarget));
         if (!sourceReferenceLink(event.target)) return;
         const nextTarget = event.relatedTarget;
         if (nextTarget instanceof Node && sourceReferenceLink(nextTarget)) return;
@@ -1542,6 +1655,18 @@ export function MarkdownArtifactEditor({
       }}
       onClickCapture={(event) => {
         const target = event.target instanceof Element ? event.target : null;
+        const numberingControl = target?.closest<HTMLElement>('[data-writer-numbering-control]');
+        if (numberingControl) {
+          event.preventDefault();
+          event.stopPropagation();
+          const rect = numberingControl.getBoundingClientRect();
+          setNumberingMenu({
+            anchorId: numberingControl.dataset.writerNumberingControl!,
+            x: rect.right,
+            y: rect.bottom,
+          });
+          return;
+        }
         if (target?.closest('.mdxeditor-toolbar')) {
           window.setTimeout(() => {
             toolbarInteractionRef.current = false;
@@ -1565,9 +1690,7 @@ export function MarkdownArtifactEditor({
             ? rawAnchorId
             : rawAnchorId ? `block-${rawAnchorId}` : '';
           const numberingMarker = markdownNumberingMarkerClicked(heading, event.clientX);
-          const unorderedControl = heading.dataset.writerHeadingMode === 'unordered'
-            && event.clientX < heading.getBoundingClientRect().left;
-          if (anchorId && (numberingMarker || unorderedControl)) {
+          if (anchorId && numberingMarker) {
             event.preventDefault();
             event.stopPropagation();
             setNumberingMenu({
@@ -1615,6 +1738,27 @@ export function MarkdownArtifactEditor({
         if (event.key !== 'Escape') recordSelection();
       }}
       onKeyDownCapture={(event) => {
+        const target = event.target instanceof Element ? event.target : null;
+        if (event.altKey && event.key === 'Enter') {
+          const anchor = window.getSelection()?.anchorNode;
+          const element = anchor instanceof Element ? anchor : anchor?.parentElement;
+          const anchorId = element?.closest('h2, h3, h4, h5, h6')?.id;
+          const control = Array.from(rootRef.current?.querySelectorAll<HTMLButtonElement>(
+            '[data-writer-numbering-control]',
+          ) ?? []).find((candidate) => candidate.dataset.writerNumberingControl === anchorId);
+          if (control) {
+            event.preventDefault();
+            event.stopPropagation();
+            control.focus();
+            control.click();
+            return;
+          }
+        }
+        if (target?.closest('[data-writer-numbering-control]') && event.key !== 'Escape') {
+          // Let the native button handle Enter/Space without editing the heading.
+          event.stopPropagation();
+          return;
+        }
         if (!chatPresentation || !onOpenSourceReference) return;
         if (event.key !== 'Enter' && event.key !== ' ') return;
         const sourceLink = sourceReferenceLink(event.target);
@@ -1625,6 +1769,24 @@ export function MarkdownArtifactEditor({
         if (citationId) onOpenSourceReference(citationId);
       }}
     >
+      {/* Keep controls outside the editable DOM so Lexical preserves them and Markdown stays clean. */}
+      {numberingControlHost && createPortal(numberingControls.map(({ anchorId, top, left, width }) => (
+        <button
+          key={anchorId}
+          type='button'
+          className='writer-markdown-editor__numbering-control'
+          data-writer-numbering-control={anchorId}
+          data-visible={hoveredNumberingId === anchorId}
+          style={{ top, left, width }}
+          title={`${t('chat.writerIR.numberingSettings')} (Alt+Enter)`}
+          aria-label={t('chat.writerIR.numberingSettings')}
+          aria-haspopup='dialog'
+          aria-keyshortcuts='Alt+Enter'
+          aria-expanded={numberingMenu?.anchorId === anchorId}
+        >
+          <DownOutlined aria-hidden />
+        </button>
+      )), numberingControlHost)}
       {numberingMenu && (
         <WriterHeadingNumberingMenu
           x={numberingMenu.x}
@@ -1857,6 +2019,7 @@ export function MarkdownArtifactEditor({
             onError={({ source }: { source: string }) => setRenderErrorSource(source)}
             plugins={[
               headingsPlugin(),
+              writerEmptyHeadingPlugin(),
               listsPlugin(),
               quotePlugin(),
               thematicBreakPlugin(),

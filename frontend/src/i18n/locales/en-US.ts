@@ -2378,6 +2378,14 @@ const enUS = {
     writerMarkdown: {
       documentRegion: "Markdown document",
       readOnly: "Read-only",
+      headingPlaceholders: {
+        h1: "Type a level 1 heading…",
+        h2: "Type a level 2 heading…",
+        h3: "Type a level 3 heading…",
+        h4: "Type a level 4 heading…",
+        h5: "Type a level 5 heading…",
+        h6: "Type a level 6 heading…",
+      },
       blockTypes: {
         paragraph: "Paragraph",
         quote: "Quote",
@@ -3311,6 +3319,8 @@ const enUS = {
     allStatuses: "All statuses",
     uninstalled: "Not installed",
     installed: "Installed",
+    installing: "Installing",
+    updating: "Updating",
     updateAvailable: "Update available",
     upToDate: "Up to date",
     latestVersion: "Latest version",
