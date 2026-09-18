@@ -1,0 +1,346 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone as datetime_timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from lazymind.chat.engine.agent_runtime import AgentRole, PromptBuilder, PromptBundle
+from lazymind.common.memory.field_contract import memory_operation_rules
+
+from .guidance import (
+    ANALYSIS_GUIDANCE,
+    CLARIFICATION_GUIDANCE,
+    DECISION_PLANNING_GUIDANCE,
+    DEFAULT_SYSTEM_PROMPT,
+    EDITABLE_WRITING_GUIDANCE,
+    DELIVERABLE_GUIDANCE,
+    FRESH_RESEARCH_GUIDANCE,
+    LEARNING_GUIDANCE,
+    REQUEST_ANALYSIS_GUIDANCE,
+    RESPONSE_LANGUAGE_GUIDANCE,
+    SKILL_RESTRAINT_GUIDANCE,
+    TRANSFORMATION_GUIDANCE,
+)
+from .task_profile import TaskProfile
+
+_DEFAULT_UI_LOCALE = 'zh-CN'
+
+
+def _get_ui_locale(environment_context: dict | None = None) -> str:
+    if isinstance(environment_context, dict):
+        locale = str(environment_context.get('locale') or '').strip()
+        if locale:
+            return locale
+    return _DEFAULT_UI_LOCALE
+
+
+def _environment_time_parts(environment_context: dict | None) -> tuple[object, object]:
+    if not isinstance(environment_context, dict):
+        return None, None
+    time_info = environment_context.get('time') or {}
+    if not isinstance(time_info, dict):
+        return None, None
+    return time_info.get('now'), time_info.get('timezone')
+
+
+def _parse_user_local_time(time_now: object, timezone: object) -> tuple[datetime | None, str, str]:
+    raw_time = str(time_now).strip()
+    timezone_name = str(timezone).strip() if timezone is not None else ''
+    if not raw_time:
+        return None, timezone_name, ''
+    try:
+        normalized_time = raw_time[:-1] + '+00:00' if raw_time.endswith('Z') else raw_time
+        parsed_time = datetime.fromisoformat(normalized_time)
+        if parsed_time.tzinfo is None:
+            parsed_time = parsed_time.replace(tzinfo=datetime_timezone.utc)
+        if timezone_name:
+            try:
+                return parsed_time.astimezone(ZoneInfo(timezone_name)), timezone_name, raw_time
+            except ZoneInfoNotFoundError:
+                return parsed_time, '', raw_time
+        return parsed_time, '', raw_time
+    except (ValueError, TypeError):
+        return None, timezone_name, raw_time
+
+
+def _format_user_date(time_now: object, timezone: object) -> str:
+    parsed_time, timezone_name, _raw_time = _parse_user_local_time(time_now, timezone)
+    if parsed_time is None:
+        return ''
+    if timezone_name:
+        return f'{parsed_time:%Y-%m-%d} ({timezone_name})'
+    return f'{parsed_time:%Y-%m-%d}'
+
+
+def _format_user_time(time_now: object, timezone: object) -> str:
+    parsed_time, timezone_name, raw_time = _parse_user_local_time(time_now, timezone)
+    if parsed_time is None:
+        return raw_time
+    if timezone_name:
+        return f'{parsed_time:%H:%M:%S} ({timezone_name})'
+    return f'{parsed_time:%H:%M:%S}'
+
+
+def _build_environment_context_prompt(environment_context: dict | None = None) -> str:
+    time_now, timezone = _environment_time_parts(environment_context)
+    user_date = _format_user_date(time_now, timezone) if time_now else ''
+    locale = _get_ui_locale(environment_context)
+    lines = ['## Environment Context']
+    if user_date:
+        lines.append(f'Current user date: {user_date}')
+    lines.append(f'UI locale: {locale}')
+    return '\n'.join(lines)
+
+
+def _build_turn_time_prompt(environment_context: dict | None = None) -> str:
+    time_now, timezone = _environment_time_parts(environment_context)
+    user_time = _format_user_time(time_now, timezone) if time_now else ''
+    if not user_time:
+        return ''
+    return f'Current user time: {user_time}'
+
+
+_TOOL_APPENDIX_SECTION_TITLES = {
+    'tool_policy': 'Tool-specific policies',
+    'safety': 'Tool-specific safety constraints',
+    'output_contract': 'Tool output contracts',
+    'response_policy': 'Tool-specific response policies',
+}
+
+
+def _build_tool_appendix_prompt(appendices: dict[str, list[str]] | None = None) -> str:
+    blocks = []
+    for section, title in _TOOL_APPENDIX_SECTION_TITLES.items():
+        entries = [item.strip() for item in (appendices or {}).get(section, []) if item.strip()]
+        if entries:
+            blocks.append(f'## {title}\n' + '\n\n'.join(entries))
+    return '\n\n'.join(blocks)
+
+
+def add_standard_system_sections(
+    builder: PromptBuilder,
+    has_tools: bool,
+    *,
+    environment_context: dict | None = None,
+    use_memory: bool = True,
+    soul: str | None = None,
+    profile: str | None = None,
+    preference: str | None = None,
+    current_query: str | None = None,
+    conversation_history: list[dict] | None = None,
+    tool_prompt_appendices: dict[str, list[str]] | None = None,
+    show_tool_status: bool = True,
+    task_profile: TaskProfile | None = None,
+    dynamic_prompt_modules: bool = False,
+    include_editable_writing: bool = True,
+) -> PromptBuilder:
+    builder.system(
+        'platform_identity', '', DEFAULT_SYSTEM_PROMPT, 'platform.guidance', priority=10,
+    ).system(
+        'editable_writing', '', EDITABLE_WRITING_GUIDANCE,
+        'platform.output.editable', priority=15, skip_if=not include_editable_writing,
+    ).system(
+        'response_language', '', RESPONSE_LANGUAGE_GUIDANCE, 'platform.language', priority=20,
+    ).runtime(
+        'environment_time', 'Current Time',
+        _build_turn_time_prompt(environment_context),
+        'request.environment.time', priority=2, content_kind='state',
+    )
+
+    environment_prompt = _build_environment_context_prompt(environment_context)
+    builder.system(
+        'environment', '', environment_prompt, 'request.environment', priority=30,
+    )
+
+    if dynamic_prompt_modules and task_profile is not None:
+        builder.system(
+            'task_profile_interpretation', '# Task profile interpretation',
+            'The enabled task modules and deliverable hints were selected by fast heuristic '
+            'rules. They are provisional guidance, may be incomplete or inaccurate, and must '
+            'not override the user\'s actual request. Independently infer the user\'s goal and '
+            'correct the response strategy when the wording, conversation context, or available '
+            'evidence indicates a better interpretation. Do not mention this internal routing '
+            'review to the user. Runtime sections explicitly marked AUTHORITATIVE remain binding.',
+            'platform.task.interpretation', priority=31,
+        )
+        outcomes = {task_profile.primary_outcome, *task_profile.secondary_outcomes}
+        builder.system(
+            'task_learning', '', LEARNING_GUIDANCE, 'platform.task.learning', priority=32,
+            skip_if='learn' not in outcomes,
+        ).system(
+            'task_fresh_research', '', FRESH_RESEARCH_GUIDANCE,
+            'platform.task.research', priority=33,
+            skip_if=not task_profile.research_required and task_profile.freshness != 'current',
+        ).system(
+            'task_decision_planning', '', DECISION_PLANNING_GUIDANCE,
+            'platform.task.decision', priority=34,
+            skip_if=not outcomes.intersection({'decide', 'plan'}),
+        ).system(
+            'task_analysis', '', ANALYSIS_GUIDANCE,
+            'platform.task.analysis', priority=34,
+            skip_if='analyze' not in outcomes,
+        ).system(
+            'task_transformation', '', TRANSFORMATION_GUIDANCE,
+            'platform.task.transformation', priority=34,
+            skip_if='transform' not in outcomes,
+        )
+        deliverables = [task_profile.deliverable_kind, *task_profile.secondary_deliverables][:2]
+        contracts = [DELIVERABLE_GUIDANCE[item] for item in deliverables if item in DELIVERABLE_GUIDANCE]
+        builder.system(
+            'task_deliverable', '# Deliverable contract', '\n'.join(contracts),
+            'platform.task.deliverable', priority=35,
+            skip_if=not contracts or (
+                task_profile.complexity == 'simple' and task_profile.deliverable_kind == 'direct_answer'
+            ),
+        ).system(
+            'task_skill_restraint', '', SKILL_RESTRAINT_GUIDANCE,
+            'platform.task.skills', priority=36,
+            skip_if=task_profile.skill_mode == 'explicit',
+        ).system(
+            'task_request_analysis', '', REQUEST_ANALYSIS_GUIDANCE,
+            'platform.task.request_analysis', priority=37,
+            skip_if=(
+                task_profile.request_assessment.status == 'ready'
+                and task_profile.complexity != 'compound'
+            ),
+        ).system(
+            'task_clarification', '', CLARIFICATION_GUIDANCE,
+            'platform.task.clarification', priority=38,
+            skip_if=task_profile.request_assessment.interaction_need != 'blocking',
+        )
+        assessment = task_profile.request_assessment
+        excluded = task_profile.excluded_resources
+        excluded_lines = [
+            *(f'- Skill: {value}' for value in excluded.skill_names),
+            *(f'- Knowledge base: {value}' for value in excluded.knowledge_base_ids),
+            *(f'- Workflow: {value}' for value in excluded.workflow_refs),
+        ]
+        if excluded_lines:
+            builder.runtime(
+                'task_resource_policy', 'Resource Usage Policy',
+                '\n'.join([
+                    'Do not use, invoke, cite, or rely on these resources in this turn, even if '
+                    'their content appears elsewhere in the assembled context:',
+                    *excluded_lines,
+                ]),
+                'runtime.task.resources', priority=4, authoritative=True, content_kind='instruction',
+            )
+        if assessment.status != 'ready':
+            issue_lines = [
+                f'- {issue.issue_type} ({issue.impact}): {issue.description} '
+                f'[evidence: {issue.evidence}]'
+                for issue in assessment.issues
+            ]
+            question_lines = [
+                f'- {question.question}'
+                + (f' Options: {", ".join(question.options)}.' if question.options else '')
+                + (f' Recommended: {question.recommended}.' if question.recommended else '')
+                for question in assessment.clarification_questions
+            ]
+            builder.runtime(
+                'task_request_assessment', 'Request Assessment',
+                '\n'.join([
+                    f'Status: {assessment.status}',
+                    f'Interaction need: {assessment.interaction_need}',
+                    *issue_lines,
+                    *question_lines,
+                ]),
+                'runtime.task.assessment', priority=5, authoritative=True, content_kind='state',
+            )
+
+    if use_memory:
+        if any(
+            isinstance(content, str) and content.strip()
+            for content in (soul, profile)
+        ):
+            builder.system(
+                'memory_field_contract',
+                'Memory Field Contract',
+                memory_operation_rules(),
+                'memory.field_contract',
+                priority=37,
+            )
+        if isinstance(soul, str) and soul.strip():
+            soul_block = (
+                '## Agent Soul\n'
+                'This is the assistant identity and default behavior baseline. '
+                'It does not contain user facts, current-task instructions, tool '
+                'capabilities, or safety rules. System rules and real permissions '
+                'always override Soul. Current-turn requests must not change the '
+                'stored identity unless Soul itself is updated.\n\n'
+                + soul.strip()
+                + '\n\n<!-- end of Agent Soul -->'
+            )
+            builder.system(
+                'agent_soul', '', soul_block, 'agent.soul', priority=38,
+            )
+        if isinstance(profile, str) and profile.strip():
+            profile_block = (
+                '## User Profile\n'
+                'Stable structured facts about who the user is now. '
+                'Use them only when relevant to the current request. '
+                'Do not invent missing fields or treat profile as a history log.\n\n'
+                + profile.strip()
+                + '\n\n<!-- end of User Profile -->'
+            )
+            builder.system(
+                'user_profile', '', profile_block, 'user.profile', priority=40,
+            )
+        if isinstance(preference, str) and preference.strip():
+            preference_block = (
+                '## User Preference Index\n'
+                'Active long-term preferences for how to serve this user. '
+                'Each item has a short executable summary and an optional '
+                '`ref` to a detailed reference file under '
+                '`memory/users/references/`. '
+                'Apply a preference only when it matches the current task. '
+                'When the summary is insufficient, read the referenced detail '
+                'with `read_memory_reference` (one or more `refs` from the index) '
+                'instead of guessing. '
+                'Do not load unrelated reference files.\n\n'
+                + preference.strip()
+                + '\n\n<!-- end of User Preference Index -->'
+            )
+            builder.system(
+                'user_preferences', '', preference_block, 'user.preference', priority=50,
+            )
+
+    if has_tools:
+        tool_policy = (
+            '# Tool use policy\n'
+            'First decide whether tools are needed. A tool named get_*Toolkit_methods '
+            'is a Toolkit gateway: call it before using that Toolkit. Confirm before '
+            'destructive or externally visible actions unless the user '
+            'already requested that exact action.'
+        )
+        if show_tool_status:
+            tool_policy = (
+                '# Tool call status\n'
+                'Before calling a tool, write one concise, user-visible sentence explaining '
+                'what you are about to do. Keep it action-oriented and do not reveal hidden '
+                'reasoning. Then make the tool call in the same response.\n'
+                "CRITICAL: Never write a status sentence (e.g. '正在…', 'I am now checking…', "
+                "'Activating…') without immediately following it with an actual tool call in the "
+                'same response. If you cannot call a tool, do not pretend you are doing so — '
+                'answer directly instead.\n\n'
+                + tool_policy
+            )
+        builder.system(
+            'tool_policy', '', tool_policy, 'platform.tools', priority=60,
+        )
+        appendix_prompt = _build_tool_appendix_prompt(tool_prompt_appendices)
+        builder.system(
+            'tool_appendices', '', appendix_prompt, 'tool.registry', priority=70,
+        )
+
+    return builder
+
+
+def build_standard_prompt_bundle(has_tools: bool, **kwargs) -> PromptBundle:
+    """Render standard system and runtime sections for direct consumers and tests."""
+    builder = PromptBuilder.for_role(AgentRole.CHAT)
+    return add_standard_system_sections(builder, has_tools, **kwargs).build()
+
+
+def build_system_prompt(has_tools: bool, **kwargs) -> str:
+    """Render standard system sections for direct consumers and focused tests."""
+    return build_standard_prompt_bundle(has_tools, **kwargs).system_prompt

@@ -1,0 +1,2249 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
+
+func defaultProfileValue() string {
+	return ""
+}
+
+func installFakeUVOnPath(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	name := "uv"
+	if runtime.GOOS == "windows" {
+		name = "uv.exe"
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), []byte("fake uv"), 0o755); err != nil {
+		t.Fatalf("write fake uv: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("UV", "uv")
+}
+
+func TestMain(m *testing.M) {
+	home, err := os.MkdirTemp("", "lazymind-runtime-manager-home-*")
+	if err != nil {
+		panic(err)
+	}
+	_ = os.Setenv(localHostHomeEnvVar, home)
+	_ = os.Setenv("HOME", home)
+	_ = os.Setenv("LOCALAPPDATA", filepath.Join(home, "AppData", "Local"))
+	code := m.Run()
+	_ = os.RemoveAll(home)
+	os.Exit(code)
+}
+
+func sameDirectory(t *testing.T, left, right string) bool {
+	t.Helper()
+	leftInfo, leftErr := os.Stat(left)
+	rightInfo, rightErr := os.Stat(right)
+	return leftErr == nil && rightErr == nil && os.SameFile(leftInfo, rightInfo)
+}
+
+func TestRuntimeConfigUsesPlatformUserPathsByDefault(t *testing.T) {
+	repo := t.TempDir()
+	home := filepath.Join(t.TempDir(), "home")
+	t.Setenv(localHostHomeEnvVar, home)
+	t.Setenv("HOME", home)
+	t.Setenv("LOCALAPPDATA", filepath.Join(home, "AppData", "Local"))
+	t.Setenv(runtimeRootEnvVar, "")
+	t.Setenv(localSQLiteDirEnvVar, "")
+	t.Setenv(localMilvusLiteDBPathEnvVar, "")
+	t.Setenv("LAZYMIND_FILE_WATCHER_BASE_ROOT", "")
+	t.Setenv("LAZYMIND_FILE_WATCHER_WATCH_HOST_DIR", "")
+	writeComposeFixture(t, repo)
+	cfg, paths, err := NewRuntimeConfig("", repo)
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	if cfg.Profile != "local" {
+		t.Fatalf("profile = %q, want local", cfg.Profile)
+	}
+	layout := runtimePathLayoutForGOOS(runtime.GOOS, home, "", "", "", "")
+	if paths.RuntimeRoot != layout.DataRoot {
+		t.Fatalf("runtime root = %q, want %q", paths.RuntimeRoot, layout.DataRoot)
+	}
+	if paths.BuildRoot != filepath.Join(repo, "local", "build") {
+		t.Fatalf("build root = %q, want %q", paths.BuildRoot, filepath.Join(repo, "local", "build"))
+	}
+	if paths.LogsDir != layout.LogsRoot {
+		t.Fatalf("logs dir = %q, want %q", paths.LogsDir, layout.LogsRoot)
+	}
+	if paths.CacheDir != layout.CacheRoot {
+		t.Fatalf("cache dir = %q, want %q", paths.CacheDir, layout.CacheRoot)
+	}
+	if cfg.FileWatcher.WatchHostDir != layout.LocalImportRoot {
+		t.Fatalf("watch host dir = %q, want %q", cfg.FileWatcher.WatchHostDir, layout.LocalImportRoot)
+	}
+	if strings.HasPrefix(paths.RuntimeRoot, repo+string(os.PathSeparator)) {
+		t.Fatalf("default runtime root must not be under repo: %q", paths.RuntimeRoot)
+	}
+	if !strings.HasPrefix(paths.BuildRoot, repo+string(os.PathSeparator)) {
+		t.Fatalf("default build root must be under repo: %q", paths.BuildRoot)
+	}
+}
+
+func TestWaitForAuthServiceHealthyToleratesStalePIDDuringRestart(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "auth-service.pid")
+	if err := os.WriteFile(pidFile, []byte("2147483647\n"), 0o600); err != nil {
+		t.Fatalf("write stale auth-service pid: %v", err)
+	}
+
+	manager := NewRuntimeManager(&fakeRunner{t: t}, filepath.Join(t.TempDir(), "local-runtime-manager"))
+	probeCount := 0
+	manager.probeAuth = func(_ int, _ time.Duration) bool {
+		probeCount++
+		// The old implementation failed after three 500ms checks of the stale
+		// PID, before the replacement service had time to become healthy.
+		return probeCount >= 4
+	}
+
+	if err := manager.waitForAuthServiceHealthy(context.Background(), 18000, 3*time.Second, pidFile); err != nil {
+		t.Fatalf("wait for restarted auth-service: %v", err)
+	}
+}
+
+func TestWaitForAuthServiceHealthyReportsObservedProcessExit(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "auth-service.pid")
+	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+		t.Fatalf("write live auth-service pid: %v", err)
+	}
+
+	manager := NewRuntimeManager(&fakeRunner{t: t}, filepath.Join(t.TempDir(), "local-runtime-manager"))
+	manager.probeAuth = func(_ int, _ time.Duration) bool { return false }
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		_ = os.Remove(pidFile)
+	}()
+
+	err := manager.waitForAuthServiceHealthy(context.Background(), 18000, 3*time.Second, pidFile)
+	if err == nil || !strings.Contains(err.Error(), "auth-service process exited before becoming healthy") {
+		t.Fatalf("wait error = %v, want observed process exit", err)
+	}
+}
+
+func TestRuntimePathLayoutForSupportedPlatforms(t *testing.T) {
+	home := filepath.Join("Users", "me")
+	tests := []struct {
+		name     string
+		goos     string
+		localApp string
+		wantData string
+		wantLog  string
+		wantImp  string
+	}{
+		{
+			name:     "darwin",
+			goos:     "darwin",
+			wantData: filepath.Join(home, "Library", "Application Support", "LazyMind"),
+			wantLog:  filepath.Join(home, "Library", "Logs", "LazyMind"),
+			wantImp:  filepath.Join(home, "Documents", "LazyMind"),
+		},
+		{
+			name:     "windows local app data",
+			goos:     "windows",
+			localApp: filepath.Join("Users", "me", "AppData", "Local"),
+			wantData: filepath.Join("Users", "me", "AppData", "Local", "LazyMind"),
+			wantLog:  filepath.Join("Users", "me", "AppData", "Local", "LazyMind", "Logs"),
+			wantImp:  filepath.Join(home, "Documents", "LazyMind"),
+		},
+		{
+			name:     "linux xdg",
+			goos:     "linux",
+			wantData: filepath.Join(home, ".local", "share", "LazyMind"),
+			wantLog:  filepath.Join(home, ".local", "state", "LazyMind", "logs"),
+			wantImp:  filepath.Join(home, "Documents", "LazyMind"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			layout := runtimePathLayoutForGOOS(tt.goos, home, tt.localApp, "", "", "")
+			if layout.DataRoot != tt.wantData {
+				t.Fatalf("data root = %q, want %q", layout.DataRoot, tt.wantData)
+			}
+			if layout.LogsRoot != tt.wantLog {
+				t.Fatalf("logs root = %q, want %q", layout.LogsRoot, tt.wantLog)
+			}
+			if layout.LocalImportRoot != tt.wantImp {
+				t.Fatalf("import root = %q, want %q", layout.LocalImportRoot, tt.wantImp)
+			}
+		})
+	}
+}
+
+func TestRuntimeConfigHonorsLegacyExplicitRuntimeRoot(t *testing.T) {
+	repo := t.TempDir()
+	runtimeRoot := filepath.Join(repo, "local", "runtime")
+	t.Setenv(runtimeRootEnvVar, runtimeRoot)
+	t.Setenv("LAZYMIND_FILE_WATCHER_BASE_ROOT", "")
+	writeComposeFixture(t, repo)
+	_, paths, err := NewRuntimeConfig("", repo)
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	if paths.RuntimeRoot != runtimeRoot {
+		t.Fatalf("runtime root = %q, want %q", paths.RuntimeRoot, runtimeRoot)
+	}
+	if paths.FileWatcherBaseRoot != filepath.Join(runtimeRoot, "data", "stores", "scan", "file-watcher") {
+		t.Fatalf("file watcher base root = %q", paths.FileWatcherBaseRoot)
+	}
+}
+
+func TestRuntimeConfigMergesDesktopExtraAllowedRoots(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	extra := filepath.Join(t.TempDir(), ".codex", "skills")
+	extraJSON, err := json.Marshal([]string{extra})
+	if err != nil {
+		t.Fatalf("marshal extra allowed roots: %v", err)
+	}
+	t.Setenv("LAZYMIND_FILE_WATCHER_EXTRA_ALLOWED_ROOTS_JSON", string(extraJSON))
+
+	cfg, _, err := NewRuntimeConfig(defaultProfileValue(), repo)
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	if len(cfg.FileWatcher.AllowedRoots) != 2 {
+		t.Fatalf("allowed roots = %#v", cfg.FileWatcher.AllowedRoots)
+	}
+	if cfg.FileWatcher.AllowedRoots[0] != cfg.FileWatcher.WatchHostDir || cfg.FileWatcher.AllowedRoots[1] != extra {
+		t.Fatalf("allowed roots = %#v", cfg.FileWatcher.AllowedRoots)
+	}
+}
+
+func TestRuntimeConfigUsesDesktopRootsAndManifestPaths(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	resources := filepath.Join(repo, "desktop-runtime")
+	runtimeRoot := filepath.Join(t.TempDir(), "desktop-state")
+	if err := os.MkdirAll(filepath.Join(resources, "bin"), 0o755); err != nil {
+		t.Fatalf("mkdir resources: %v", err)
+	}
+	manifest := `{
+	  "version": 1,
+	  "profile": "desktop",
+	  "platform": "` + runtime.GOOS + `",
+	  "arch": "` + runtime.GOARCH + `",
+	  "binaries": {
+	    "process-supervisor": "bin/process-compose",
+	    "local-proxy": "bin/local-proxy",
+	    "core": "bin/core",
+	    "scan-control-plane": "bin/scan-control-plane",
+	    "file-watcher": "bin/file-watcher",
+	    "caddy": "bin/caddy"
+	  },
+	  "paths": {
+	    "pythonRuntime": "python/runtime",
+	    "authServiceVenv": "python/auth-service",
+	    "channelGatewayVenv": "python/channel-gateway",
+	    "algorithmVenv": "python/algorithm",
+	    "localProxyConfig": "app/local/local-proxy/configs/cloud-replace-kong.yaml"
+	  }
+	}`
+	if err := os.WriteFile(filepath.Join(resources, runtimeManifestFileName), []byte(manifest), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	cfg, paths, err := NewRuntimeConfigWithOptions(RuntimeConfigOptions{
+		Profile:       "desktop",
+		OwnerToken:    "desktop-test-owner",
+		RepoRoot:      repo,
+		RuntimeRoot:   runtimeRoot,
+		ResourcesRoot: resources,
+	})
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	if cfg.Profile != "desktop" {
+		t.Fatalf("profile = %q, want desktop", cfg.Profile)
+	}
+	if paths.RuntimeRoot != runtimeRoot {
+		t.Fatalf("runtime root = %q, want %q", paths.RuntimeRoot, runtimeRoot)
+	}
+	if paths.ResourcesRoot != resources {
+		t.Fatalf("resources root = %q, want %q", paths.ResourcesRoot, resources)
+	}
+	if paths.BuildRoot != resources {
+		t.Fatalf("build root = %q, want %q", paths.BuildRoot, resources)
+	}
+	if paths.ProcessComposeBin != filepath.Join(resources, "bin", "process-compose") {
+		t.Fatalf("process-compose bin = %q", paths.ProcessComposeBin)
+	}
+	if paths.LocalProxyBin != filepath.Join(resources, "bin", "local-proxy") {
+		t.Fatalf("local-proxy bin = %q", paths.LocalProxyBin)
+	}
+	if paths.AlgorithmPython != venvExecutable(filepath.Join(resources, "python", "algorithm"), "python") {
+		t.Fatalf("algorithm python = %q", paths.AlgorithmPython)
+	}
+	if paths.ChannelGatewayVenvDir != filepath.Join(resources, "python", "channel-gateway") {
+		t.Fatalf("channel gateway venv = %q", paths.ChannelGatewayVenvDir)
+	}
+	if paths.FileWatcherBaseRoot != filepath.Join(runtimeRoot, "data", "stores", "scan", "file-watcher") {
+		t.Fatalf("file watcher base root = %q", paths.FileWatcherBaseRoot)
+	}
+	wantLogsDir := defaultRuntimePathLayout().LogsRoot
+	if paths.LogsDir != wantLogsDir {
+		t.Fatalf("desktop logs dir = %q, want platform log root %q", paths.LogsDir, wantLogsDir)
+	}
+	if strings.HasPrefix(paths.FileWatcherBaseRoot, repo+string(os.PathSeparator)) {
+		t.Fatalf("desktop file watcher base root must not be under bundled repo root: %q", paths.FileWatcherBaseRoot)
+	}
+}
+
+func TestRuntimeConfigKeepsRuntimeDataUnderLocalRoot(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	_, paths, err := NewRuntimeConfig("", repo)
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	wantUploadRoot := filepath.Join(paths.RuntimeRoot, "data", "core", "uploads")
+	if paths.UploadRoot != wantUploadRoot {
+		t.Fatalf("upload root = %q, want %q", paths.UploadRoot, wantUploadRoot)
+	}
+	for name, path := range map[string]string{
+		"upload root":    paths.UploadRoot,
+		"lazyllm temp":   paths.LazyLLMTempDir,
+		"ocr cache":      paths.OCRCacheDir,
+		"subagent data":  paths.SubagentDataDir,
+		"trace data":     paths.TracesDir,
+		"algorithm home": paths.AlgorithmHome,
+		"milvus lite db": paths.MilvusLiteDBPath,
+		"core sqlite db": paths.CoreDBPath,
+		"lazyllm sqlite": paths.LazyLLMDBPath,
+		"scan sqlite db": paths.ScanDBPath,
+	} {
+		if !strings.HasPrefix(path, paths.RuntimeRoot+string(os.PathSeparator)) {
+			t.Fatalf("%s path %q is outside runtime root %q", name, path, paths.RuntimeRoot)
+		}
+	}
+}
+
+func TestEnsurePathUnderRootResolvesSymlinks(t *testing.T) {
+	temp := t.TempDir()
+	realRoot := filepath.Join(temp, "real-root")
+	linkRoot := filepath.Join(temp, "link-root")
+	python := filepath.Join(realRoot, "runtimes", "python", "bin", "python3")
+	if err := os.MkdirAll(filepath.Dir(python), 0o755); err != nil {
+		t.Fatalf("mkdir python dir: %v", err)
+	}
+	if err := os.WriteFile(python, []byte("python"), 0o755); err != nil {
+		t.Fatalf("write python: %v", err)
+	}
+	if err := createDirectoryLink(realRoot, linkRoot); err != nil {
+		t.Fatalf("symlink runtime root: %v", err)
+	}
+	linkPython := filepath.Join(linkRoot, "runtimes", "python", "bin", "python3")
+	if err := ensurePathUnderRoot(linkPython, realRoot); err != nil {
+		t.Fatalf("symlinked path should be under real root: %v", err)
+	}
+	if err := ensurePathUnderRoot(python, linkRoot); err != nil {
+		t.Fatalf("real path should be under symlinked root: %v", err)
+	}
+}
+
+func TestRegisterLocalProcessConcurrent(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	_, paths, err := NewRuntimeConfig("", repo)
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	if err := paths.EnsureAllDirs(); err != nil {
+		t.Fatalf("ensure dirs: %v", err)
+	}
+	done := make(chan struct{}, 20)
+	for i := 0; i < cap(done); i++ {
+		i := i
+		go func() {
+			registerLocalProcess(paths, "svc-"+strconv.Itoa(i), 9000+i, []int{18000 + i}, []string{"cmd", strconv.Itoa(i)})
+			done <- struct{}{}
+		}()
+	}
+	for i := 0; i < cap(done); i++ {
+		<-done
+	}
+	registry, err := readLocalProcessRegistry(paths)
+	if err != nil {
+		t.Fatalf("read registry: %v", err)
+	}
+	if len(registry.Processes) != cap(done) {
+		t.Fatalf("registry process count = %d, want %d: %#v", len(registry.Processes), cap(done), registry.Processes)
+	}
+}
+
+func TestEnsureAllDirsCreatesRuntimeDataDirs(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	_, paths, err := NewRuntimeConfig("", repo)
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	if err := paths.EnsureAllDirs(); err != nil {
+		t.Fatalf("ensure all dirs: %v", err)
+	}
+	for _, path := range []string{
+		paths.UploadRoot,
+		paths.LazyLLMTempDir,
+		paths.OCRCacheDir,
+		paths.SubagentDataDir,
+		paths.TracesDir,
+		paths.LazyLLMHome,
+		paths.EvoDataDir,
+	} {
+		if info, err := os.Stat(path); err != nil || !info.IsDir() {
+			t.Fatalf("expected runtime data dir %s: info=%v err=%v", path, info, err)
+		}
+	}
+}
+
+func TestEnsureRuntimeDirsCreatesDocumentScanDirectory(t *testing.T) {
+	repo := t.TempDir()
+	watchDir := filepath.Join(t.TempDir(), "Documents", "LazyMind")
+	t.Setenv("LAZYMIND_FILE_WATCHER_WATCH_HOST_DIR", watchDir)
+	writeComposeFixture(t, repo)
+	cfg, paths, err := NewRuntimeConfig("desktop", repo)
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	if err := ensureRuntimeDirs(cfg, paths); err != nil {
+		t.Fatalf("ensure runtime dirs: %v", err)
+	}
+	if info, err := os.Stat(watchDir); err != nil || !info.IsDir() {
+		t.Fatalf("expected document scan directory %s: info=%v err=%v", watchDir, info, err)
+	}
+}
+
+func TestEnsureAllDirsUsesOnlyApprovedTopLevelDirs(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	_, paths, err := NewRuntimeConfig("", repo)
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	if err := paths.EnsureAllDirs(); err != nil {
+		t.Fatalf("ensure all dirs: %v", err)
+	}
+	allowed := map[string]bool{
+		"cache":     true,
+		"config":    true,
+		"data":      true,
+		"generated": true,
+		"logs":      true,
+		"run":       true,
+		"state":     true,
+		"tmp":       true,
+	}
+	entries, err := os.ReadDir(paths.RuntimeRoot)
+	if err != nil {
+		t.Fatalf("read runtime root: %v", err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if !allowed[strings.ToLower(entry.Name())] {
+			t.Fatalf("unexpected top-level runtime dir %q", entry.Name())
+		}
+	}
+}
+
+func TestEnsureAllDirsDoesNotCreateDesktopBuildDirsInResources(t *testing.T) {
+	repo := t.TempDir()
+	resources := filepath.Join(t.TempDir(), "runtime")
+	runtimeRoot := filepath.Join(t.TempDir(), "state")
+	writeComposeFixture(t, repo)
+	if err := os.MkdirAll(resources, 0o755); err != nil {
+		t.Fatalf("mkdir resources: %v", err)
+	}
+	_, paths, err := NewRuntimeConfigWithOptions(RuntimeConfigOptions{
+		Profile:       "desktop",
+		RepoRoot:      repo,
+		RuntimeRoot:   runtimeRoot,
+		ResourcesRoot: resources,
+	})
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	if err := paths.EnsureAllDirs(); err != nil {
+		t.Fatalf("ensure all dirs: %v", err)
+	}
+	for _, path := range []string{
+		paths.BinDir,
+		paths.DepsDir,
+		paths.PythonRuntimeDir,
+		paths.NodeRuntimeDir,
+		paths.AuthServiceVenvDir,
+		filepath.Dir(paths.AlgorithmVenv),
+		paths.FrontendNodeModules,
+	} {
+		if _, err := os.Stat(path); err == nil {
+			t.Fatalf("desktop bundled build dir should not be created: %s", path)
+		} else if !os.IsNotExist(err) {
+			t.Fatalf("stat %s: %v", path, err)
+		}
+	}
+	if _, err := os.Stat(paths.DataDir); err != nil {
+		t.Fatalf("runtime data dir should still be created: %v", err)
+	}
+}
+
+func TestCLIAcceptsDesktopProfileFlag(t *testing.T) {
+	cli := NewCLI(io.Discard, io.Discard, &fakeRunner{t: t}, filepath.Join(t.TempDir(), "local-runtime-manager"))
+	if err := cli.Run(context.Background(), []string{"status", "--profile", "desktop"}); err != nil {
+		t.Fatalf("expected desktop profile flag to be accepted: %v", err)
+	}
+	if err := cli.Run(context.Background(), []string{"status", "--profile", "linux-browser"}); err == nil {
+		t.Fatal("expected invalid profile flag to be rejected")
+	}
+}
+
+func TestRuntimeGuardRunsDownWhenOwnerExits(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	cfg, paths, err := NewRuntimeConfig("", repo)
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	calls := 0
+	aliveCalls := 0
+	err = runRuntimeGuard(context.Background(), cfg, paths, 12345, time.Millisecond,
+		func(pid int) bool {
+			if pid != 12345 {
+				t.Fatalf("owner pid = %d, want 12345", pid)
+			}
+			aliveCalls++
+			return aliveCalls == 1
+		},
+		func(_ context.Context, gotCfg RuntimeConfig, gotPaths RuntimePaths) error {
+			calls++
+			if gotCfg.Profile != cfg.Profile || gotPaths.RuntimeRoot != paths.RuntimeRoot {
+				t.Fatalf("guard passed unexpected runtime config")
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("runtime guard: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("down calls = %d, want 1", calls)
+	}
+}
+
+func TestRuntimeGuardContextCancelDoesNotRunDown(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	cfg, paths, err := NewRuntimeConfig("", repo)
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	calls := 0
+	err = runRuntimeGuard(ctx, cfg, paths, 12345, time.Millisecond,
+		func(int) bool { return true },
+		func(context.Context, RuntimeConfig, RuntimePaths) error {
+			calls++
+			return nil
+		},
+	)
+	if err == nil {
+		t.Fatal("expected context cancellation")
+	}
+	if calls != 0 {
+		t.Fatalf("down calls = %d, want 0", calls)
+	}
+}
+
+func TestProcessComposeGeneratedConfigContainsOnlyHostProcesses(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	cfg, paths, err := NewRuntimeConfig("", repo)
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	manager := NewRuntimeManager(&fakeRunner{t: t}, filepath.Join(repo, "local", ".bin", "local-runtime-manager"))
+	var out strings.Builder
+	if err := manager.processCompose.WriteGeneratedConfig(&out, repo, paths, cfg, paths.RunDirTokenFile, cfg.ProcessComposePort); err != nil {
+		t.Fatalf("write generated config: %v", err)
+	}
+	var parsed processComposeConfig
+	if err := yaml.Unmarshal([]byte(out.String()), &parsed); err != nil {
+		t.Fatalf("generated config invalid yaml: %v\n%s", err, out.String())
+	}
+	for _, forbidden := range []string{legacyComposeServiceName, "internal " + "compose-", "--" + "profile"} {
+		if strings.Contains(out.String(), forbidden) {
+			t.Fatalf("generated config contains %q:\n%s", forbidden, out.String())
+		}
+	}
+	for _, name := range []string{localProxyProcessName, authServiceProcessName, channelGatewayProcessName, coreProcessName, scanControlPlaneProcessName, fileWatcherProcessName, frontendProcessName, milvusLiteProcessName, docServerProcessName, processorServerProcessName, processorWorkerProcessName, algoProcessName, chatProcessName} {
+		proc, ok := parsed.Processes[name]
+		if !ok {
+			t.Fatalf("missing process %s", name)
+		}
+		if proc.Namespace != "host" {
+			t.Fatalf("process %s namespace = %q, want host", name, proc.Namespace)
+		}
+		if len(proc.Environment) == 0 {
+			t.Fatalf("process %s has no explicit environment", name)
+		}
+		if strings.HasPrefix(proc.Command, "env ") {
+			t.Fatalf("process %s uses POSIX env command: %q", name, proc.Command)
+		}
+		if runtime.GOOS == "windows" && strings.Contains(proc.Command, "'") {
+			t.Fatalf("process %s command is not cmd-compatible: %q", name, proc.Command)
+		}
+	}
+}
+
+func TestInstallerWarmupGeneratesReducedProcessGraph(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	cfg, paths, err := NewRuntimeConfigWithOptions(RuntimeConfigOptions{
+		Profile:         defaultProfileValue(),
+		RepoRoot:        repo,
+		MaintenanceMode: installerWarmupMaintenanceMode,
+	})
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	manager := NewRuntimeManager(&fakeRunner{t: t}, filepath.Join(repo, "local", ".bin", "local-runtime-manager"))
+	var out strings.Builder
+	if err := manager.processCompose.WriteGeneratedConfig(&out, repo, paths, cfg, paths.RunDirTokenFile, cfg.ProcessComposePort); err != nil {
+		t.Fatalf("write generated config: %v", err)
+	}
+	var parsed processComposeConfig
+	if err := yaml.Unmarshal([]byte(out.String()), &parsed); err != nil {
+		t.Fatalf("generated config invalid yaml: %v\n%s", err, out.String())
+	}
+	for _, name := range []string{
+		localProxyProcessName,
+		authServiceProcessName,
+		channelGatewayProcessName,
+		coreProcessName,
+		frontendProcessName,
+		milvusLiteProcessName,
+		processorServerProcessName,
+		algoProcessName,
+		docServerProcessName,
+		chatProcessName,
+	} {
+		if _, ok := parsed.Processes[name]; !ok {
+			t.Fatalf("warmup graph missing process %s", name)
+		}
+	}
+	for _, name := range []string{fileWatcherProcessName, scanControlPlaneProcessName, processorWorkerProcessName} {
+		if _, ok := parsed.Processes[name]; ok {
+			t.Fatalf("warmup graph unexpectedly contains process %s", name)
+		}
+	}
+	for name, process := range parsed.Processes {
+		for _, item := range process.Environment {
+			if strings.HasPrefix(item, "LAZYMIND_MAINTENANCE_MODE=") {
+				t.Fatalf("process %s received installer scenario environment: %s", name, item)
+			}
+		}
+	}
+	if !environmentContains(
+		parsed.Processes[chatProcessName].Environment,
+		installerWarmupSkipProcessorWorkerEnvVar+"=true",
+	) {
+		t.Fatalf("warmup Chat environment missing %s", installerWarmupSkipProcessorWorkerEnvVar)
+	}
+}
+
+func environmentContains(environment []string, want string) bool {
+	for _, item := range environment {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestInstallerWarmupDoesNotCreateFileWatcherImportDirectory(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	cfg, paths, err := NewRuntimeConfigWithOptions(RuntimeConfigOptions{
+		Profile:         defaultProfileValue(),
+		RepoRoot:        repo,
+		MaintenanceMode: installerWarmupMaintenanceMode,
+	})
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	cfg.FileWatcher.WatchHostDir = filepath.Join(t.TempDir(), "Documents", "LazyMind")
+	if err := ensureRuntimeDirs(cfg, paths); err != nil {
+		t.Fatalf("ensure runtime dirs: %v", err)
+	}
+	if _, err := os.Stat(cfg.FileWatcher.WatchHostDir); !os.IsNotExist(err) {
+		t.Fatalf("warmup touched file watcher import directory %q: %v", cfg.FileWatcher.WatchHostDir, err)
+	}
+}
+
+func TestProcessComposeDesktopUsesHiddenWindowsShellWrapper(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows-specific process-compose shell")
+	}
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	cfg, paths, err := NewRuntimeConfig("", repo)
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	cfg.Profile = "desktop"
+	execPath := filepath.Join(repo, "local-runtime-manager.exe")
+	manager := NewRuntimeManager(&fakeRunner{t: t}, execPath)
+	var out strings.Builder
+	if err := manager.processCompose.WriteGeneratedConfig(&out, repo, paths, cfg, paths.RunDirTokenFile, cfg.ProcessComposePort); err != nil {
+		t.Fatalf("write generated config: %v", err)
+	}
+
+	var parsed processComposeConfig
+	if err := yaml.Unmarshal([]byte(out.String()), &parsed); err != nil {
+		t.Fatalf("generated config invalid yaml: %v", err)
+	}
+	if parsed.Shell == nil {
+		t.Fatal("Desktop config has no Windows shell wrapper")
+	}
+	if parsed.Shell.Command != execPath || parsed.Shell.Argument != "shell" {
+		t.Fatalf("shell = %#v, want command %q argument shell", parsed.Shell, execPath)
+	}
+	for name, process := range parsed.Processes {
+		if !strings.HasPrefix(process.Command, "internal ") {
+			t.Fatalf("Desktop process %s command = %q, want internal sidecar command", name, process.Command)
+		}
+	}
+}
+
+func TestProcessComposeGOBINIsUnderLocalBuildRoot(t *testing.T) {
+	repo := t.TempDir()
+	buildRoot := filepath.Join(t.TempDir(), "build")
+	paths := RuntimePaths{
+		RepoRoot:          repo,
+		RuntimeRoot:       filepath.Join(t.TempDir(), "runtime"),
+		BuildRoot:         buildRoot,
+		ProcessComposeBin: filepath.Join(buildRoot, "bin", "process-compose"),
+	}
+	got, err := processComposeGOBIN(paths)
+	if err != nil {
+		t.Fatalf("process compose GOBIN: %v", err)
+	}
+	want := filepath.Dir(paths.ProcessComposeBin)
+	if got != want {
+		t.Fatalf("GOBIN = %q, want %q", got, want)
+	}
+}
+
+func TestProcessComposeDesktopRequiresBundledBinaryUnderResourcesRoot(t *testing.T) {
+	root := t.TempDir()
+	wrongProcessComposeBin := filepath.Join(root, "runtime", "bin", "process-compose")
+	if err := os.MkdirAll(filepath.Dir(wrongProcessComposeBin), 0o755); err != nil {
+		t.Fatalf("mkdir wrong process-compose dir: %v", err)
+	}
+	if err := os.WriteFile(wrongProcessComposeBin, []byte("process-compose"), 0o755); err != nil {
+		t.Fatalf("write wrong process-compose binary: %v", err)
+	}
+	paths := RuntimePaths{
+		RepoRoot:           filepath.Join(root, "app"),
+		RuntimeRoot:        filepath.Join(root, "runtime"),
+		ResourcesRoot:      filepath.Join(root, "resources"),
+		ProcessComposeBin:  wrongProcessComposeBin,
+		ProcessComposeHome: filepath.Join(root, "runtime", "data", "homes", "process-compose"),
+	}
+	manager := NewProcessComposeManager(&ExecRunner{}, filepath.Join(paths.ResourcesRoot, "bin", "local-runtime-manager"))
+
+	err := manager.EnsureBinary(context.Background(), paths)
+	if err == nil {
+		t.Fatalf("expected missing desktop process-compose outside resources root to fail")
+	}
+	if !strings.Contains(err.Error(), "runtime resources") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestProcessComposeUsesLocalConfigHome(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	cfg, paths, err := NewRuntimeConfig("", repo)
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	runner := &fakeRunner{t: t}
+	manager := NewProcessComposeManager(runner, filepath.Join(paths.BinDir, "local-runtime-manager"))
+	if err := manager.Up(context.Background(), cfg, paths); err != nil {
+		t.Fatalf("process compose up: %v", err)
+	}
+	runner.assertCommandCount(1)
+	env := map[string]string{}
+	for _, item := range runner.calls[0].Env {
+		k, v, ok := strings.Cut(item, "=")
+		if ok {
+			env[k] = v
+		}
+	}
+	if env["HOME"] != paths.ProcessComposeHome {
+		t.Fatalf("HOME = %q, want %q", env["HOME"], paths.ProcessComposeHome)
+	}
+	if env["XDG_CONFIG_HOME"] != paths.ConfigDir {
+		t.Fatalf("XDG_CONFIG_HOME = %q, want %q", env["XDG_CONFIG_HOME"], paths.ConfigDir)
+	}
+}
+
+func TestProcessComposeDownStreamsOutputWhenRunnerSupportsIt(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	cfg, paths, err := NewRuntimeConfig("", repo)
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	runner := &fakeStreamRunner{fakeRunner: fakeRunner{t: t}}
+	runner.streamHandlers = append(runner.streamHandlers, func(cmd Command) error {
+		assertCommand(t, cmd, processComposeCommand(paths),
+			"-p", strconv.Itoa(cfg.ProcessComposePort),
+			"--token-file", paths.RunDirTokenFile,
+			"down",
+		)
+		return nil
+	})
+	manager := NewProcessComposeManager(runner, filepath.Join(paths.BinDir, "local-runtime-manager"))
+	if err := manager.Down(context.Background(), cfg, paths, io.Discard, io.Discard); err != nil {
+		t.Fatalf("process-compose down: %v", err)
+	}
+	if len(runner.streamCalls) != 1 {
+		t.Fatalf("expected 1 stream call got %d", len(runner.streamCalls))
+	}
+	runner.assertCommandCount(0)
+}
+
+func TestRuntimeManagerUsesDefaultProcessComposeDownTimeout(t *testing.T) {
+	t.Setenv(processComposeDownTimeoutEnvVar, "")
+	t.Setenv(localDownTimeoutEnvVar, "150s")
+	manager := NewRuntimeManager(&fakeRunner{t: t}, filepath.Join(t.TempDir(), "local-runtime-manager"))
+
+	if got, want := manager.effectiveProcessComposeDownTimeout(), 60*time.Second; got != want {
+		t.Fatalf("process-compose down timeout = %s, want %s", got, want)
+	}
+}
+
+func TestRuntimeManagerCapsProcessComposeDownTimeoutAtOverallDownTimeout(t *testing.T) {
+	t.Setenv(processComposeDownTimeoutEnvVar, "30s")
+	t.Setenv(localDownTimeoutEnvVar, "5s")
+	manager := NewRuntimeManager(&fakeRunner{t: t}, filepath.Join(t.TempDir(), "local-runtime-manager"))
+
+	if got, want := manager.effectiveProcessComposeDownTimeout(), 5*time.Second; got != want {
+		t.Fatalf("process-compose down timeout = %s, want %s", got, want)
+	}
+}
+
+func TestProcessComposeEnvPinsAllPlannedPorts(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	cfg, paths, err := NewRuntimeConfig("", repo)
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	env := map[string]string{}
+	for _, item := range runtimeCommandEnv(paths, cfg) {
+		k, v, ok := strings.Cut(item, "=")
+		if ok {
+			env[k] = v
+		}
+	}
+	wants := map[string]int{
+		processComposePortEnvVar:     cfg.ProcessComposePort,
+		frontendPortEnvVar:           cfg.FrontendPort,
+		localProxyPortEnvVar:         cfg.LocalProxy.Port,
+		localAuthPortEnvVar:          cfg.AuthService.Port,
+		localCorePortEnvVar:          cfg.LocalProxy.CoreHostPort,
+		localDocPortEnvVar:           cfg.Algorithm.DocPort,
+		localProcessorPortEnvVar:     cfg.Algorithm.ProcessorPort,
+		localAlgoPortEnvVar:          cfg.Algorithm.AlgoPort,
+		localWorkerPortEnvVar:        cfg.Algorithm.WorkerPort,
+		localChatPortEnvVar:          cfg.Algorithm.ChatPort,
+		localMilvusPortEnvVar:        cfg.ModeProfile.VectorStore.Port,
+		routerPortPoolStartEnvVar:    cfg.Algorithm.RouterPortPoolStart,
+		routerPortPoolEndEnvVar:      cfg.Algorithm.RouterPortPoolEnd,
+		routerPortsPerInstanceEnvVar: defaultRouterPortsPerInstance,
+	}
+	for key, want := range wants {
+		if env[key] != strconv.Itoa(want) {
+			t.Fatalf("%s = %q, want %d", key, env[key], want)
+		}
+	}
+	if env[localPortsPinnedEnvVar] != "1" {
+		t.Fatalf("%s = %q, want 1", localPortsPinnedEnvVar, env[localPortsPinnedEnvVar])
+	}
+	if env[localBuildRootEnvVar] != paths.BuildRoot {
+		t.Fatalf("%s = %q, want %q", localBuildRootEnvVar, env[localBuildRootEnvVar], paths.BuildRoot)
+	}
+	if env["HOME"] != paths.ServiceHome {
+		t.Fatalf("HOME = %q, want %q", env["HOME"], paths.ServiceHome)
+	}
+	if env["XDG_CONFIG_HOME"] != paths.ConfigDir {
+		t.Fatalf("XDG_CONFIG_HOME = %q, want %q", env["XDG_CONFIG_HOME"], paths.ConfigDir)
+	}
+}
+
+func TestRuntimeConfigMovesRouterPortPoolWhenDefaultRangeUnavailable(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	listeners := occupyLocalPorts(t, defaultRouterPortPoolStart)
+	defer func() {
+		for _, ln := range listeners {
+			_ = ln.Close()
+		}
+	}()
+	cfg, _, err := NewRuntimeConfig("", repo)
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	if cfg.Algorithm.RouterPortPoolStart == defaultRouterPortPoolStart {
+		t.Fatalf("router pool start did not move from occupied default %d", defaultRouterPortPoolStart)
+	}
+	if cfg.Algorithm.RouterPortPoolEnd != cfg.Algorithm.RouterPortPoolStart+defaultRouterPortsPerInstance-1 {
+		t.Fatalf("router pool end = %d, want start+%d", cfg.Algorithm.RouterPortPoolEnd, defaultRouterPortsPerInstance-1)
+	}
+}
+
+func TestRuntimeConfigMovesFrontendPortWhenPreferredPortIsServing(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	listeners := occupyPortsOn(t, "127.0.0.1", defaultFrontendPort)
+	defer func() {
+		for _, ln := range listeners {
+			_ = ln.Close()
+		}
+	}()
+	t.Setenv(frontendPortEnvVar, strconv.Itoa(defaultFrontendPort))
+	t.Setenv(localPortsPinnedEnvVar, "false")
+
+	cfg, _, err := NewRuntimeConfig("", repo)
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	if cfg.FrontendPort == defaultFrontendPort {
+		t.Fatalf("frontend port did not move from occupied preferred port %d", defaultFrontendPort)
+	}
+}
+
+func TestKillStaleRuntimeProcessesStopsScannerOrphan(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	cfg, paths, err := NewRuntimeConfigWithOptions(RuntimeConfigOptions{
+		RepoRoot:    repo,
+		RuntimeRoot: filepath.Join(t.TempDir(), "runtime"),
+	})
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	if err := paths.EnsureAllDirs(); err != nil {
+		t.Fatalf("ensure dirs: %v", err)
+	}
+	cmd := exec.Command("sleep", "60")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("sleep command unavailable: %v", err)
+	}
+	waitDone := make(chan struct{})
+	go func() {
+		_, _ = cmd.Process.Wait()
+		close(waitDone)
+	}()
+	defer func() {
+		if processAlive(cmd.Process.Pid) {
+			_ = cmd.Process.Kill()
+		}
+		<-waitDone
+	}()
+	manager := NewRuntimeManager(&fakeRunner{t: t}, filepath.Join(paths.BinDir, "local-runtime-manager"))
+	manager.processScanner = func(paths RuntimePaths) ([]LocalProcessRecord, error) {
+		return []LocalProcessRecord{{
+			Service:     "test-orphan",
+			PID:         cmd.Process.Pid,
+			RepoRoot:    paths.RepoRoot,
+			RuntimeRoot: paths.RuntimeRoot,
+		}}, nil
+	}
+	if err := manager.killStaleRuntimeProcesses(context.Background(), cfg, paths); err != nil {
+		t.Fatalf("kill stale: %v", err)
+	}
+	<-waitDone
+	if processAlive(cmd.Process.Pid) {
+		t.Fatalf("expected orphan process %d to stop", cmd.Process.Pid)
+	}
+}
+
+func TestSelectLANIPv4SkipsLoopbackAndContainerBridges(t *testing.T) {
+	candidates := []lanIPv4Candidate{
+		{name: "lo", flags: net.FlagUp | net.FlagLoopback, ip: net.ParseIP("10.255.255.254")},
+		{name: "docker0", flags: net.FlagUp, ip: net.ParseIP("172.17.0.1")},
+		{name: "br-f16ec9f3bf18", flags: net.FlagUp, ip: net.ParseIP("172.20.0.1")},
+		{name: "eth0", flags: net.FlagUp, ip: net.ParseIP("172.24.189.31")},
+	}
+	if got := selectLANIPv4(candidates); got != "172.24.189.31" {
+		t.Fatalf("selectLANIPv4() = %q, want WSL eth0 address", got)
+	}
+}
+
+func TestDesktopProfileDoesNotRequireBundledLazyLLMSource(t *testing.T) {
+	repo := t.TempDir()
+	runner := &fakeRunner{t: t}
+	runner.handlers = append(runner.handlers, func(cmd Command) (CommandResult, error) {
+		t.Fatalf("desktop startup must not initialize LazyLLM source: %s %v", cmd.Name, cmd.Args)
+		return CommandResult{}, nil
+	})
+	if err := ensureLazyLLMSource(context.Background(), runner, repo, "desktop"); err != nil {
+		t.Fatalf("desktop source check: %v", err)
+	}
+	runner.assertCommandCount(0)
+}
+
+func TestRuntimeManagerUpRejectsForeignOwnerBeforePythonRelocation(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	cfg, paths, err := NewRuntimeConfigWithOptions(RuntimeConfigOptions{
+		Profile:       "desktop",
+		OwnerToken:    "new-desktop-owner",
+		RepoRoot:      repo,
+		RuntimeRoot:   filepath.Join(t.TempDir(), "runtime"),
+		ResourcesRoot: filepath.Join(t.TempDir(), "resources"),
+	})
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	if err := paths.EnsureAllDirs(); err != nil {
+		t.Fatalf("ensure dirs: %v", err)
+	}
+	state := defaultRuntimeState(cfg, cfg.ProcessComposePort, paths.RunDirTokenFile)
+	state.OwnerToken = "old-desktop-owner"
+	state.OverallStatus = "running"
+	state.Services[processComposeServiceName] = RuntimeServiceState{Kind: "host-supervisor", Status: "running"}
+	if err := writeRuntimeState(paths.StateFile, state); err != nil {
+		t.Fatalf("write state: %v", err)
+	}
+	manager := NewRuntimeManager(&fakeRunner{t: t}, filepath.Join(paths.BinDir, "local-runtime-manager"))
+	manager.probeAPI = func(int, time.Duration) bool { return true }
+	relocated := false
+	manager.relocatePythonVenvs = func(RuntimeConfig, RuntimePaths) error {
+		relocated = true
+		return nil
+	}
+	var output strings.Builder
+	manager.SetOutput(&output, &output)
+	err = manager.Up(context.Background(), cfg, paths)
+	if err == nil || !strings.Contains(err.Error(), "another application instance") {
+		t.Fatalf("runtime manager up error = %v, want owner conflict", err)
+	}
+	diagnostic, ok := runtimeDiagnosticFromError(err)
+	if !ok || diagnostic.Code != runtimeDiagnosticCodeInstanceConflict || diagnostic.LogPath != paths.LogFilePath {
+		t.Fatalf("owner diagnostic = %#v, want instance conflict with supervisor log", diagnostic)
+	}
+	if relocated {
+		t.Fatal("Python relocation ran before active owner rejection")
+	}
+	stateAfter, err := readRuntimeState(paths.StateFile)
+	if err != nil || stateAfter.OverallStatus != "running" || stateAfter.Diagnostic != nil {
+		t.Fatalf("foreign state was overwritten: state=%+v err=%v", stateAfter, err)
+	}
+	if !strings.Contains(output.String(), `"event":"startup.failed"`) || !strings.Contains(output.String(), "another application instance") {
+		t.Fatalf("startup output did not preserve ownership failure: %s", output.String())
+	}
+}
+
+func TestStartupCleanupFailureDoesNotReusePortConflictDiagnostic(t *testing.T) {
+	portErr := &startupPortConflictError{Service: "process-supervisor", Port: 19080, Cause: errors.New("claimed")}
+	cleanupErr := errors.New("process registry unreadable")
+	finalErr := fmt.Errorf("cleanup failed startup after %v: %w", portErr, cleanupErr)
+	if isStartupPortConflict(finalErr) || !errors.Is(finalErr, cleanupErr) {
+		t.Fatalf("cleanup error chain = %v, want cleanup cause without port conflict", finalErr)
+	}
+	wrapped := attachRuntimeDiagnostic(finalErr, runtimeFailureContext{
+		Operation: runtimeDiagnosticOperationUp, Phase: runtimeDiagnosticPhaseSupervisorStart,
+	})
+	diagnostic, ok := runtimeDiagnosticFromError(wrapped)
+	if !ok || diagnostic.Code != runtimeDiagnosticCodeUnknown {
+		t.Fatalf("cleanup diagnostic = %#v, want unknown", diagnostic)
+	}
+}
+
+func TestPinnedPortConflictDiagnosticIncludesPortContext(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	cfg, _, err := NewRuntimeConfig("", repo)
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.ProcessComposePort))
+	if err != nil {
+		t.Skipf("port %d is already in use: %v", cfg.ProcessComposePort, err)
+	}
+	defer listener.Close()
+	t.Setenv(localPortsPinnedEnvVar, "true")
+	portErr := validateRuntimeStartPorts(cfg)
+	var conflict *startupPortConflictError
+	if !errors.As(portErr, &conflict) {
+		t.Fatalf("port error = %T, want startupPortConflictError", portErr)
+	}
+	paths := RuntimePaths{LogFilePath: "process-compose.log"}
+	failureContext, ok := runtimePortConflictFailureContext(portErr, paths, 1)
+	if !ok || failureContext.Phase != runtimeDiagnosticPhasePreflight || failureContext.Service != "process-compose" {
+		t.Fatalf("port failure context = %+v, ok=%t", failureContext, ok)
+	}
+	diagnostic := classifyRuntimeFailure(portErr, failureContext)
+	if diagnostic.Code != runtimeDiagnosticCodePortConflict || diagnostic.LogPath != paths.LogFilePath || diagnostic.Details == nil {
+		t.Fatalf("port diagnostic = %+v", diagnostic)
+	}
+	if diagnostic.Details.Address != "127.0.0.1" || diagnostic.Details.Port != cfg.ProcessComposePort || diagnostic.Details.Attempt != 1 || diagnostic.Details.MaxAttempts != 1 {
+		t.Fatalf("port diagnostic details = %+v", diagnostic.Details)
+	}
+}
+
+func TestPinnedDuplicatePortDiagnosticIncludesConflictContext(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	cfg, paths, err := NewRuntimeConfig("", repo)
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	cfg.SQLiteServerPort = cfg.ProcessComposePort
+	t.Setenv(localPortsPinnedEnvVar, "true")
+	portErr := validateRuntimeStartPorts(cfg)
+	var conflict *startupPortConflictError
+	if !errors.As(portErr, &conflict) {
+		t.Fatalf("duplicate port error = %T, want startupPortConflictError", portErr)
+	}
+	if !strings.Contains(portErr.Error(), "process-compose") || !strings.Contains(portErr.Error(), sqliteServerProcessName) {
+		t.Fatalf("duplicate port error = %v, want both services", portErr)
+	}
+	failureContext, ok := runtimePortConflictFailureContext(portErr, paths, 1)
+	if !ok || failureContext.Service != sqliteServerProcessName || failureContext.Phase != runtimeDiagnosticPhasePreflight {
+		t.Fatalf("duplicate port failure context = %+v, ok=%t", failureContext, ok)
+	}
+	diagnostic := classifyRuntimeFailure(portErr, failureContext)
+	if diagnostic.Code != runtimeDiagnosticCodePortConflict || diagnostic.LogPath != paths.SQLiteServerLog || diagnostic.Details == nil {
+		t.Fatalf("duplicate port diagnostic = %+v", diagnostic)
+	}
+	if diagnostic.Details.Address != "127.0.0.1" || diagnostic.Details.Port != cfg.ProcessComposePort || diagnostic.Details.Attempt != 1 || diagnostic.Details.MaxAttempts != 1 {
+		t.Fatalf("duplicate port diagnostic details = %+v", diagnostic.Details)
+	}
+}
+
+func TestFinalPortConflictDiagnosticIncludesRetryContext(t *testing.T) {
+	t.Setenv(localPortsPinnedEnvVar, "false")
+	portErr := &startupPortConflictError{
+		Service: "core", Address: "127.0.0.1", Port: 18001, Cause: errors.New("claimed"),
+	}
+	paths := RuntimePaths{CoreLog: "core.log"}
+	failureContext, ok := runtimePortConflictFailureContext(portErr, paths, maxAutomaticPortStartupAttempts)
+	if !ok || failureContext.Attempt != 3 || failureContext.MaxAttempts != 3 {
+		t.Fatalf("retry failure context = %+v, ok=%t", failureContext, ok)
+	}
+	diagnostic := classifyRuntimeFailure(portErr, failureContext)
+	if diagnostic.Service != "core" || diagnostic.LogPath != paths.CoreLog || diagnostic.Details == nil {
+		t.Fatalf("retry port diagnostic = %+v", diagnostic)
+	}
+	if diagnostic.Details.Port != 18001 || diagnostic.Details.Attempt != 3 || diagnostic.Details.MaxAttempts != 3 {
+		t.Fatalf("retry port details = %+v", diagnostic.Details)
+	}
+}
+
+func TestStartRuntimeAttemptUsesAlgorithmPortConflictContext(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	cfg, paths, err := NewRuntimeConfigWithOptions(RuntimeConfigOptions{
+		Profile: "local", RepoRoot: repo, RuntimeRoot: filepath.Join(t.TempDir(), "runtime"),
+		ResourcesRoot: filepath.Join(t.TempDir(), "resources"), MaintenanceMode: installerWarmupMaintenanceMode,
+	})
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	if err := paths.EnsureAllDirs(); err != nil {
+		t.Fatalf("ensure runtime dirs: %v", err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve chat port: %v", err)
+	}
+	defer listener.Close()
+	cfg.Algorithm.ChatPort = listener.Addr().(*net.TCPAddr).Port
+	for _, spec := range buildRuntimeProcessPlan(cfg).AlgorithmServices {
+		if spec.Name != chatProcessName && !localPortAvailableOn("127.0.0.1", spec.Port) {
+			t.Skipf("algorithm port %d is already in use: %s", spec.Port, spec.Name)
+		}
+	}
+	manager := NewRuntimeManager(&fakeRunner{t: t}, filepath.Join(repo, "local-runtime-manager"))
+	manager.probeAPI = func(int, time.Duration) bool { return true }
+	manager.probeSQLiteServer = func(int, time.Duration) bool { return true }
+	manager.probeLocalProxy = func(int, time.Duration) bool { return true }
+	manager.probeAuth = func(int, time.Duration) bool { return true }
+	manager.probeChannelGateway = func(int, time.Duration) bool { return true }
+	manager.probeCore = func(int, time.Duration) bool { return true }
+	manager.waitHostReady = func(context.Context, RuntimeConfig, []AlgorithmServiceSpec) error {
+		return errors.New("chat health check timed out")
+	}
+	state := defaultRuntimeState(cfg, cfg.ProcessComposePort, paths.RunDirTokenFile)
+	err = manager.startRuntimeAttempt(context.Background(), 1, cfg, paths, &state)
+	if err == nil {
+		t.Fatal("startRuntimeAttempt unexpectedly succeeded")
+	}
+	diagnostic, ok := runtimeDiagnosticFromError(err)
+	if !ok || diagnostic.Code != runtimeDiagnosticCodePortConflict || diagnostic.Service != chatProcessName {
+		t.Fatalf("algorithm port diagnostic = %#v, ok=%t", diagnostic, ok)
+	}
+	if diagnostic.LogPath != algorithmLogPath(paths, chatProcessName) || diagnostic.Phase != runtimeDiagnosticPhaseServiceReadiness || diagnostic.Details == nil {
+		t.Fatalf("algorithm port diagnostic context = %#v", diagnostic)
+	}
+	if diagnostic.Details.Address != "127.0.0.1" || diagnostic.Details.Port != cfg.Algorithm.ChatPort || diagnostic.Details.Attempt != 1 || diagnostic.Details.MaxAttempts != maxAutomaticPortStartupAttempts {
+		t.Fatalf("algorithm port diagnostic details = %#v", diagnostic.Details)
+	}
+}
+
+func TestDesktopStartRuntimeAttemptClassifiesAlgorithmPortConflictWithoutRetry(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	cfg, paths, err := NewRuntimeConfigWithOptions(RuntimeConfigOptions{
+		Profile: "desktop", RepoRoot: repo, RuntimeRoot: filepath.Join(t.TempDir(), "runtime"),
+		ResourcesRoot: filepath.Join(t.TempDir(), "resources"),
+	})
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	if err := paths.EnsureAllDirs(); err != nil {
+		t.Fatalf("ensure runtime dirs: %v", err)
+	}
+	cfg.ModeProfile.VectorStore.ManagedProcess = false
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve chat port: %v", err)
+	}
+	defer listener.Close()
+	cfg.Algorithm.ChatPort = listener.Addr().(*net.TCPAddr).Port
+	for _, spec := range buildRuntimeProcessPlan(cfg).AlgorithmServices {
+		if spec.Name != chatProcessName && !localPortAvailableOn("127.0.0.1", spec.Port) {
+			t.Skipf("algorithm port %d is already in use: %s", spec.Port, spec.Name)
+		}
+	}
+	manager := NewRuntimeManager(&fakeRunner{t: t}, filepath.Join(repo, "local-runtime-manager"))
+	manager.probeAPI = func(int, time.Duration) bool { return true }
+	manager.probeSQLiteServer = func(int, time.Duration) bool { return true }
+	manager.probeLocalProxy = func(int, time.Duration) bool { return true }
+	manager.probeFrontend = func(int, time.Duration) bool { return true }
+	manager.probeAuth = func(int, time.Duration) bool { return true }
+	manager.probeChannelGateway = func(int, time.Duration) bool { return true }
+	manager.probeCore = func(int, time.Duration) bool { return true }
+	manager.probeScan = func(int, time.Duration) bool { return true }
+	manager.probeFileWatch = func(int, time.Duration) bool { return true }
+	manager.waitHostReady = func(context.Context, RuntimeConfig, []AlgorithmServiceSpec) error {
+		return errors.New("chat health check timed out")
+	}
+	state := defaultRuntimeState(cfg, cfg.ProcessComposePort, paths.RunDirTokenFile)
+	err = manager.startRuntimeAttempt(context.Background(), 1, cfg, paths, &state)
+	if err == nil {
+		t.Fatal("startRuntimeAttempt unexpectedly succeeded")
+	}
+	diagnostic, ok := runtimeDiagnosticFromError(err)
+	if !ok || diagnostic.Code != runtimeDiagnosticCodePortConflict || diagnostic.Service != chatProcessName {
+		t.Fatalf("desktop algorithm port diagnostic = %#v, ok=%t", diagnostic, ok)
+	}
+	if diagnostic.LogPath != algorithmLogPath(paths, chatProcessName) || diagnostic.Details == nil {
+		t.Fatalf("desktop algorithm port context = %#v", diagnostic)
+	}
+	if diagnostic.Details.Address != "127.0.0.1" || diagnostic.Details.Port != cfg.Algorithm.ChatPort {
+		t.Fatalf("desktop algorithm port details = %#v", diagnostic.Details)
+	}
+	if diagnostic.Details.Attempt != 1 || diagnostic.Details.MaxAttempts != 1 {
+		t.Fatalf("desktop algorithm retry details = %#v, want one attempt", diagnostic.Details)
+	}
+	if isStartupPortConflict(err) {
+		t.Fatal("desktop non-retry failure must preserve the readiness error as its cause")
+	}
+}
+
+func TestDesktopStartRuntimeAttemptPreservesHostPortRetryContext(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	cfg, paths, err := NewRuntimeConfigWithOptions(RuntimeConfigOptions{
+		Profile: "desktop", RepoRoot: repo, RuntimeRoot: filepath.Join(t.TempDir(), "runtime"),
+		ResourcesRoot: filepath.Join(t.TempDir(), "resources"),
+	})
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	if err := paths.EnsureAllDirs(); err != nil {
+		t.Fatalf("ensure runtime dirs: %v", err)
+	}
+	cfg.ModeProfile.VectorStore.ManagedProcess = false
+	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.ChannelGateway.Port))
+	if err != nil {
+		t.Skipf("channel gateway port %d is already in use: %v", cfg.ChannelGateway.Port, err)
+	}
+	defer listener.Close()
+	manager := NewRuntimeManager(&fakeRunner{t: t}, filepath.Join(repo, "local-runtime-manager"))
+	manager.upTimeout = 10 * time.Millisecond
+	manager.probeAPI = func(int, time.Duration) bool { return true }
+	manager.probeSQLiteServer = func(int, time.Duration) bool { return true }
+	manager.probeLocalProxy = func(int, time.Duration) bool { return true }
+	manager.probeFrontend = func(int, time.Duration) bool { return true }
+	manager.probeAuth = func(int, time.Duration) bool { return true }
+	manager.probeChannelGateway = func(int, time.Duration) bool { return false }
+	manager.probeScan = func(int, time.Duration) bool { return true }
+	manager.probeFileWatch = func(int, time.Duration) bool { return true }
+	manager.waitHostReady = func(context.Context, RuntimeConfig, []AlgorithmServiceSpec) error { return nil }
+	state := defaultRuntimeState(cfg, cfg.ProcessComposePort, paths.RunDirTokenFile)
+	err = manager.startRuntimeAttempt(context.Background(), 1, cfg, paths, &state)
+	if err == nil {
+		t.Fatal("startRuntimeAttempt unexpectedly succeeded")
+	}
+	diagnostic, ok := runtimeDiagnosticFromError(err)
+	if !ok || diagnostic.Code != runtimeDiagnosticCodePortConflict || diagnostic.Service != channelGatewayProcessName {
+		t.Fatalf("desktop host port diagnostic = %#v, ok=%t", diagnostic, ok)
+	}
+	if diagnostic.Details == nil || diagnostic.Details.Attempt != 1 || diagnostic.Details.MaxAttempts != 1 {
+		t.Fatalf("desktop host retry details = %#v, want one attempt", diagnostic.Details)
+	}
+	if diagnostic.Details.Port != cfg.ChannelGateway.Port || isStartupPortConflict(err) {
+		t.Fatalf("desktop host port error = %#v, want preserved readiness cause", err)
+	}
+}
+
+func TestStartupCapabilityReadyIncludesFrontendPort(t *testing.T) {
+	manager := NewRuntimeManager(&fakeRunner{t: t}, filepath.Join(t.TempDir(), "local-runtime-manager"))
+	var output strings.Builder
+	manager.SetOutput(&output, &output)
+
+	manager.startupCapabilityReady("home", 8090)
+
+	const marker = "[startup-event] "
+	line := strings.TrimSpace(output.String())
+	if !strings.HasPrefix(line, marker) {
+		t.Fatalf("startup capability output = %q, want %q prefix", line, marker)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(line, marker)), &payload); err != nil {
+		t.Fatalf("unmarshal startup capability event: %v", err)
+	}
+	if payload["event"] != "capability.ready" || payload["capability"] != "home" {
+		t.Fatalf("unexpected startup capability event: %#v", payload)
+	}
+	if payload["frontendPort"] != float64(8090) {
+		t.Fatalf("frontendPort = %#v, want 8090", payload["frontendPort"])
+	}
+}
+
+func TestStartupProgressEventIncludesPythonPayloadProgress(t *testing.T) {
+	manager := NewRuntimeManager(&fakeRunner{t: t}, filepath.Join(t.TempDir(), "local-runtime-manager"))
+	var output strings.Builder
+	manager.SetOutput(&output, &output)
+
+	manager.startupEventWithDetails("phase.progress", "python-payload", time.Now(), nil, map[string]any{
+		"stage":          "extracting",
+		"completedFiles": 7,
+		"totalFiles":     10,
+		"completedBytes": 700,
+		"totalBytes":     1000,
+	})
+
+	const marker = "[startup-event] "
+	line := strings.TrimSpace(output.String())
+	if !strings.HasPrefix(line, marker) {
+		t.Fatalf("startup progress output = %q", line)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(line, marker)), &payload); err != nil {
+		t.Fatalf("unmarshal startup progress event: %v", err)
+	}
+	if payload["event"] != "phase.progress" || payload["phase"] != "python-payload" || payload["stage"] != "extracting" {
+		t.Fatalf("unexpected startup progress event: %#v", payload)
+	}
+	if payload["completedFiles"] != float64(7) || payload["totalBytes"] != float64(1000) {
+		t.Fatalf("unexpected startup progress values: %#v", payload)
+	}
+}
+
+func TestStatusMigratesLegacyDockerStackState(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	cfg, paths, err := NewRuntimeConfig("", repo)
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	if err := paths.EnsureAllDirs(); err != nil {
+		t.Fatalf("ensure dirs: %v", err)
+	}
+	state := defaultRuntimeState(cfg, cfg.ProcessComposePort, paths.RunDirTokenFile)
+	state.OverallStatus = "failed"
+	state.Diagnostic = &RuntimeDiagnostic{Code: runtimeDiagnosticCodeHealthTimeout, Operation: runtimeDiagnosticOperationUp, Phase: runtimeDiagnosticPhaseServiceReadiness, Message: "health timeout", Retryable: true, Action: "retry"}
+	state.Services[legacyComposeServiceName] = RuntimeServiceState{Kind: "docker" + "-compose", Status: "running"}
+	delete(state.Services, processComposeServiceName)
+	if err := writeRuntimeState(paths.StateFile, state); err != nil {
+		t.Fatalf("write state: %v", err)
+	}
+	manager := NewRuntimeManager(&fakeRunner{t: t}, filepath.Join(repo, "local", ".bin", "local-runtime-manager"))
+	manager.probeAPI = func(port int, timeout time.Duration) bool { return false }
+	out, err := manager.Status(context.Background(), cfg, paths, true)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	var resp StatusResponse
+	if err := json.Unmarshal([]byte(out), &resp); err != nil {
+		t.Fatalf("unmarshal status: %v", err)
+	}
+	svc, ok := resp.Services[processComposeServiceName]
+	if !ok {
+		t.Fatalf("missing %s service", processComposeServiceName)
+	}
+	if svc.Kind != "host-supervisor" {
+		t.Fatalf("kind = %q, want host-supervisor", svc.Kind)
+	}
+	if resp.Diagnostic == nil || resp.Diagnostic.Code != runtimeDiagnosticCodeHealthTimeout {
+		t.Fatalf("diagnostic = %#v, want health timeout", resp.Diagnostic)
+	}
+}
+
+func TestUpdateProbedServiceMarksStartingServiceStale(t *testing.T) {
+	services := map[string]RuntimeServiceState{
+		scanControlPlaneProcessName: {Kind: "host-process", Status: "starting"},
+	}
+
+	if updateProbedService(services, scanControlPlaneProcessName, false) {
+		t.Fatal("unhealthy service reported healthy")
+	}
+	if got := services[scanControlPlaneProcessName].Status; got != "stale" {
+		t.Fatalf("status = %q, want stale", got)
+	}
+}
+
+func TestRuntimeDiagnosticClassification(t *testing.T) {
+	portErr := &startupPortConflictError{Service: "auth-service", Address: "127.0.0.1", Port: 8081, Cause: errors.New("claimed")}
+	tests := []struct {
+		name string
+		err  error
+		ctx  runtimeFailureContext
+		want string
+	}{
+		{"port conflict", portErr, runtimeFailureContext{Service: "auth-service"}, runtimeDiagnosticCodePortConflict},
+		{"permission", os.ErrPermission, runtimeFailureContext{}, runtimeDiagnosticCodePermissionDenied},
+		{"dependency", exec.ErrNotFound, runtimeFailureContext{Fact: runtimeFailureFactDependencyMissing, Dependency: "uv"}, runtimeDiagnosticCodeDependencyMissing},
+		{"process exit", errors.New("wait failed"), runtimeFailureContext{Fact: runtimeFailureFactProcessExited}, runtimeDiagnosticCodeProcessExited},
+		{"health timeout", errors.New("deadline"), runtimeFailureContext{Fact: runtimeFailureFactHealthTimeout}, runtimeDiagnosticCodeHealthTimeout},
+		{"stop timeout", errors.New("deadline"), runtimeFailureContext{Fact: runtimeFailureFactStopTimeout}, runtimeDiagnosticCodeStopTimeout},
+		{"instance conflict", errors.New("owner"), runtimeFailureContext{Fact: runtimeFailureFactInstanceConflict}, runtimeDiagnosticCodeInstanceConflict},
+		{"unknown", errors.New("failed"), runtimeFailureContext{}, runtimeDiagnosticCodeUnknown},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classifyRuntimeFailure(tt.err, tt.ctx).Code; got != tt.want {
+				t.Fatalf("diagnostic code = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRuntimeDiagnosticDoesNotInferFromErrorText(t *testing.T) {
+	for _, message := range []string{"permission denied", "not found", "timeout"} {
+		t.Run(message, func(t *testing.T) {
+			got := classifyRuntimeFailure(errors.New(message), runtimeFailureContext{})
+			if got.Code != runtimeDiagnosticCodeUnknown {
+				t.Fatalf("diagnostic code = %q, want unknown", got.Code)
+			}
+		})
+	}
+	got := classifyRuntimeFailure(context.Canceled, runtimeFailureContext{Fact: runtimeFailureFactHealthTimeout})
+	if got.Code != runtimeDiagnosticCodeUnknown {
+		t.Fatalf("canceled health check code = %q, want unknown", got.Code)
+	}
+}
+
+func TestRuntimeDiagnosticErrorPreservesCauseAndIsIdempotent(t *testing.T) {
+	cause := fmt.Errorf("permission denied: %w", fs.ErrPermission)
+	wrapped := attachRuntimeDiagnostic(cause, runtimeFailureContext{})
+	if wrapped.Error() != cause.Error() || !errors.Is(wrapped, cause) {
+		t.Fatalf("diagnostic error did not preserve cause: %v", wrapped)
+	}
+	first, ok := runtimeDiagnosticFromError(wrapped)
+	if !ok || first.Code != runtimeDiagnosticCodePermissionDenied {
+		t.Fatalf("missing permission diagnostic: %#v", first)
+	}
+	second, ok := runtimeDiagnosticFromError(attachRuntimeDiagnostic(wrapped, runtimeFailureContext{Fact: runtimeFailureFactProcessExited}))
+	if !ok || first != second {
+		t.Fatalf("diagnostic was not reused: first=%p second=%p", first, second)
+	}
+}
+
+func TestRuntimeDiagnosticJSONUsesWhitelistAndOmitsNil(t *testing.T) {
+	diagnostic := classifyRuntimeFailure(errors.New("stderr password=secret"), runtimeFailureContext{
+		Operation: runtimeDiagnosticOperationUp, Phase: runtimeDiagnosticPhaseServiceReadiness,
+		Service: "auth-service", LogPath: "/tmp/auth.log", HealthURL: "http://127.0.0.1:8081/health",
+		TimeoutMs: 1800000, Address: "127.0.0.1", Port: 8081, Path: "/health",
+		Attempt: 2, MaxAttempts: 3, BlockingServices: []string{"core", "auth-service", "core"},
+	})
+	raw, err := json.Marshal(diagnostic)
+	if err != nil {
+		t.Fatalf("marshal diagnostic: %v", err)
+	}
+	if strings.Contains(string(raw), "stderr") || strings.Contains(string(raw), "password") || strings.Contains(string(raw), "secret") {
+		t.Fatalf("sensitive error content leaked: %s", raw)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("unmarshal diagnostic: %v", err)
+	}
+	details, ok := payload["details"].(map[string]any)
+	if !ok || details["blockingServices"].([]any)[0] != "auth-service" {
+		t.Fatalf("unexpected details: %#v", payload["details"])
+	}
+	for _, forbidden := range []string{"cause", "stderr", "error", "password"} {
+		if _, ok := payload[forbidden]; ok {
+			t.Fatalf("forbidden diagnostic field %q present", forbidden)
+		}
+	}
+	if got, _ := json.Marshal(struct {
+		Diagnostic *RuntimeDiagnostic `json:"diagnostic,omitempty"`
+	}{}); string(got) != "{}" {
+		t.Fatalf("nil diagnostic JSON = %s, want {}", got)
+	}
+}
+
+func TestReadRuntimeStateAcceptsLegacyStateWithoutDiagnostic(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "runtime-state.json")
+	legacy := `{"version":1,"runtime":"local","profile":"local","repoRoot":"repo","runtimeRoot":"runtime","processCompose":{"apiPort":9000},"services":{},"updatedAt":"2026-01-01T00:00:00Z"}`
+	if err := os.WriteFile(path, []byte(legacy), 0o644); err != nil {
+		t.Fatalf("write legacy state: %v", err)
+	}
+	state, err := readRuntimeState(path)
+	if err != nil || state.Diagnostic != nil {
+		t.Fatalf("legacy state read = %#v, err=%v", state, err)
+	}
+}
+
+func TestUpdateProbedServiceRejectsStoppedService(t *testing.T) {
+	services := map[string]RuntimeServiceState{
+		fileWatcherProcessName: {Kind: "host-process", Status: "stopped"},
+	}
+
+	if updateProbedService(services, fileWatcherProcessName, false) {
+		t.Fatal("stopped service reported healthy")
+	}
+	if got := services[fileWatcherProcessName].Status; got != "stopped" {
+		t.Fatalf("status = %q, want stopped", got)
+	}
+}
+
+func TestUpdateProbedServiceMarksHealthyServiceRunning(t *testing.T) {
+	services := map[string]RuntimeServiceState{}
+
+	if !updateProbedService(services, scanControlPlaneProcessName, true) {
+		t.Fatal("healthy service reported unhealthy")
+	}
+	service := services[scanControlPlaneProcessName]
+	if service.Status != "running" || service.Kind != "host-process" {
+		t.Fatalf("service = %+v, want running host-process", service)
+	}
+}
+
+func TestProcessComposeRuntimeStatusWaitsForAuthoritativeReady(t *testing.T) {
+	if got := processComposeRuntimeStatus("starting", true); got != "starting" {
+		t.Fatalf("status = %q, want starting", got)
+	}
+	if got := processComposeRuntimeStatus("ready", true); got != "ready" {
+		t.Fatalf("status = %q, want ready", got)
+	}
+	if got := processComposeRuntimeStatus("ready", false); got != "stale" {
+		t.Fatalf("status = %q, want stale", got)
+	}
+	if got := processComposeRuntimeStatus("failed", false); got != "failed" {
+		t.Fatalf("failed status = %q, want failed while unhealthy", got)
+	}
+	if got := processComposeRuntimeStatus("failed", true); got != "ready" {
+		t.Fatalf("failed status = %q, want ready after healthy probes", got)
+	}
+}
+
+func TestStatusKeepsFailedDiagnosticWhenAlgorithmIsUnhealthy(t *testing.T) {
+	cfg, paths, state := newRunningRuntimeFixture(t)
+	cfg.ModeProfile.VectorStore.ManagedProcess = false
+	cfg.Algorithm.ProcessorPort = 0
+	cfg.Algorithm.WorkerPort = 0
+	cfg.Algorithm.AlgoPort = 0
+	cfg.Algorithm.DocPort = 0
+	cfg.Algorithm.ChatPort = 0
+	cfg.Algorithm.EnableEvo = false
+	state.Config = snapshotRuntimeConfig(cfg)
+	state.OverallStatus = "failed"
+	state.Diagnostic = &RuntimeDiagnostic{
+		Code: runtimeDiagnosticCodeHealthTimeout, Operation: runtimeDiagnosticOperationUp,
+		Phase: runtimeDiagnosticPhaseServiceReadiness, Message: "algorithm failed",
+		Retryable: true, Action: "retry",
+	}
+	for _, spec := range buildRuntimeProcessPlan(cfg).AlgorithmServices {
+		svc := state.Services[spec.Name]
+		svc.Status = "failed"
+		state.Services[spec.Name] = svc
+	}
+	if err := writeRuntimeState(paths.StateFile, state); err != nil {
+		t.Fatalf("write failed state: %v", err)
+	}
+	manager := NewRuntimeManager(&fakeRunner{t: t}, filepath.Join(paths.BinDir, "local-runtime-manager"))
+	manager.probeAPI = func(int, time.Duration) bool { return true }
+	manager.probeSQLiteServer = func(int, time.Duration) bool { return true }
+	manager.probeLocalProxy = func(int, time.Duration) bool { return true }
+	manager.probeAuth = func(int, time.Duration) bool { return true }
+	manager.probeChannelGateway = func(int, time.Duration) bool { return true }
+	manager.probeCore = func(int, time.Duration) bool { return true }
+	manager.probeFrontend = func(int, time.Duration) bool { return true }
+	statusJSON, err := manager.Status(context.Background(), cfg, paths, true)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	var response StatusResponse
+	if err := json.Unmarshal([]byte(statusJSON), &response); err != nil {
+		t.Fatalf("unmarshal status: %v", err)
+	}
+	if response.OverallStatus != "failed" || response.Diagnostic == nil || response.Diagnostic.Code != runtimeDiagnosticCodeHealthTimeout {
+		t.Fatalf("response = %+v, want failed with preserved diagnostic", response)
+	}
+}
+
+func TestStatusSuppressesStaleDiagnosticAfterLiveRecovery(t *testing.T) {
+	cfg, paths, state := newRunningRuntimeFixture(t)
+	state.Diagnostic = &RuntimeDiagnostic{Code: runtimeDiagnosticCodeHealthTimeout, Operation: runtimeDiagnosticOperationUp, Phase: runtimeDiagnosticPhaseServiceReadiness, Message: "old", Retryable: true, Action: "retry"}
+	if err := writeRuntimeState(paths.StateFile, state); err != nil {
+		t.Fatalf("write diagnostic state: %v", err)
+	}
+	ready := false
+	manager := NewRuntimeManager(&fakeRunner{t: t}, filepath.Join(paths.BinDir, "local-runtime-manager"))
+	manager.probeAPI = func(int, time.Duration) bool { return false }
+	manager.runtimeReady = func(context.Context, RuntimeConfig, RuntimePaths) bool { return ready }
+	readStatus := func() StatusResponse {
+		raw, err := manager.Status(context.Background(), cfg, paths, true)
+		if err != nil {
+			t.Fatalf("status: %v", err)
+		}
+		var response StatusResponse
+		if err := json.Unmarshal([]byte(raw), &response); err != nil {
+			t.Fatalf("unmarshal status: %v", err)
+		}
+		return response
+	}
+	if response := readStatus(); response.OverallStatus != "stale" || response.Diagnostic != nil {
+		t.Fatalf("stale response = %+v, want no diagnostic", response)
+	}
+	state.OverallStatus = "failed"
+	if err := writeRuntimeState(paths.StateFile, state); err != nil {
+		t.Fatalf("write failed state: %v", err)
+	}
+	ready = true
+	if response := readStatus(); response.OverallStatus != "ready" || response.Diagnostic != nil {
+		t.Fatalf("recovered response = %+v, want ready without diagnostic", response)
+	}
+}
+
+func TestDerivedToolInstallPathsUseLocalBuildRoot(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	_, paths, err := NewRuntimeConfig("", repo)
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	for _, path := range []string{paths.BinDir, paths.DepsDir, paths.AuthServiceVenvDir, paths.ChannelGatewayVenvDir, paths.AlgorithmVenv, paths.FrontendNodeModules, paths.PythonRuntimeDir, paths.NodeRuntimeDir} {
+		if !strings.HasPrefix(path, paths.BuildRoot+string(os.PathSeparator)) {
+			t.Fatalf("%s is outside build root %s", path, paths.BuildRoot)
+		}
+	}
+	for _, path := range []string{paths.GeneratedDir, paths.StateDir, paths.RunDir, paths.ConfigDir, paths.MilvusLiteDBPath, paths.FileWatcherBaseRoot, paths.PythonStateDir} {
+		if !strings.HasPrefix(path, paths.RuntimeRoot+string(os.PathSeparator)) {
+			t.Fatalf("%s is outside runtime root %s", path, paths.RuntimeRoot)
+		}
+	}
+	if paths.AuthServiceVenvDir != filepath.Join(paths.BuildRoot, "deps", "python", "auth-service") {
+		t.Fatalf("auth-service venv = %q", paths.AuthServiceVenvDir)
+	}
+	if paths.ChannelGatewayVenvDir != filepath.Join(paths.BuildRoot, "deps", "python", "channel-gateway") {
+		t.Fatalf("channel gateway venv = %q", paths.ChannelGatewayVenvDir)
+	}
+	if paths.AlgorithmVenv != filepath.Join(paths.BuildRoot, "deps", "python", "algorithm") {
+		t.Fatalf("algorithm venv = %q", paths.AlgorithmVenv)
+	}
+	if paths.FrontendNodeModules != filepath.Join(paths.BuildRoot, "deps", "node", "frontend") {
+		t.Fatalf("frontend node_modules = %q", paths.FrontendNodeModules)
+	}
+	if paths.PythonRuntimeDir != filepath.Join(paths.BuildRoot, "runtimes", "python") {
+		t.Fatalf("python runtime dir = %q", paths.PythonRuntimeDir)
+	}
+	if paths.NodeRuntimeDir != filepath.Join(paths.BuildRoot, "runtimes", "node") {
+		t.Fatalf("node runtime dir = %q", paths.NodeRuntimeDir)
+	}
+	if paths.PythonStateDir != filepath.Join(paths.RuntimeRoot, "state", "python") {
+		t.Fatalf("python state dir = %q", paths.PythonStateDir)
+	}
+}
+
+func TestGoToolEnvUsesHostCacheOutsideRuntimeRoot(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	_, paths, err := NewRuntimeConfig("", repo)
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	hostHome := filepath.Join(t.TempDir(), "host-home")
+	t.Setenv(localHostHomeEnvVar, hostHome)
+	t.Setenv("LOCALAPPDATA", filepath.Join(hostHome, "AppData", "Local"))
+	t.Setenv("HOME", paths.ServiceHome)
+	t.Setenv("GOCACHE", filepath.Join(paths.BuildRoot, "cache", "go-build"))
+	t.Setenv("GOMODCACHE", filepath.Join(paths.RuntimeRoot, "go", "pkg", "mod"))
+
+	env := map[string]string{}
+	for _, item := range goToolEnv(paths) {
+		k, v, ok := strings.Cut(item, "=")
+		if ok {
+			env[k] = v
+		}
+	}
+	for _, key := range []string{"GOCACHE", "GOMODCACHE"} {
+		if pathIsUnderRoot(env[key], paths.RuntimeRoot) {
+			t.Fatalf("%s = %q is under runtime root %q", key, env[key], paths.RuntimeRoot)
+		}
+		if pathIsUnderRoot(env[key], paths.BuildRoot) {
+			t.Fatalf("%s = %q is under build root %q", key, env[key], paths.BuildRoot)
+		}
+		if !strings.HasPrefix(env[key], hostHome+string(os.PathSeparator)) {
+			t.Fatalf("%s = %q, want under host home %q", key, env[key], hostHome)
+		}
+	}
+}
+
+func TestPrepareFrontendNodeModulesLinksSourceTreeToRuntimeRoot(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	_, paths, err := NewRuntimeConfig("", repo)
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	frontendDir := filepath.Join(repo, "frontend")
+	nodeModules := filepath.Join(frontendDir, "node_modules")
+	if err := os.MkdirAll(nodeModules, 0o755); err != nil {
+		t.Fatalf("mkdir node_modules: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(nodeModules, ".modules.yaml"), []byte(frontendModulesYAML(t, paths, nodeModules)), 0o644); err != nil {
+		t.Fatalf("write pnpm metadata: %v", err)
+	}
+	if err := prepareFrontendNodeModules(paths, frontendDir); err != nil {
+		t.Fatalf("prepare frontend node_modules: %v", err)
+	}
+	target, ok := directoryLinkTarget(nodeModules)
+	if !ok {
+		t.Fatalf("node_modules should be a symlink into runtime root")
+	}
+	if !sameDirectory(t, target, frontendRuntimeNodeModules(paths)) {
+		t.Fatalf("node_modules symlink = %q, want %q", target, frontendRuntimeNodeModules(paths))
+	}
+}
+
+func TestPrepareFrontendNodeModulesKeepsRuntimeRootSymlink(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	_, paths, err := NewRuntimeConfig("", repo)
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	frontendDir := filepath.Join(repo, "frontend")
+	nodeModules := filepath.Join(frontendDir, "node_modules")
+	runtimeNodeModules := frontendRuntimeNodeModules(paths)
+	for _, dir := range []string{
+		filepath.Join(runtimeNodeModules, ".bin"),
+		filepath.Join(runtimeNodeModules, "vite", "bin"),
+	} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir frontend dependency dir: %v", err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(runtimeNodeModules, ".modules.yaml"), []byte(frontendModulesYAML(t, paths, runtimeNodeModules)), 0o644); err != nil {
+		t.Fatalf("write pnpm metadata: %v", err)
+	}
+	if err := os.WriteFile(frontendToolPath(runtimeNodeModules, "vite"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("write vite bin: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(runtimeNodeModules, "vite", "bin", "vite.js"), []byte("console.log('vite')\n"), 0o644); err != nil {
+		t.Fatalf("write vite js: %v", err)
+	}
+	if err := os.MkdirAll(frontendDir, 0o755); err != nil {
+		t.Fatalf("mkdir frontend dir: %v", err)
+	}
+	if err := createDirectoryLink(runtimeNodeModules, nodeModules); err != nil {
+		t.Fatalf("link node_modules: %v", err)
+	}
+	if err := prepareFrontendNodeModules(paths, frontendDir); err != nil {
+		t.Fatalf("prepare frontend node_modules: %v", err)
+	}
+	target, ok := directoryLinkTarget(nodeModules)
+	if !ok || !sameDirectory(t, target, runtimeNodeModules) {
+		t.Fatalf("node_modules symlink = %q ok=%v, want %q", target, ok, runtimeNodeModules)
+	}
+	if ready, reason, err := frontendNodeModulesReady(paths, frontendDir); err != nil || !ready {
+		t.Fatalf("node_modules should remain usable: ready=%v reason=%q err=%v", ready, reason, err)
+	}
+}
+
+func TestPNPMLocalCacheEnvIsNonInteractive(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	_, paths, err := NewRuntimeConfig("", repo)
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	env := map[string]string{}
+	for _, item := range pnpmLocalCacheEnv(paths) {
+		k, v, ok := strings.Cut(item, "=")
+		if ok {
+			env[k] = v
+		}
+	}
+	for key, want := range map[string]string{
+		"CI":                              "true",
+		"COREPACK_ENABLE_DOWNLOAD_PROMPT": "0",
+		"NPM_CONFIG_UPDATE_NOTIFIER":      "false",
+		"npm_config_yes":                  "true",
+	} {
+		if env[key] != want {
+			t.Fatalf("%s = %q, want %q", key, env[key], want)
+		}
+	}
+	for _, key := range []string{"HOME", "XDG_CACHE_HOME"} {
+		if pathIsUnderRoot(env[key], paths.RuntimeRoot) {
+			t.Fatalf("%s = %q is under runtime root %q", key, env[key], paths.RuntimeRoot)
+		}
+		if pathIsUnderRoot(env[key], paths.BuildRoot) {
+			t.Fatalf("%s = %q is under build root %q", key, env[key], paths.BuildRoot)
+		}
+	}
+	for _, key := range []string{"PNPM_HOME", "NPM_CONFIG_STORE_DIR"} {
+		if _, ok := env[key]; ok {
+			t.Fatalf("%s should not be pinned into local runtime env", key)
+		}
+	}
+	args := pnpmLocalCacheArgs(paths)
+	virtualStoreFlag := false
+	for i, arg := range args {
+		if arg == "--store-dir" {
+			t.Fatalf("pnpm store-dir should use pnpm's user-level default cache")
+		}
+		if arg == "--virtual-store-dir" && i+1 < len(args) {
+			virtualStoreFlag = true
+			want := filepath.Join(paths.FrontendNodeModules, ".pnpm")
+			if args[i+1] != want {
+				t.Fatalf("virtual store = %q, want %q", args[i+1], want)
+			}
+		}
+	}
+	if !virtualStoreFlag {
+		t.Fatalf("pnpm virtual-store-dir flag is missing")
+	}
+}
+
+func frontendModulesYAML(t *testing.T, paths RuntimePaths, nodeModules string) string {
+	t.Helper()
+	virtualStore, err := filepath.Rel(nodeModules, filepath.Join(paths.FrontendNodeModules, ".pnpm"))
+	if err != nil {
+		t.Fatalf("relative virtual store: %v", err)
+	}
+	return "nodeLinker: isolated\n" +
+		"packageManager: pnpm@10.0.0\n" +
+		"virtualStoreDir: " + filepath.ToSlash(virtualStore) + "\n"
+}
+
+func (r *fakeRunner) assertCommandCount(expected int) {
+	if len(r.calls) != expected {
+		r.t.Fatalf("expected %d calls got %d", expected, len(r.calls))
+	}
+}
+
+func (r *fakeRunner) Run(ctx context.Context, cmd Command) (CommandResult, error) {
+	r.calls = append(r.calls, cmd)
+	if len(r.handlers) == 0 {
+		return CommandResult{}, nil
+	}
+	call := r.handlers[0]
+	r.handlers = r.handlers[1:]
+	return call(cmd)
+}
+
+type fakeRunner struct {
+	calls    []Command
+	handlers []func(Command) (CommandResult, error)
+	t        *testing.T
+}
+
+type fakeStreamRunner struct {
+	fakeRunner
+	streamCalls    []Command
+	streamHandlers []func(Command) error
+}
+
+func (r *fakeStreamRunner) Stream(ctx context.Context, cmd Command, stdout, stderr io.Writer) error {
+	r.streamCalls = append(r.streamCalls, cmd)
+	if len(r.streamHandlers) == 0 {
+		return nil
+	}
+	call := r.streamHandlers[0]
+	r.streamHandlers = r.streamHandlers[1:]
+	return call(cmd)
+}
+
+func writeComposeFixture(t *testing.T, repo string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(repo, "Makefile"), []byte("help:\n\t@true\n"), 0o644); err != nil {
+		t.Fatalf("write Makefile: %v", err)
+	}
+	mod := filepath.Join(repo, "local", "local-runtime-manager", "go.mod")
+	if err := os.MkdirAll(filepath.Dir(mod), 0o755); err != nil {
+		t.Fatalf("mkdir local runtime manager fixture: %v", err)
+	}
+	if err := os.WriteFile(mod, []byte("module fixture\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod fixture: %v", err)
+	}
+}
+
+func newRunningRuntimeFixture(t *testing.T) (RuntimeConfig, RuntimePaths, RuntimeState) {
+	t.Helper()
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	cfg, paths, err := NewRuntimeConfigWithOptions(RuntimeConfigOptions{
+		Profile: "local", RepoRoot: repo, RuntimeRoot: filepath.Join(t.TempDir(), "runtime"),
+		ResourcesRoot: filepath.Join(t.TempDir(), "resources"), MaintenanceMode: installerWarmupMaintenanceMode,
+	})
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	if err := paths.EnsureAllDirs(); err != nil {
+		t.Fatalf("ensure runtime dirs: %v", err)
+	}
+	state := defaultRuntimeState(cfg, cfg.ProcessComposePort, paths.RunDirTokenFile)
+	state.OverallStatus = "running"
+	state.Services[processComposeServiceName] = RuntimeServiceState{Kind: "host-supervisor", Status: "running"}
+	if err := writeRuntimeState(paths.StateFile, state); err != nil {
+		t.Fatalf("write runtime state: %v", err)
+	}
+	return cfg, paths, state
+}
+
+func occupyLocalPorts(t *testing.T, ports ...int) []net.Listener {
+	return occupyPortsOn(t, "127.0.0.1", ports...)
+}
+
+func occupyPortsOn(t *testing.T, address string, ports ...int) []net.Listener {
+	t.Helper()
+	listeners := make([]net.Listener, 0, len(ports))
+	for _, port := range ports {
+		ln, err := net.Listen("tcp", net.JoinHostPort(address, strconv.Itoa(port)))
+		if err != nil {
+			for _, existing := range listeners {
+				_ = existing.Close()
+			}
+			t.Skipf("port %d is already in use on %s on this test host: %v", port, address, err)
+		}
+		listeners = append(listeners, ln)
+	}
+	return listeners
+}
+
+func assertCommand(t *testing.T, cmd Command, name string, args ...string) {
+	t.Helper()
+	if cmd.Name != name {
+		t.Fatalf("expected command %s got %s", name, cmd.Name)
+	}
+	if len(cmd.Args) != len(args) {
+		t.Fatalf("expected args len %d got %d (%v)", len(args), len(cmd.Args), cmd.Args)
+	}
+	for i := range args {
+		if cmd.Args[i] != args[i] {
+			t.Fatalf("arg mismatch at %d expected %q got %q", i, args[i], cmd.Args[i])
+		}
+	}
+}
+
+func assertCommandContainsInOrder(t *testing.T, cmd Command, name string, args []string) {
+	t.Helper()
+	if cmd.Name != name {
+		t.Fatalf("expected command %s got %s", name, cmd.Name)
+	}
+	if len(cmd.Args) < len(args) {
+		t.Fatalf("expected at least %d args got %d", len(args), len(cmd.Args))
+	}
+	for i := range args {
+		if cmd.Args[i] != args[i] {
+			t.Fatalf("arg mismatch at %d expected %q got %q", i, args[i], cmd.Args[i])
+		}
+	}
+}
+
+func assertStringSlicesEqual(t *testing.T, got, want []string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("expected %v got %v", want, got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("expected %v got %v", want, got)
+		}
+	}
+}
+
+func assertContains(t *testing.T, args []string, want string) {
+	for _, a := range args {
+		if a == want {
+			return
+		}
+	}
+	t.Fatalf("missing arg %s in %v", want, args)
+}
+
+func containsString(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}
+
+func assertStringArgAfter(t *testing.T, args []string, flag string, want string) {
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == flag && args[i+1] == want {
+			return
+		}
+	}
+	t.Fatalf("missing arg pair %s %s in %v", flag, want, args)
+}
+
+func TestRuntimeManagerDownPersistsDiagnosticAndStatus(t *testing.T) {
+	cfg, paths, _ := newRunningRuntimeFixture(t)
+	manager := NewRuntimeManager(&fakeRunner{t: t}, filepath.Join(paths.BinDir, "local-runtime-manager"))
+	manager.probeAPI = func(int, time.Duration) bool { return false }
+	manager.processScanner = func(RuntimePaths) ([]LocalProcessRecord, error) {
+		return nil, errors.New("process registry unavailable")
+	}
+	manager.runtimeReady = func(context.Context, RuntimeConfig, RuntimePaths) bool { return false }
+	var output strings.Builder
+	manager.SetOutput(&output, &output)
+	if err := manager.Down(context.Background(), cfg, paths); err == nil {
+		t.Fatal("Down unexpectedly succeeded")
+	}
+	state, err := readRuntimeState(paths.StateFile)
+	if err != nil || state.OverallStatus != "failed" || state.Diagnostic == nil || state.Diagnostic.Code != runtimeDiagnosticCodeUnknown {
+		t.Fatalf("failed state = %+v, err=%v", state, err)
+	}
+	statusJSON, err := manager.Status(context.Background(), cfg, paths, true)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	var response StatusResponse
+	if err := json.Unmarshal([]byte(statusJSON), &response); err != nil {
+		t.Fatalf("unmarshal status: %v", err)
+	}
+	if response.Diagnostic == nil || response.Diagnostic.Code != state.Diagnostic.Code {
+		t.Fatalf("status diagnostic = %#v, want %#v", response.Diagnostic, state.Diagnostic)
+	}
+	if !strings.Contains(output.String(), `"event":"shutdown.failed.diagnostic"`) || !strings.Contains(output.String(), `"event":"shutdown.failed"`) {
+		t.Fatalf("shutdown failure events missing: %s", output.String())
+	}
+}
+
+func TestRuntimeManagerDownFallbackClearsDiagnostic(t *testing.T) {
+	cfg, paths, state := newRunningRuntimeFixture(t)
+	state.Diagnostic = &RuntimeDiagnostic{Code: runtimeDiagnosticCodeHealthTimeout, Operation: runtimeDiagnosticOperationUp, Phase: runtimeDiagnosticPhaseServiceReadiness, Message: "old", Retryable: true, Action: "retry"}
+	if err := writeRuntimeState(paths.StateFile, state); err != nil {
+		t.Fatalf("write diagnostic state: %v", err)
+	}
+	manager := NewRuntimeManager(&fakeRunner{t: t}, filepath.Join(paths.BinDir, "local-runtime-manager"))
+	manager.probeAPI = func(int, time.Duration) bool { return false }
+	manager.processScanner = func(RuntimePaths) ([]LocalProcessRecord, error) { return nil, nil }
+	var output strings.Builder
+	manager.SetOutput(&output, &output)
+	if err := manager.Down(context.Background(), cfg, paths); err != nil {
+		t.Fatalf("fallback Down: %v", err)
+	}
+	stateAfter, err := readRuntimeState(paths.StateFile)
+	if err != nil || stateAfter.OverallStatus != "stopped" || stateAfter.Diagnostic != nil {
+		t.Fatalf("stopped state = %+v, err=%v", stateAfter, err)
+	}
+	if strings.Contains(output.String(), "shutdown.failed") {
+		t.Fatalf("fallback success emitted failure event: %s", output.String())
+	}
+}
+
+func TestRuntimeManagerDownDoesNotOverwriteForeignState(t *testing.T) {
+	cfg, paths, state := newRunningRuntimeFixture(t)
+	state.Profile, state.Runtime, state.OwnerToken = "desktop", "desktop", "other-owner"
+	if err := writeRuntimeState(paths.StateFile, state); err != nil {
+		t.Fatalf("write foreign state: %v", err)
+	}
+	manager := NewRuntimeManager(&fakeRunner{t: t}, filepath.Join(paths.BinDir, "local-runtime-manager"))
+	manager.probeAPI = func(int, time.Duration) bool { return false }
+	if err := manager.Down(context.Background(), cfg, paths); err == nil {
+		t.Fatal("foreign Down unexpectedly succeeded")
+	}
+	stateAfter, err := readRuntimeState(paths.StateFile)
+	if err != nil || stateAfter.Profile != "desktop" || stateAfter.OverallStatus != "running" || stateAfter.Diagnostic != nil {
+		t.Fatalf("foreign state changed = %+v, err=%v", stateAfter, err)
+	}
+}
+
+func TestWaitForRuntimeStoppedReportsStructuredTimeout(t *testing.T) {
+	manager := NewRuntimeManager(&fakeRunner{}, "local-runtime-manager")
+	manager.probeAPI = func(int, time.Duration) bool { return true }
+	manager.downTimeout = 10 * time.Millisecond
+	manager.pollInterval = time.Millisecond
+	err := manager.waitForRuntimeStopped(context.Background(), RuntimeConfig{ProcessComposePort: 19080}, RuntimePaths{LogFilePath: "runtime.log"})
+	if runtimeFailureFact(err) != runtimeFailureFactStopTimeout {
+		t.Fatalf("stop timeout fact = %q, err=%v", runtimeFailureFact(err), err)
+	}
+	failureContext, ok := runtimeFailureContextFromError(err)
+	if !ok || failureContext.Phase != runtimeDiagnosticPhaseShutdownVerification || !containsString(failureContext.BlockingServices, processComposeServiceName) {
+		t.Fatalf("stop timeout context = %+v, ok=%t", failureContext, ok)
+	}
+	diagnostic := classifyRuntimeFailure(err, failureContext)
+	if diagnostic.Code != runtimeDiagnosticCodeStopTimeout || diagnostic.Details == nil || diagnostic.Details.TimeoutMs != 10 {
+		t.Fatalf("stop timeout diagnostic = %+v", diagnostic)
+	}
+}
+
+func TestMergeRuntimeStopBlockersSortsAndDeduplicates(t *testing.T) {
+	got := mergeRuntimeStopBlockers(
+		[]string{sqliteServerProcessName, processComposeServiceName},
+		[]LocalProcessRecord{{Service: "auth-service"}, {Service: sqliteServerProcessName}, {Service: "auth-service"}, {Service: ""}},
+	)
+	assertStringSlicesEqual(t, got, []string{"auth-service", processComposeServiceName, sqliteServerProcessName})
+}
+
+func TestRuntimeManagerUpPersistsDiagnosticAndKeepsFailureEventCompatible(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	if err := os.MkdirAll(filepath.Join(repo, "algorithm", "lazyllm", "lazyllm"), 0o755); err != nil {
+		t.Fatalf("create lazyllm source: %v", err)
+	}
+	cfg, paths, err := NewRuntimeConfigWithOptions(RuntimeConfigOptions{
+		Profile: "local", RepoRoot: repo, RuntimeRoot: filepath.Join(t.TempDir(), "runtime"),
+		ResourcesRoot: filepath.Join(t.TempDir(), "resources"), MaintenanceMode: installerWarmupMaintenanceMode,
+	})
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	manager := NewRuntimeManager(&fakeRunner{t: t}, filepath.Join(repo, "local-runtime-manager"))
+	manager.relocatePythonVenvs = func(RuntimeConfig, RuntimePaths) error { return errors.New("relocation failed") }
+	var output strings.Builder
+	manager.SetOutput(&output, &output)
+	startErr := manager.Up(context.Background(), cfg, paths)
+	if startErr == nil || !strings.Contains(startErr.Error(), "desktop Python relocation failed") {
+		t.Fatalf("Up error = %v, want relocation failure", startErr)
+	}
+	state, err := readRuntimeState(paths.StateFile)
+	if err != nil {
+		t.Fatalf("read failed state: %v", err)
+	}
+	if state.OverallStatus != "failed" || state.Diagnostic == nil || state.Diagnostic.Code != runtimeDiagnosticCodeUnknown {
+		t.Fatalf("failed state = %+v, want failed with unknown diagnostic", state)
+	}
+	text := output.String()
+	if !strings.Contains(text, `"event":"startup.failed.diagnostic"`) || !strings.Contains(text, `"event":"startup.failed"`) {
+		t.Fatalf("failure events missing: %s", text)
+	}
+	if !strings.Contains(text, `"error":"desktop Python relocation failed`) {
+		t.Fatalf("original failure text missing: %s", text)
+	}
+}
+
+func TestRuntimeManagerUpRetriesPortConflictAndClearsDiagnostic(t *testing.T) {
+	preferredListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve preferred port: %v", err)
+	}
+	preferred := preferredListener.Addr().(*net.TCPAddr).Port
+	_ = preferredListener.Close()
+	t.Setenv(processComposePortEnvVar, strconv.Itoa(preferred))
+	t.Setenv(localPortsPinnedEnvVar, "false")
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	if err := os.MkdirAll(filepath.Join(repo, "algorithm", "lazyllm", "lazyllm"), 0o755); err != nil {
+		t.Fatalf("create lazyllm source: %v", err)
+	}
+	cfg, paths, err := NewRuntimeConfigWithOptions(RuntimeConfigOptions{
+		Profile: "local", RepoRoot: repo, RuntimeRoot: filepath.Join(t.TempDir(), "runtime"),
+		ResourcesRoot: filepath.Join(t.TempDir(), "resources"), MaintenanceMode: installerWarmupMaintenanceMode,
+	})
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	var held net.Listener
+	firstPort, secondPort := 0, 0
+	runner := &fakeRunner{t: t}
+	runner.handlers = []func(Command) (CommandResult, error){
+		func(cmd Command) (CommandResult, error) {
+			firstPort = commandPort(cmd)
+			held, err = net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(firstPort)))
+			if err != nil {
+				t.Fatalf("hold first attempt port: %v", err)
+			}
+			return CommandResult{}, errors.New("port claimed")
+		},
+		func(cmd Command) (CommandResult, error) {
+			secondPort = commandPort(cmd)
+			_ = held.Close()
+			return CommandResult{}, nil
+		},
+	}
+	manager := NewRuntimeManager(runner, filepath.Join(repo, "local-runtime-manager"))
+	manager.probeAPI = func(int, time.Duration) bool { return true }
+	manager.probeSQLiteServer = func(int, time.Duration) bool { return true }
+	manager.probeLocalProxy = func(int, time.Duration) bool { return true }
+	manager.probeFrontend = func(int, time.Duration) bool { return true }
+	manager.probeAuth = func(int, time.Duration) bool { return true }
+	manager.probeChannelGateway = func(int, time.Duration) bool { return true }
+	manager.probeCore = func(int, time.Duration) bool { return true }
+	manager.probeScan = func(int, time.Duration) bool { return true }
+	manager.probeFileWatch = func(int, time.Duration) bool { return true }
+	manager.waitHostReady = func(context.Context, RuntimeConfig, []AlgorithmServiceSpec) error { return nil }
+	var output strings.Builder
+	manager.SetOutput(&output, &output)
+	if err := manager.Up(context.Background(), cfg, paths); err != nil {
+		t.Fatalf("Up after automatic retry: %v", err)
+	}
+	state, err := readRuntimeState(paths.StateFile)
+	if err != nil {
+		t.Fatalf("read ready state: %v", err)
+	}
+	if firstPort == 0 || secondPort == 0 || firstPort == secondPort || state.Config.ProcessComposePort != secondPort || state.Diagnostic != nil {
+		t.Fatalf("attempt state = %+v, first=%d second=%d", state.Config, firstPort, secondPort)
+	}
+	if strings.Contains(output.String(), "startup.failed.diagnostic") {
+		t.Fatalf("retry emitted final failure diagnostic: %s", output.String())
+	}
+	_ = held.Close()
+}
+
+func commandPort(cmd Command) int {
+	for i := 0; i+1 < len(cmd.Args); i++ {
+		if cmd.Args[i] == "-p" {
+			port, _ := strconv.Atoi(cmd.Args[i+1])
+			return port
+		}
+	}
+	return 0
+}

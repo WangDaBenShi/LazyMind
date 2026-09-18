@@ -1,0 +1,129 @@
+backend/auth-service/api_permissions.json
+.vscode/settings.json
+backend/core/core
+.env
+docker-compose.override.yml
+# Machine-local model overlay; copy from runtime_models.inner.yaml.
+algorithm/lazymind/common/runtime_models.local.yaml
+
+.flake8-python.path
+__pycache__
+
+# python files
+*__pycache__*
+*.pyc
+
+# temp files
+test/
+node_modules/
+# Editable PPT export deps live outside the repo; never commit this runtime link.
+workflows/ppt-workflow/runtime/scripts/export_pptx/node_modules/
+dist/
+tmp/
+build
+*.lock
+*.db
+*.sqlite3
+mkdocs.yml
+.temp
+infer_log/
+*.log
+log.txt
+save_ckpt/
+wget-log
+
+# dev tools
+.vscode
+.claude
+.cursor
+.codex
+.playwright-cli/
+.worktrees/
+.codex-gocache/
+.codex-gomodcache/
+.reasonix
+
+# docs
+lazyllm_chroma/
+docs/en/assets
+docs/zh/assets
+docs/superpowers/
+
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# build directories
+build*
+lazyllm_cpp.egg-info/
+!build*.sh
+!build*.ps1
+!build_document.py
+!builder.py
+
+.venv/
+.venv-test/
+data/
+volumes/
+local/config.env
+local/.bin/
+local/runtime/
+desktop/build/
+desktop/cache/
+skills/.runtime/
+local/bin/process-compose
+.conda
+
+# evo runtime artifacts
+evo/output/
+data/evo/
+
+# macOS
+.DS_Store
+
+AGENTS.md
+algorithm/.agentic_rag/
+version.*
+algorithm/Dockerfile.chat-rebase
+
+# generated openapi
+api/backend/auth-service/openapi.yml
+api/backend/auth-service/swagger.json
+api/backend/core/openapi.yml
+api/backend/core/swagger.json
+
+.pnpm-store/
+backend/core/openapi.json
+backend/core/swagger.json
+backend/core/docs/swagger.json
+openapi-export/
+
+# History samples live next to the repository and are release assets hosted on
+# ModelScope. Ignore an accidentally copied in-repository workspace wholesale.
+/history-injection/
+lazymind-history-injection*.zip

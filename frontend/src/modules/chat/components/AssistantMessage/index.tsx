@@ -1,0 +1,1653 @@
+import { Button, Divider, Flex, message, Modal, Spin, Tooltip } from "antd";
+import { trim, debounce } from "lodash";
+import { useCallback, useEffect, useReducer, useRef, useState } from "react";
+import type { KeyboardEvent, MouseEvent } from "react";
+import { useTranslation } from "react-i18next";
+
+import "./index.scss";
+import {
+  CopyOutlined,
+  BranchesOutlined,
+  CloseOutlined,
+  DislikeFilled,
+  DislikeOutlined,
+  ExclamationCircleOutlined,
+  FileTextOutlined,
+  LikeFilled,
+  LikeOutlined,
+  ReloadOutlined,
+  RightOutlined,
+} from "@ant-design/icons";
+import {
+  ChatConversationsResponseFinishReasonEnum,
+  FeedBackChatHistoryRequestTypeEnum,
+} from "@/api/generated/chatbot-client";
+import type { ChatModelRoute } from "@/api/generated/core-client";
+import { AgentAppsAuth } from "@/components/auth";
+import {
+  isAskPendingReadOnly,
+  shouldRenderAskPending,
+  mailDraftCardsReadOnly,
+  unansweredMailDrafts,
+} from "@/modules/chat/utils/message";
+import type { ExternalExecutionProjection } from "@/modules/chat/utils/message";
+import { ChatServiceApi, decideToolLimit } from "@/modules/chat/utils/request";
+import { useWorkflowStore } from "@/modules/chat/store/workflowPanel";
+import { WorkflowPanel } from "@/modules/chat/components/WorkflowPanel";
+import MultiAnswerDisplay, { type PreferenceType } from "../MultiAnswerDisplay";
+import FeedbackModal from "../FeedbackModal";
+import AskCard from "@/modules/chat/components/AskCard";
+import MailDraftCard from "@/modules/chat/components/MailDraftCard";
+import MailMailboxCard from "@/modules/chat/components/MailDraftCard/MailMailboxCard";
+import ToolLimitCard from "@/modules/chat/components/ToolLimitCard";
+import ArtifactDownloadButton from "@/modules/chat/components/ArtifactCollectorCard/ArtifactDownloadButton";
+import RunStatusCard from "@/modules/chat/components/RunStatusCard";
+import {
+  type ChatSource,
+  type ChatSourceCollection,
+  getReferenceSources,
+  getSourceDedupKey,
+  getSourceEvidenceText,
+  getSourceFaviconUrl,
+  getSourceLabel,
+  getSourceSubtitle,
+  isExternalSource,
+  openSource,
+} from "@/modules/chat/utils/sourceAdapter";
+import { IdentityAvatar } from "@/modules/identityAvatar";
+import {
+  getTranslationStatus,
+  isSingleEnglishWord,
+  translateSelectionText,
+  TranslationUnavailableError,
+} from "@/modules/knowledge/api/translation";
+
+let translationStatusRequest: Promise<boolean> | undefined;
+
+function loadTranslationStatus() {
+  translationStatusRequest ??= getTranslationStatus().catch(() => false);
+  return translationStatusRequest;
+}
+
+const SOURCE_ICON_TONES = 6;
+
+function getSourceIconTone(source: ChatSource) {
+  const value = getSourceSubtitle(source) || getSourceLabel(source);
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) | 0;
+  }
+  return Math.abs(hash) % SOURCE_ICON_TONES;
+}
+
+function getSourceIconInitial(source: ChatSource) {
+  const value = (getSourceSubtitle(source) || getSourceLabel(source)).trim();
+  return value ? value[0].toLocaleUpperCase() : "S";
+}
+
+function SourceFavicon({
+  source,
+  compact = false,
+}: {
+  source: ChatSource;
+  compact?: boolean;
+}) {
+  const [hasFaviconError, setHasFaviconError] = useState(false);
+  const faviconUrl = getSourceFaviconUrl(source);
+  const showFavicon = Boolean(faviconUrl && !hasFaviconError);
+
+  return (
+    <span
+      className={`chat-source-brand-icon tone-${getSourceIconTone(source)}${compact ? " is-compact" : ""}`}
+      aria-hidden="true"
+    >
+      {showFavicon ? (
+        <img
+          src={faviconUrl}
+          alt=""
+          loading="lazy"
+          referrerPolicy="no-referrer"
+          onError={() => setHasFaviconError(true)}
+        />
+      ) : isExternalSource(source) ? (
+        <span className="chat-source-brand-initial">
+          {getSourceIconInitial(source)}
+        </span>
+      ) : (
+        <FileTextOutlined />
+      )}
+    </span>
+  );
+}
+
+export function ChatSourcePanel({
+  sources,
+  onClose,
+  embedded = false,
+}: {
+  sources: ChatSource[];
+  onClose: () => void;
+  embedded?: boolean;
+}) {
+  const { t } = useTranslation();
+  const [selected, setSelected] = useState<ChatSource | null>(null);
+  useEffect(() => { setSelected(null); }, [sources]);
+
+  return (
+    <aside className="chat-source-panel" aria-label={t("chat.references")}>
+      {!embedded && <div className="chat-source-panel-header">
+        <h2 className="chat-source-panel-title">
+          <span>{t("chat.references")}</span>
+          <span className="chat-source-panel-count">{sources.length}</span>
+        </h2>
+        <Button
+          type="text"
+          className="chat-source-panel-close"
+          icon={<CloseOutlined />}
+          onClick={onClose}
+          aria-label={t("common.close")}
+        />
+      </div>}
+      <div className="chat-source-panel-body">
+        {selected ? <div className="chat-source-detail">
+          <Button type="text" onClick={() => setSelected(null)}>{t("chat.contextPanel.backToSources")}</Button>
+          <h3>{getSourceLabel(selected)}</h3>
+          <small>{getSourceSubtitle(selected)}</small>
+          <p>{getSourceEvidenceText(selected) || t("chat.contextPanel.noExcerpt")}</p>
+          <Button onClick={() => openSource(selected)}>{t("chat.contextPanel.openOriginal")}</Button>
+        </div> : <div className="chat-source-list">
+          {sources.map((source, sourceIndex) => (
+            <button
+              type="button"
+              className="chat-source-item"
+              key={getSourceDedupKey(source, sourceIndex)}
+              onClick={() => embedded ? setSelected(source) : openSource(source)}
+              title={getSourceLabel(source)}
+            >
+              <SourceFavicon source={source} />
+              <span className="chat-source-item-copy">
+                <span className="chat-source-item-heading">
+                  {getSourceSubtitle(source) || t("chat.references")}
+                </span>
+                <strong className="chat-source-item-title">
+                  {getSourceLabel(source)}
+                </strong>
+                {getSourceEvidenceText(source) && (
+                  <span className="chat-source-item-content">
+                    {getSourceEvidenceText(source)}
+                  </span>
+                )}
+              </span>
+              <RightOutlined
+                className="chat-source-item-arrow"
+                aria-hidden="true"
+              />
+            </button>
+          ))}
+        </div>}
+      </div>
+    </aside>
+  );
+}
+
+async function copyTextToClipboard(text: string) {
+  const normalizedText = text.trim();
+  if (!normalizedText) {
+    return;
+  }
+
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(normalizedText);
+      return;
+    }
+  } catch {}
+
+  const textarea = document.createElement("textarea");
+  textarea.value = normalizedText;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.top = "0";
+  textarea.style.left = "0";
+  textarea.style.width = "1px";
+  textarea.style.height = "1px";
+  textarea.style.opacity = "0";
+  textarea.style.pointerEvents = "none";
+
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  textarea.setSelectionRange(0, normalizedText.length);
+
+  try {
+    const copied = document.execCommand("copy");
+    if (!copied) {
+      throw new Error();
+    }
+  } finally {
+    document.body.removeChild(textarea);
+  }
+}
+
+interface FeedbackState {
+  showModal: boolean;
+  isSubmitting: boolean;
+  localFeedbackType: FeedBackChatHistoryRequestTypeEnum | undefined;
+  localFeedbackHistoryId: string | undefined;
+  targetHistoryId: string | undefined;
+}
+
+export function externalProviderDisplayName(provider: string): string {
+  if (provider.toLowerCase() === "workbuddy") {
+    return "WorkBuddy";
+  }
+  return provider.charAt(0).toUpperCase() + provider.slice(1);
+}
+
+function ExternalExecutionSummary({
+  execution,
+}: {
+  execution?: ExternalExecutionProjection;
+}) {
+  const { t } = useTranslation();
+  if (!execution) {
+    return null;
+  }
+  const provider = externalProviderDisplayName(execution.provider);
+  const status = t(`chat.executionStatus.${execution.status}`);
+  const workflows = execution.workflows
+    .map((workflow) => `${workflow.workflow_id} · ${workflow.status}`)
+    .join(", ");
+  return (
+    <details
+      className={`external-execution external-execution-${execution.status}`}
+    >
+      <summary>
+        <span className="external-execution-dot" />
+        <span>{provider}</span>
+        <span className="external-execution-status">{status}</span>
+      </summary>
+      <div className="external-execution-details">
+        <span>
+          {t("chat.executionCalls", { count: execution.invocation.total })}
+          {execution.invocation.tools.length > 0
+            ? ` · ${execution.invocation.tools.join(", ")}`
+            : ""}
+        </span>
+        {execution.recovery_count > 0 && (
+          <span>
+            {t("chat.executionRecovery", { count: execution.recovery_count })}
+          </span>
+        )}
+        {workflows && (
+          <span>
+            {t("chat.executionWorkflow")} · {workflows}
+          </span>
+        )}
+        {execution.artifact_revision_count > 0 && (
+          <span>
+            {t("chat.executionArtifacts", { count: execution.artifact_count })}
+            {" · "}
+            {t("chat.executionVersions", {
+              count: execution.artifact_revision_count,
+            })}
+          </span>
+        )}
+        {execution.host_id && (
+          <span>
+            {t("chat.executionHost")} · {execution.host_id} ·{" "}
+            {t(
+              execution.host_online
+                ? "chat.executionHostOnline"
+                : "chat.executionHostOffline",
+            )}
+          </span>
+        )}
+        {execution.error_message && (
+          <span className="external-execution-error">
+            {execution.error_message}
+          </span>
+        )}
+      </div>
+    </details>
+  );
+}
+
+function ModelRouteSummary({ route }: { route?: ChatModelRoute }) {
+  const { t } = useTranslation();
+  if (!route?.provider_name || !route.model_name) {
+    return null;
+  }
+  const model = `${route.provider_name} · ${route.model_name}`;
+  const label = t(
+    route.mode === "auto"
+      ? "chat.modelRouteAutoLabel"
+      : "chat.modelRouteFixedLabel",
+    { model },
+  );
+  const reason = route.reason
+    ? t(`chat.modelRouteReason.${route.reason}`, { defaultValue: "" })
+    : "";
+  const content = (
+    <div className="chat-model-route" aria-label={label}>
+      {label}
+    </div>
+  );
+  return reason ? <Tooltip title={reason}>{content}</Tooltip> : content;
+}
+
+type FeedbackAction =
+  | { type: "OPEN_MODAL"; historyId: string }
+  | { type: "CLOSE_MODAL" }
+  | { type: "SUBMIT_START" }
+  | {
+      type: "SUBMIT_SUCCESS";
+      feedbackType: FeedBackChatHistoryRequestTypeEnum | undefined;
+      historyId: string;
+    }
+  | { type: "SUBMIT_FAIL" }
+  | {
+      type: "SYNC_FROM_SERVER";
+      feedbackType: FeedBackChatHistoryRequestTypeEnum | undefined;
+      historyId: string | undefined;
+    };
+
+function normalizeFeedbackType(
+  feedbackType: unknown,
+): FeedBackChatHistoryRequestTypeEnum | undefined {
+  const normalizedFeedbackType =
+    typeof feedbackType === "string"
+      ? feedbackType.trim().toUpperCase()
+      : feedbackType;
+  if (
+    normalizedFeedbackType ===
+      FeedBackChatHistoryRequestTypeEnum.FeedBackTypeUnspecified ||
+    normalizedFeedbackType === 0 ||
+    normalizedFeedbackType === "0"
+  ) {
+    return undefined;
+  }
+  if (
+    normalizedFeedbackType ===
+      FeedBackChatHistoryRequestTypeEnum.FeedBackTypeLike ||
+    normalizedFeedbackType === 1 ||
+    normalizedFeedbackType === "1" ||
+    normalizedFeedbackType === "LIKE"
+  ) {
+    return FeedBackChatHistoryRequestTypeEnum.FeedBackTypeLike;
+  }
+  if (
+    normalizedFeedbackType ===
+      FeedBackChatHistoryRequestTypeEnum.FeedBackTypeUnlike ||
+    normalizedFeedbackType === 2 ||
+    normalizedFeedbackType === "2" ||
+    normalizedFeedbackType === "UNLIKE"
+  ) {
+    return FeedBackChatHistoryRequestTypeEnum.FeedBackTypeUnlike;
+  }
+  return undefined;
+}
+
+// ==================== Reducer ====================
+
+function feedbackReducer(
+  state: FeedbackState,
+  action: FeedbackAction,
+): FeedbackState {
+  switch (action.type) {
+    case "OPEN_MODAL":
+      return {
+        ...state,
+        showModal: true,
+        targetHistoryId: action.historyId,
+      };
+
+    case "CLOSE_MODAL":
+      return {
+        ...state,
+        showModal: false,
+        targetHistoryId: undefined,
+      };
+
+    case "SUBMIT_START":
+      return {
+        ...state,
+        isSubmitting: true,
+      };
+
+    case "SUBMIT_SUCCESS":
+      return {
+        ...state,
+        isSubmitting: false,
+        localFeedbackType: action.feedbackType,
+        localFeedbackHistoryId: action.historyId,
+        showModal: false,
+        targetHistoryId: undefined,
+      };
+
+    case "SUBMIT_FAIL":
+      return {
+        ...state,
+        isSubmitting: false,
+      };
+
+    case "SYNC_FROM_SERVER":
+      return {
+        ...state,
+        localFeedbackType: action.feedbackType,
+        localFeedbackHistoryId: action.historyId,
+      };
+
+    default:
+      return state;
+  }
+}
+
+const AssistantMessage = (props: any) => {
+  const { t } = useTranslation();
+  const {
+    item,
+    index,
+    length,
+    sendMessage,
+    regenerate,
+    regenerateDisabled,
+    stopGeneration,
+    renderText,
+    updateMessage,
+    sessionId,
+    conversationFiles,
+    onPreferenceSelect,
+    isLatestDualAnswer,
+    onCiteMessage,
+    onOpenSideChat,
+    hasLaterUserMessage,
+    onOpenSources,
+  } = props;
+  const selectionActionsRef = useRef<HTMLDivElement | null>(null);
+  const citeSelectionTextRef = useRef("");
+  const translationConfiguredRef = useRef(false);
+  const [translationSource, setTranslationSource] = useState("");
+  const [translationResult, setTranslationResult] = useState("");
+  const [translationLoading, setTranslationLoading] = useState(false);
+  const onCiteMessageRef = useRef(onCiteMessage);
+  onCiteMessageRef.current = onCiteMessage;
+  const onOpenSideChatRef = useRef(onOpenSideChat);
+  onOpenSideChatRef.current = onOpenSideChat;
+  // Debounced backend persistence for ask-card answers. Created once per component
+  // instance with useRef so it is stable across re-renders.
+  const persistAskAnswersRef = useRef(
+    debounce((sid: string, hid: string, answers: Record<number, any>) => {
+      ChatServiceApi()
+        .conversationServiceSaveAskAnswers(sid, hid, answers)
+        .catch(() => {});
+    }, 600),
+  );
+  const [feedbackState, dispatch] = useReducer(feedbackReducer, {
+    showModal: false,
+    isSubmitting: false,
+    localFeedbackType: normalizeFeedbackType(item?.feed_back),
+    localFeedbackHistoryId: item?.history_id,
+    targetHistoryId: undefined,
+  });
+
+  const workflowSession = useWorkflowStore((s) =>
+    sessionId ? (s.sessionByConversation[sessionId] ?? null) : null,
+  );
+
+  useEffect(() => {
+    dispatch({
+      type: "SYNC_FROM_SERVER",
+      feedbackType: normalizeFeedbackType(item?.feed_back),
+      historyId: item?.history_id,
+    });
+  }, [item?.feed_back, item?.history_id]);
+
+  const handleCopy = async (text?: string) => {
+    try {
+      await copyTextToClipboard(text || "");
+      message.success(t("chat.copySuccess"));
+    } catch {
+      message.error(t("chat.copyFailedManual"));
+    }
+  };
+
+  const hideCiteButton = useCallback(() => {
+    selectionActionsRef.current?.remove();
+    selectionActionsRef.current = null;
+    citeSelectionTextRef.current = "";
+  }, []);
+
+  const handleCiteSelectedText = useCallback(() => {
+    const selectedText = citeSelectionTextRef.current.trim();
+    if (!selectedText) {
+      hideCiteButton();
+      return;
+    }
+    onCiteMessageRef.current?.(selectedText);
+    window.getSelection()?.removeAllRanges();
+    hideCiteButton();
+  }, [hideCiteButton]);
+
+  const handleCiteSelectedTextRef = useRef(handleCiteSelectedText);
+  handleCiteSelectedTextRef.current = handleCiteSelectedText;
+
+  const handleOpenSideChat = useCallback(() => {
+    const selectedText = citeSelectionTextRef.current.trim();
+    if (!selectedText) {
+      hideCiteButton();
+      return;
+    }
+    onOpenSideChatRef.current?.({
+      selectedText,
+      historyId: item.history_id || item.id,
+      sequence: item.seq,
+    });
+    window.getSelection()?.removeAllRanges();
+    hideCiteButton();
+  }, [hideCiteButton, item.history_id, item.id, item.seq]);
+
+  const handleOpenSideChatRef = useRef(handleOpenSideChat);
+  handleOpenSideChatRef.current = handleOpenSideChat;
+
+  const handleTranslateSelectedText = useCallback(async () => {
+    const selectedText = citeSelectionTextRef.current.trim();
+    if (!selectedText) return;
+    setTranslationSource(selectedText);
+    setTranslationResult("");
+    setTranslationLoading(true);
+    window.getSelection()?.removeAllRanges();
+    hideCiteButton();
+    try {
+      const result = await translateSelectionText(selectedText);
+      setTranslationResult(result.translated_text);
+    } catch (error) {
+      if(error instanceof TranslationUnavailableError&&error.reason==="service_not_configured")window.location.href="/settings?section=knowledge&tool=translation";
+      else message.error(error instanceof TranslationUnavailableError?t("knowledge.dictionaryNotFound"):t("knowledge.translationFailed"));
+    } finally {
+      setTranslationLoading(false);
+    }
+  }, [hideCiteButton, t]);
+
+  const handleTranslateSelectedTextRef = useRef(handleTranslateSelectedText);
+  handleTranslateSelectedTextRef.current = handleTranslateSelectedText;
+
+  const showCiteButton = useCallback(
+    (text: string, top: number, left: number) => {
+      let actions = selectionActionsRef.current;
+      if (!actions) {
+        actions = document.createElement("div");
+        actions.className = "chat-selection-actions";
+        actions.setAttribute("role", "toolbar");
+        actions.setAttribute("aria-label", t("chat.sideChat.selectionActions"));
+        // Keep selection while clicking the cite button.
+        actions.addEventListener("mousedown", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+        });
+        actions.addEventListener("pointerdown", (event) => {
+          event.stopPropagation();
+        });
+
+        const citeButton = document.createElement("button");
+        citeButton.type = "button";
+        citeButton.className = "chat-selection-action";
+        citeButton.addEventListener("click", (event) => {
+          event.stopPropagation();
+          handleCiteSelectedTextRef.current();
+        });
+        actions.appendChild(citeButton);
+
+        if (onOpenSideChatRef.current) {
+          const sideChatButton = document.createElement("button");
+          sideChatButton.type = "button";
+          sideChatButton.className = "chat-selection-action";
+          sideChatButton.dataset.action = "side-chat";
+          sideChatButton.addEventListener("click", (event) => {
+            event.stopPropagation();
+            handleOpenSideChatRef.current();
+          });
+          actions.appendChild(sideChatButton);
+        }
+
+        const translateButton = document.createElement("button");
+        translateButton.type = "button";
+        translateButton.className = "chat-selection-action is-translation-disabled";
+        translateButton.dataset.action = "translate";
+        translateButton.setAttribute("aria-disabled", "true");
+        translateButton.addEventListener("click", (event) => {
+          event.stopPropagation();
+          handleTranslateSelectedTextRef.current();
+        });
+        actions.appendChild(translateButton);
+
+        document.body.appendChild(actions);
+        selectionActionsRef.current = actions;
+      }
+
+      citeSelectionTextRef.current = text;
+      const buttons = actions.querySelectorAll<HTMLButtonElement>(
+        ".chat-selection-action",
+      );
+      if (buttons[0]) {
+        buttons[0].textContent = t("chat.cite");
+      }
+      const sideChatButton = actions.querySelector<HTMLButtonElement>(
+        '[data-action="side-chat"]',
+      );
+      if (sideChatButton) {
+        sideChatButton.textContent = t("chat.sideChat.askFromSelection");
+      }
+      const translateButton = actions.querySelector<HTMLButtonElement>(
+        '[data-action="translate"]',
+      );
+      if (translateButton) {
+        translateButton.textContent = t("knowledge.translateSelection");
+        const wordSelection=isSingleEnglishWord(text);
+        translateButton.classList.toggle("is-translation-disabled", !wordSelection);
+        translateButton.setAttribute("aria-disabled", String(!wordSelection));
+        translateButton.title = wordSelection?t("knowledge.translateSelection"):t("knowledge.translationConfigureTip");
+        void loadTranslationStatus().then((configured) => {
+          translationConfiguredRef.current = configured;
+          const disabled=!configured&&!isSingleEnglishWord(text);
+          translateButton.classList.toggle("is-translation-disabled", disabled);
+          translateButton.setAttribute("aria-disabled", String(disabled));
+          translateButton.title = !disabled
+            ? t("knowledge.translateSelection")
+            : `${t("knowledge.translationConfigureTip")} · ${t("knowledge.translationConfigureAction")}`;
+        });
+      }
+      actions.style.top = `${top}px`;
+      actions.style.left = `${left}px`;
+    },
+    [t],
+  );
+
+  // Dismiss cite float on any outside click (capture), so it closes even when
+  // the click lands outside this message's onMouseUp handler.
+  useEffect(() => {
+    const dismissOnPointerDown = (event: PointerEvent) => {
+      const actions = selectionActionsRef.current;
+      if (!actions) {
+        return;
+      }
+      if (event.target instanceof Node && actions.contains(event.target)) {
+        return;
+      }
+      window.getSelection()?.removeAllRanges();
+      hideCiteButton();
+    };
+
+    document.addEventListener("pointerdown", dismissOnPointerDown, true);
+    return () => {
+      document.removeEventListener("pointerdown", dismissOnPointerDown, true);
+      hideCiteButton();
+    };
+  }, [hideCiteButton]);
+
+  const showSelectionActions = (container: HTMLDivElement) => {
+    const selection = window.getSelection();
+    const selectedText = selection?.toString().trim() || "";
+    if (!selection || !selectedText || selection.rangeCount < 1) {
+      hideCiteButton();
+      return;
+    }
+
+    const range = selection.getRangeAt(0);
+    const currentTarget = range.commonAncestorContainer;
+    const element =
+      currentTarget.nodeType === Node.ELEMENT_NODE
+        ? (currentTarget as Element)
+        : currentTarget.parentElement;
+
+    const messageBody = container.querySelector(".chat-bot");
+    if (!element || !messageBody?.contains(element)) {
+      hideCiteButton();
+      return;
+    }
+    // Editable writing blocks expose Cite in their own selection toolbar.
+    if (element.closest(".md-editable-block")) {
+      hideCiteButton();
+      return;
+    }
+
+    // Prefer line boxes from getClientRects(): cross-block / wrapped selections
+    // make getBoundingClientRect() as wide as the container, pushing the button right.
+    const lineRects = Array.from(range.getClientRects()).filter(
+      (lineRect) => lineRect.width > 0 && lineRect.height > 0,
+    );
+    if (lineRects.length === 0) {
+      hideCiteButton();
+      return;
+    }
+
+    const top = Math.min(...lineRects.map((lineRect) => lineRect.top));
+    const left = Math.min(...lineRects.map((lineRect) => lineRect.left));
+    const right = Math.max(...lineRects.map((lineRect) => lineRect.right));
+    const centerX = (left + right) / 2;
+    // Keep the fixed toolbar inside the viewport. The side-chat action makes
+    // it wider than the legacy single cite button.
+    const horizontalInset = onOpenSideChatRef.current ? 132 : 56;
+    const clampedLeft = Math.min(
+      Math.max(centerX, horizontalInset),
+      Math.max(horizontalInset, window.innerWidth - horizontalInset),
+    );
+
+    showCiteButton(selectedText, Math.max(8, top - 42), clampedLeft);
+  };
+
+  const handleMouseUp = (event: MouseEvent<HTMLDivElement>) => {
+    showSelectionActions(event.currentTarget);
+  };
+
+  const handleKeyUp = (event: KeyboardEvent<HTMLDivElement>) => {
+    const selectsAll =
+      (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "a";
+    if (!event.shiftKey && !selectsAll) return;
+    showSelectionActions(event.currentTarget);
+  };
+
+  const translationModal = (
+    <Modal
+      open={Boolean(translationSource)}
+      title={t("knowledge.translationTitle")}
+      footer={null}
+      onCancel={() => {
+        if (!translationLoading) {
+          setTranslationSource("");
+          setTranslationResult("");
+        }
+      }}
+    >
+      <div className="chat-translation-block">
+        <div className="chat-translation-label">{t("knowledge.translationOriginal")}</div>
+        <div className="chat-translation-text">{translationSource}</div>
+      </div>
+      <div className="chat-translation-block">
+        <div className="chat-translation-label">{t("knowledge.translationResult")}</div>
+        {translationLoading ? <Spin size="small" /> : <div className="chat-translation-text">{translationResult}</div>}
+      </div>
+    </Modal>
+  );
+
+  function renderLoading() {
+    return (
+      <div className="chat-assistant-msg-chat-loading">
+        <Spin size="small" />
+        <span>{t("chat.generatingAnswer")}</span>
+      </div>
+    );
+  }
+
+  function renderOnboardingInfo(info: any) {
+    return (
+      <div className="onboarding-info">
+        <div>{info.prologue}</div>
+        <ul>
+          {info.suggested_questions?.map((question: any, index: any) => {
+            if (!question) {
+              return null;
+            }
+            return (
+              <li key={index}>
+                <a onClick={() => sendMessage(question, false)}>{question}</a>
+              </li>
+            );
+          })}
+        </ul>
+      </div>
+    );
+  }
+
+  function renderError() {
+    return (
+      <div style={{ color: "#b8c3d7" }}>
+        <ExclamationCircleOutlined style={{ fontSize: 20 }} />
+      </div>
+    );
+  }
+
+  function renderSourceButton(sources?: ChatSourceCollection) {
+    const displaySources = getReferenceSources(sources);
+    if (!displaySources.length) return null;
+    return (
+      <Tooltip title={`${t("chat.references")} (${displaySources.length})`}>
+        <Button
+          className="tool-btn source-btn"
+          onClick={() => onOpenSources?.(displaySources, String(item?.content || item?.delta || "").slice(0, 180))}
+          aria-label={`${t("chat.references")} (${displaySources.length})`}
+        >
+          <span className="chat-source-button-icons" aria-hidden="true">
+            {displaySources.slice(0, 3).map((source, sourceIndex) => (
+              <SourceFavicon
+                source={source}
+                compact
+                key={getSourceDedupKey(source, sourceIndex)}
+              />
+            ))}
+          </span>
+          <span className="chat-source-button-label">
+            {t("chat.references")}
+          </span>
+          <span className="chat-source-button-count">
+            {displaySources.length}
+          </span>
+        </Button>
+      </Tooltip>
+    );
+  }
+
+  function getCurrentFeedback(historyId?: string) {
+    const resolvedHistoryId = historyId || item?.history_id;
+    if (
+      resolvedHistoryId &&
+      feedbackState.localFeedbackHistoryId === resolvedHistoryId
+    ) {
+      return feedbackState.localFeedbackType;
+    }
+
+    if (resolvedHistoryId && item?.answers) {
+      const answer = item.answers.find(
+        (ans: any) => ans.history_id === resolvedHistoryId,
+      );
+      if (
+        answer &&
+        answer.feed_back !== undefined &&
+        answer.feed_back !== null
+      ) {
+        return normalizeFeedbackType(answer.feed_back);
+      }
+    }
+
+    if (!historyId || resolvedHistoryId === item?.history_id) {
+      return normalizeFeedbackType(item?.feed_back);
+    }
+
+    return undefined;
+  }
+
+  function getFeedbackRecord(historyId?: string) {
+    const resolvedHistoryId = historyId || item?.history_id;
+    if (resolvedHistoryId && item?.answers) {
+      const answer = item.answers.find(
+        (candidate: any) => candidate.history_id === resolvedHistoryId,
+      );
+      if (answer) {
+        return answer;
+      }
+    }
+    return item;
+  }
+
+  const createUpdatedItem = (
+    feedbackType: FeedBackChatHistoryRequestTypeEnum | undefined,
+    targetHistoryId?: string,
+    details?: { reason?: string; expectedAnswer?: string },
+  ) => {
+    const resolvedHistoryId = targetHistoryId || item?.history_id;
+
+    const applyFeedbackFields = (
+      record: any,
+      nextFeedBack: FeedBackChatHistoryRequestTypeEnum | undefined,
+    ) => {
+      if (nextFeedBack !== undefined) {
+        return {
+          ...record,
+          feed_back: nextFeedBack,
+          reason: details?.reason,
+          expected_answer: details?.expectedAnswer,
+        };
+      }
+      return {
+        ...record,
+        feed_back: undefined,
+        reason: undefined,
+        expected_answer: undefined,
+      };
+    };
+
+    if (resolvedHistoryId && item?.answers) {
+      const hasTargetAnswer = item.answers.some(
+        (ans: any) => ans.history_id === resolvedHistoryId,
+      );
+      const updatedAnswers = item.answers.map((ans: any) =>
+        ans.history_id === resolvedHistoryId
+          ? applyFeedbackFields(ans, feedbackType)
+          : ans,
+      );
+      const itemLevelFeedback =
+        resolvedHistoryId === item?.history_id || !hasTargetAnswer
+          ? feedbackType
+          : undefined;
+      return applyFeedbackFields(
+        { ...item, answers: updatedAnswers },
+        itemLevelFeedback,
+      );
+    }
+    return applyFeedbackFields(item, feedbackType);
+  };
+
+  function onFeedBack(
+    type: FeedBackChatHistoryRequestTypeEnum,
+    historyId?: string,
+  ) {
+    if (feedbackState.isSubmitting) {
+      return;
+    }
+
+    const targetHistoryId = historyId || item?.history_id;
+    if (!targetHistoryId) {
+      message.error(t("chat.historyIdMissingFeedback"));
+      return;
+    }
+
+    const currentFeedBack = getCurrentFeedback(historyId);
+    const isCancel = currentFeedBack === type;
+    const requestType = isCancel
+      ? FeedBackChatHistoryRequestTypeEnum.FeedBackTypeUnspecified
+      : type;
+    const nextFeedbackType = isCancel ? undefined : type;
+
+    dispatch({ type: "SUBMIT_START" });
+
+    ChatServiceApi()
+      .conversationServiceFeedBackChatHistory({
+        feedBackChatHistoryRequest: {
+          history_id: targetHistoryId,
+          type: requestType,
+        },
+      })
+      .then(() => {
+        const updatedItem = createUpdatedItem(
+          nextFeedbackType,
+          targetHistoryId,
+        );
+        updateMessage(updatedItem);
+
+        dispatch({
+          type: "SUBMIT_SUCCESS",
+          feedbackType: nextFeedbackType,
+          historyId: targetHistoryId,
+        });
+      })
+      .catch(() => {
+        dispatch({ type: "SUBMIT_FAIL" });
+      });
+  }
+
+  function handleDislikeClick(historyId?: string) {
+    if (feedbackState.isSubmitting) {
+      return;
+    }
+
+    const targetHistoryId = historyId || item?.history_id;
+
+    if (!targetHistoryId) {
+      message.error(t("chat.historyIdMissingFeedback"));
+      return;
+    }
+
+    if (
+      getCurrentFeedback(historyId) !==
+        FeedBackChatHistoryRequestTypeEnum.FeedBackTypeUnlike &&
+      AgentAppsAuth.getUserInfo()?.chatUnlikeSwitch === true
+    ) {
+      dispatch({ type: "OPEN_MODAL", historyId: targetHistoryId });
+      return;
+    }
+
+    onFeedBack(
+      FeedBackChatHistoryRequestTypeEnum.FeedBackTypeUnlike,
+      historyId,
+    );
+  }
+
+  function handleFeedbackSubmit(_reasons: string[], _comment: string) {
+    const targetHistoryId = feedbackState.targetHistoryId || item?.history_id;
+    if (!targetHistoryId) {
+      message.error(t("chat.historyIdMissingFeedback"));
+      dispatch({ type: "CLOSE_MODAL" });
+      return;
+    }
+
+    if (feedbackState.isSubmitting) {
+      return;
+    }
+
+    dispatch({ type: "SUBMIT_START" });
+
+    ChatServiceApi()
+      .conversationServiceFeedBackChatHistory({
+        feedBackChatHistoryRequest: {
+          history_id: targetHistoryId,
+          type: FeedBackChatHistoryRequestTypeEnum.FeedBackTypeUnlike,
+          reason: _reasons.join(","),
+          expected_answer: _comment,
+        } as any,
+      })
+      .then(() => {
+        const updatedItem = createUpdatedItem(
+          FeedBackChatHistoryRequestTypeEnum.FeedBackTypeUnlike,
+          targetHistoryId,
+          { reason: _reasons.join(","), expectedAnswer: _comment },
+        );
+        updateMessage(updatedItem);
+
+        dispatch({
+          type: "SUBMIT_SUCCESS",
+          feedbackType: FeedBackChatHistoryRequestTypeEnum.FeedBackTypeUnlike,
+          historyId: targetHistoryId,
+        });
+        message.success(t("chat.thanksFeedback"));
+      })
+      .catch(() => {
+        dispatch({ type: "SUBMIT_FAIL" });
+      });
+  }
+
+  function onSelectAnswer(selectedIndex: number, preference: PreferenceType) {
+    const allAnswers = item.answers || [];
+    const selectedAnswer = allAnswers[selectedIndex];
+    const selectedHistoryId = selectedAnswer.history_id;
+
+    const deletedHistoryIds = allAnswers
+      .filter((_: any, idx: number) => idx !== selectedIndex)
+      .map((answer: any) => answer.history_id);
+
+    const promises = deletedHistoryIds.map((deletedHistoryId: string) => {
+      return ChatServiceApi().conversationServiceSetChatHistory({
+        setChatHistoryRequest: {
+          deleted_history_id: deletedHistoryId,
+          set_history_id: selectedHistoryId,
+        } as any,
+      });
+    });
+
+    Promise.all(promises)
+      .then(() => {
+        item.answer_preference = preference;
+        item.selected_answer_index = selectedIndex;
+        if (selectedAnswer) {
+          item.delta = selectedAnswer.content || "";
+          item.raw_delta = selectedAnswer.raw_content || item.raw_delta;
+          item.reasoning_content = selectedAnswer.reasoning_content || "";
+          item.sources = selectedAnswer.sources || item.sources;
+          item.history_id = selectedAnswer.history_id || item.history_id;
+          item.thinking_duration_s = selectedAnswer.thinking_duration_s;
+        }
+        updateMessage(item);
+        onPreferenceSelect?.(preference, sessionId);
+      })
+      .catch(() => {});
+  }
+
+  function renderAnswerFooter(answerIndex: number, showFullToolbar = false) {
+    const answer = item.answers?.[answerIndex];
+    if (!answer) {
+      return null;
+    }
+
+    const answerHistoryId = answer.history_id;
+    const answerFeedBack = getCurrentFeedback(answerHistoryId);
+
+    return (
+      <>
+        <Divider
+          className="chat-assistant-msg-tool-divider"
+          style={{ margin: "12px 0" }}
+        />
+        <div className="chat-assistant-msg-tool-chat-toolbar">
+          <div className="chat-assistant-msg-tool-actions">
+            <Tooltip title={t("chat.copy")}>
+              <Button
+                className="tool-btn"
+                icon={<CopyOutlined />}
+                onClick={() => handleCopy(answer.content)}
+              />
+            </Tooltip>
+            <ArtifactDownloadButton
+              sessionId={sessionId}
+              historyId={answerHistoryId}
+            />
+            {showFullToolbar && index === length - 1 && (
+              <Tooltip title={t("chat.regenerate")}>
+                <Button
+                  className="tool-btn"
+                  aria-label={t("chat.regenerate")}
+                  disabled={regenerateDisabled}
+                  icon={<ReloadOutlined aria-hidden="true" />}
+                  onClick={regenerate}
+                />
+              </Tooltip>
+            )}
+            {renderSourceButton(answer.sources)}
+          </div>
+          {showFullToolbar && (
+            <Flex>
+              {answerFeedBack ===
+              FeedBackChatHistoryRequestTypeEnum.FeedBackTypeLike ? (
+                <LikeFilled
+                  className="tool-btn"
+                  onClick={() =>
+                    onFeedBack(
+                      FeedBackChatHistoryRequestTypeEnum.FeedBackTypeLike,
+                      answerHistoryId,
+                    )
+                  }
+                />
+              ) : (
+                <LikeOutlined
+                  className="tool-btn"
+                  onClick={() =>
+                    onFeedBack(
+                      FeedBackChatHistoryRequestTypeEnum.FeedBackTypeLike,
+                      answerHistoryId,
+                    )
+                  }
+                />
+              )}
+              {answerFeedBack ===
+              FeedBackChatHistoryRequestTypeEnum.FeedBackTypeUnlike ? (
+                <DislikeFilled
+                  className="tool-btn"
+                  onClick={() => handleDislikeClick(answerHistoryId)}
+                />
+              ) : (
+                <DislikeOutlined
+                  className="tool-btn"
+                  onClick={() => handleDislikeClick(answerHistoryId)}
+                />
+              )}
+            </Flex>
+          )}
+        </div>
+      </>
+    );
+  }
+
+  function renderForkAction() {
+    if (!props.onFork || item.archived_failure || !item.history_id) return null;
+    if (!runCompleted) return null;
+    const candidate =
+      item.answers?.length >= 2 && item.selected_answer_index == null;
+    const disabled = candidate || props.forkPending;
+    const tooltip = candidate
+      ? "chat.fork.selectAnswerFirst"
+      : "chat.fork.title";
+
+    return (
+      <Tooltip title={t(tooltip)} trigger={["hover", "focus"]}>
+        <span className="chat-fork-action" tabIndex={disabled ? 0 : undefined}>
+          <Button
+            className="tool-btn"
+            aria-label={t("chat.fork.title")}
+            icon={<BranchesOutlined aria-hidden="true" />}
+            disabled={disabled}
+            onClick={() => props.onFork?.(item.history_id)}
+          />
+        </span>
+      </Tooltip>
+    );
+  }
+
+  function renderFooter() {
+    const currentFeedback = getCurrentFeedback();
+
+    return (
+      <>
+        <Divider className="chat-assistant-msg-tool-divider" />
+        <div className="chat-assistant-msg-tool-chat-toolbar">
+          <div className="chat-assistant-msg-tool-actions">
+            <Tooltip title={t("chat.copy")}>
+              <Button
+                className="tool-btn"
+                icon={<CopyOutlined />}
+                onClick={() => handleCopy(item.delta)}
+              />
+            </Tooltip>
+            <ArtifactDownloadButton
+              sessionId={sessionId}
+              historyId={item.history_id}
+            />
+            {index === length - 1 && (
+              <Tooltip title={t("chat.regenerate")}>
+                <Button
+                  className="tool-btn"
+                  aria-label={t("chat.regenerate")}
+                  disabled={regenerateDisabled}
+                  icon={<ReloadOutlined aria-hidden="true" />}
+                  onClick={regenerate}
+                />
+              </Tooltip>
+            )}
+            {renderSourceButton(item.sources)}
+            {renderForkAction()}
+          </div>
+          <Flex>
+            {currentFeedback ===
+            FeedBackChatHistoryRequestTypeEnum.FeedBackTypeLike ? (
+              <LikeFilled
+                className="tool-btn"
+                onClick={() =>
+                  onFeedBack(
+                    FeedBackChatHistoryRequestTypeEnum.FeedBackTypeLike,
+                  )
+                }
+              />
+            ) : (
+              <LikeOutlined
+                className="tool-btn"
+                onClick={() =>
+                  onFeedBack(
+                    FeedBackChatHistoryRequestTypeEnum.FeedBackTypeLike,
+                  )
+                }
+              />
+            )}
+            {currentFeedback ===
+            FeedBackChatHistoryRequestTypeEnum.FeedBackTypeUnlike ? (
+              <DislikeFilled
+                className="tool-btn"
+                onClick={() => handleDislikeClick()}
+              />
+            ) : (
+              <DislikeOutlined
+                className="tool-btn"
+                onClick={() => handleDislikeClick()}
+              />
+            )}
+          </Flex>
+        </div>
+      </>
+    );
+  }
+
+  const runRetryable =
+    !item.archived_failure &&
+    index === length - 1 &&
+    (item.run_status === "failed" || item.run_status === "interrupted");
+  const runCancelled = item.run_status === "cancelled";
+
+  function renderBottom() {
+    const runActive =
+      !item.run_status &&
+      item.finish_reason ===
+        ChatConversationsResponseFinishReasonEnum.FinishReasonUnspecified;
+    if (
+      item.tool_limit_pending &&
+      item.tool_limit_pending.decision_id !==
+        item.resolved_tool_limit_decision_id &&
+      sessionId &&
+      runActive
+    ) {
+      return (
+        <ToolLimitCard
+          key={item.tool_limit_pending.decision_id}
+          pending={item.tool_limit_pending}
+          onDecision={async (action) => {
+            const decisionId = item.tool_limit_pending.decision_id;
+            await decideToolLimit(sessionId, decisionId, action);
+            updateMessage({
+              id: item.id,
+              history_id: item.history_id,
+              tool_limit_pending: undefined,
+              resolved_tool_limit_decision_id: decisionId,
+            });
+          }}
+        />
+      );
+    }
+    // Render ask_pending card if present
+    if (item.ask_pending) {
+      const askPending = item.ask_pending;
+      const showAskCard = shouldRenderAskPending(
+        item.ask_answered,
+        index === length - 1,
+        !!hasLaterUserMessage,
+      );
+      const isReadOnly = isAskPendingReadOnly(
+        item.ask_answered,
+        index === length - 1,
+        !!hasLaterUserMessage,
+      );
+      if (askPending.mail_draft || (askPending.mail_drafts && askPending.mail_drafts.length)) {
+        const drafts =
+          askPending.mail_drafts && askPending.mail_drafts.length
+            ? askPending.mail_drafts
+            : askPending.mail_draft
+              ? [askPending.mail_draft]
+              : [];
+        const remainingDrafts = unansweredMailDrafts(
+          { mail_drafts: drafts },
+          item.answered_mail_draft_ids,
+        );
+        if (!remainingDrafts.length) return null;
+        const mailReadOnly = mailDraftCardsReadOnly(
+          disabled,
+          item.ask_answered,
+        );
+        const markDraftAnswered = (confirmedId: string) => {
+          const nextAnswered = Array.from(
+            new Set([
+              ...(item.answered_mail_draft_ids || []),
+              String(confirmedId || "").trim(),
+            ]),
+          ).filter(Boolean);
+          updateMessage({
+            ...item,
+            answered_mail_draft_ids: nextAnswered,
+            ask_answered:
+              unansweredMailDrafts({ mail_drafts: drafts }, nextAnswered)
+                .length === 0,
+          });
+        };
+        return (
+          <div className="mail-draft-card-list" key={askPending.ask_id}>
+            {remainingDrafts.map((draft) => {
+              const draftId = String(draft.draft_id || "").trim();
+              if (String(draft.status || "") === "needs_mailbox") {
+                return (
+                  <MailMailboxCard
+                    key={draftId || askPending.ask_id}
+                    draft={draft}
+                    disabled={mailReadOnly}
+                    onConfirm={async (mailbox, confirmedId) => {
+                      const started = await props.sendMessage?.(
+                        t("chat.mailMailbox.confirmQuery", { mailbox }),
+                        undefined,
+                        {
+                          mail_mailbox_confirm: mailbox,
+                          mail_mailbox_confirm_draft_id: confirmedId,
+                        },
+                      );
+                      if (started) {
+                        markDraftAnswered(confirmedId);
+                      }
+                    }}
+                  />
+                );
+              }
+              return (
+                <MailDraftCard
+                  key={draftId || askPending.ask_id}
+                  draft={draft}
+                  disabled={mailReadOnly}
+                  conversationFiles={conversationFiles}
+                  onConfirm={async (confirmedId, revision, patch) => {
+                    const started = await props.sendMessage?.(
+                      t("chat.mailDraft.confirmQuery"),
+                      undefined,
+                      {
+                        mail_draft_confirm_id: confirmedId,
+                        mail_draft_confirm_revision: revision,
+                        ...(patch ? { mail_draft_patch: patch } : {}),
+                      },
+                    );
+                    if (started) {
+                      markDraftAnswered(confirmedId);
+                    }
+                  }}
+                />
+              );
+            })}
+          </div>
+        );
+      }
+      if (!showAskCard) return null;
+      return (
+        <AskCard
+          key={askPending.ask_id}
+          askPending={askPending}
+          disabled={isReadOnly}
+          savedAnswers={item.ask_saved_answers}
+          onAnswerChange={(idx, ans) => {
+            const currentAnswers = {
+              ...(item.ask_saved_answers || {}),
+              [idx]: ans,
+            };
+            // Update in-memory message immediately so answers survive session switches.
+            updateMessage({ ...item, ask_saved_answers: currentAnswers });
+            // Debounced write to backend so answers survive page reload.
+            if (sessionId && item.history_id) {
+              persistAskAnswersRef.current(
+                sessionId,
+                item.history_id,
+                currentAnswers,
+              );
+            }
+          }}
+          onSubmit={(payload) => {
+            persistAskAnswersRef.current.cancel();
+            // Mark the card as answered in memory so it shows as disabled immediately.
+            updateMessage({
+              ...item,
+              ask_answered: true,
+              ask_saved_answers: undefined,
+            });
+            props.sendMessage?.(payload.text, undefined, {
+              ask_answers_structured: payload.structured,
+            });
+          }}
+        />
+      );
+    }
+    // Show stop button while still streaming (no card present).
+    if (runActive) {
+      return (
+        <Button className="stop-btn" onClick={stopGeneration}>
+          {t("chat.stopGenerate")}
+        </Button>
+      );
+    }
+    // A cancelled run has no failure card, so keep its regeneration action here.
+    if (runCancelled) {
+      return (
+        <Button
+          className="stop-btn"
+          disabled={regenerateDisabled}
+          onClick={regenerate}
+        >
+          {t("chat.regenerate")}
+        </Button>
+      );
+    }
+    if (
+      item.finish_reason ===
+      ChatConversationsResponseFinishReasonEnum.FinishReasonUnknown
+    ) {
+      return (
+        <>
+          <span style={{ color: "#b8c3d7" }}>
+            {t("chat.runStatus.providerError")}
+          </span>
+          <Button
+            className="stop-btn"
+            style={{ marginLeft: 10 }}
+            disabled={regenerateDisabled}
+            onClick={regenerate}
+          >
+            {t("chat.regenerate")}
+          </Button>
+        </>
+      );
+    }
+    return null;
+  }
+
+  const hasMultipleAnswers =
+    item.answers && Array.isArray(item.answers) && item.answers.length >= 2;
+
+  const hasMultipleAnswersContent =
+    hasMultipleAnswers &&
+    item.answers.some(
+      (answer: any) =>
+        (answer.content && trim(answer.content)?.length > 0) ||
+        (answer.reasoning_content &&
+          trim(answer.reasoning_content)?.length > 0),
+    );
+
+  const shouldShowLoading =
+    !item.model_retry &&
+    !(item.delta && trim(item.delta)?.length > 0) &&
+    !(item.reasoning_content && trim(item.reasoning_content)?.length > 0) &&
+    !hasMultipleAnswersContent &&
+    !item.run_status &&
+    item.finish_reason ===
+      ChatConversationsResponseFinishReasonEnum.FinishReasonUnspecified;
+  const runCompleted =
+    item.run_status === "completed" ||
+    (!item.run_status &&
+      item.finish_reason ===
+        ChatConversationsResponseFinishReasonEnum.FinishReasonStop);
+
+  const shouldUseMultiAnswerStyle =
+    hasMultipleAnswers &&
+    (item.selected_answer_index === undefined ||
+      item.selected_answer_index === null);
+  const modalFeedbackRecord = getFeedbackRecord(feedbackState.targetHistoryId);
+
+  if (shouldUseMultiAnswerStyle) {
+    return (
+      <div
+        className="chat-assistant-msg-multi-answer-wrap"
+        onMouseUp={handleMouseUp}
+        onKeyUp={handleKeyUp}
+      >
+        <IdentityAvatar className="chat-avatar" kind="soul" size={32} />
+        <div className="chat-bot-box-multi">
+        <div className="chat-bot">
+            <ModelRouteSummary route={item.model_route} />
+            <ExternalExecutionSummary execution={item.execution} />
+            <RunStatusCard
+              terminal={item.run_terminal}
+              conversationId={sessionId}
+              providerId={item.model_route?.provider_id}
+              providerName={item.model_route?.provider_name}
+              modelName={item.model_route?.model_name}
+              onRetry={runRetryable ? regenerate : undefined}
+              retryDisabled={regenerateDisabled}
+            />
+            {shouldShowLoading
+              ? renderLoading()
+              : renderText({ ...item, delta: "" })}
+            {item.finish_reason ===
+              ChatConversationsResponseFinishReasonEnum.FinishReasonUnknown &&
+              renderError()}
+
+            {}
+            <MultiAnswerDisplay
+              key={item.history_id || item.id || `multi-answer-${index}`}
+              answers={item.answers}
+              showPreference={isLatestDualAnswer}
+              renderText={(
+                content: string,
+                reasoningContent?: string,
+                answerIndex?: number,
+              ) => {
+                const answer = item.answers[answerIndex || 0];
+                const uniqueKey = answer?.history_id || `answer_${answerIndex}`;
+
+                return renderText(
+                  {
+                    ...item,
+                    delta: content,
+                    reasoning_content: reasoningContent,
+                    sources: answer?.sources || [],
+                    thinking_duration_s: answer?.thinking_duration_s,
+                  },
+                  uniqueKey,
+                );
+              }}
+              onSelectAnswer={onSelectAnswer}
+              disabled={!runCompleted}
+              renderFooter={runCompleted ? renderAnswerFooter : undefined}
+              initialSelectedIndex={item.selected_answer_index}
+              initialPreference={item.answer_preference}
+              isStreaming={
+                !item.run_status &&
+                item.finish_reason ===
+                  ChatConversationsResponseFinishReasonEnum.FinishReasonUnspecified
+              }
+            />
+            {renderForkAction()}
+          </div>
+          {!item.fork_read_only && (item.ask_pending || index === length - 1) && renderBottom()}
+          {index === length - 1 && workflowSession && sessionId && (
+            <WorkflowPanel
+              key={sessionId}
+              conversationId={sessionId}
+              onSendMessage={(text) => props.sendMessage?.(text)}
+              onStop={props.stopGeneration}
+            />
+          )}
+        </div>
+        <FeedbackModal
+          visible={feedbackState.showModal}
+          onCancel={() => dispatch({ type: "CLOSE_MODAL" })}
+          onSubmit={handleFeedbackSubmit}
+          submitLoading={feedbackState.isSubmitting}
+          initialReason={modalFeedbackRecord?.reason}
+          initialComment={modalFeedbackRecord?.expected_answer}
+        />
+        {translationModal}
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="chat-assistant-msg-single-answer-wrap"
+      onMouseUp={handleMouseUp}
+      onKeyUp={handleKeyUp}
+    >
+      <IdentityAvatar className="chat-avatar" kind="soul" size={32} />
+      <div className="chat-bot-box-single">
+        <div className="chat-bot">
+          <ModelRouteSummary route={item.model_route} />
+          <ExternalExecutionSummary execution={item.execution} />
+          <RunStatusCard
+            terminal={item.run_terminal}
+            conversationId={sessionId}
+            providerId={item.model_route?.provider_id}
+            providerName={item.model_route?.provider_name}
+            modelName={item.model_route?.model_name}
+            onRetry={runRetryable ? regenerate : undefined}
+            retryDisabled={regenerateDisabled}
+          />
+          {shouldShowLoading
+            ? renderLoading()
+            : item.onboardingInfo
+              ? renderOnboardingInfo(item.onboardingInfo)
+              : renderText(item)}
+          {item.finish_reason ===
+            ChatConversationsResponseFinishReasonEnum.FinishReasonUnknown &&
+            renderError()}
+
+          {}
+          {runCompleted && !item.onboardingInfo && renderFooter()}
+          {item.fork_read_only && !item.delta && <span>{t("chat.fork.emptyTerminal")}</span>}
+        </div>
+        {!item.fork_read_only && (item.ask_pending || index === length - 1) && renderBottom()}
+        {index === length - 1 && workflowSession && sessionId && (
+          <WorkflowPanel
+            key={sessionId}
+            conversationId={sessionId}
+            onSendMessage={(text) => props.sendMessage?.(text)}
+            onStop={props.stopGeneration}
+          />
+        )}
+      </div>
+      <FeedbackModal
+        visible={feedbackState.showModal}
+        onCancel={() => dispatch({ type: "CLOSE_MODAL" })}
+        onSubmit={handleFeedbackSubmit}
+        submitLoading={feedbackState.isSubmitting}
+        initialReason={modalFeedbackRecord?.reason}
+        initialComment={modalFeedbackRecord?.expected_answer}
+      />
+      {translationModal}
+    </div>
+  );
+};
+
+export default AssistantMessage;

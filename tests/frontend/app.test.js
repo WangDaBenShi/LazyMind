@@ -1,0 +1,128 @@
+import { describe, expect, it } from 'vitest';
+import {
+  appSource,
+  defaultModelConfigPanelSource,
+  formRulesSource,
+  frontendDockerfileSource,
+  indexHtml,
+  localRuntimeFrontendSource,
+  loginSource,
+  mainLayoutSource,
+  mainEntry,
+  routePaths,
+  runtimeApiBaseSource,
+  runtimeDesktopBridgeSource,
+  runtimeFeaturesSource,
+  runtimeModeSource,
+  routerSource,
+} from './setup.js';
+
+describe('Vite entrypoint', () => {
+  it('mounts the React app through the current module entry', () => {
+    expect(indexHtml).toContain('<div id="app"></div>');
+    expect(indexHtml).toContain('<script type="module" src="/src/main.tsx"></script>');
+    expect(mainEntry).toContain('createRoot');
+    expect(mainEntry).toContain('document.getElementById("app")');
+    expect(mainEntry).toContain('<GlobalErrorBoundary>');
+    expect(mainEntry).toContain('<App />');
+  });
+});
+
+describe('router contract', () => {
+  it('keeps route rendering synchronous with browser URL changes', () => {
+    expect(appSource).not.toContain('v7_startTransition: true');
+  });
+
+  it('keeps public auth routes available', () => {
+    expect(routePaths).toContain('/login');
+    expect(routePaths).toContain('/register');
+    expect(routePaths).toContain('/loginTransition');
+  });
+
+  it('keeps primary authenticated product routes available', () => {
+    expect(routePaths).toContain('/');
+    expect(routePaths).toContain('agent/chat');
+    expect(routePaths).toContain('lib/knowledge');
+    expect(routePaths).toContain('databases');
+    expect(routePaths).toContain('cloud-documents');
+    expect(routePaths).toContain('memory-management');
+    expect(routePaths).toContain('self-evolution');
+  });
+
+  it('keeps legacy model provider URLs as Settings redirects only', () => {
+    expect(routerSource).not.toContain('ModelProviderPage');
+    expect(routerSource).toContain(
+      '<Route path="model-providers/default-services" element={<Navigate to="/settings?section=models" replace />} />',
+    );
+    expect(routerSource).toContain(
+      '<Route path="model-providers/models" element={<Navigate to="/settings?section=models&view=providers" replace />} />',
+    );
+    expect(routerSource).toContain(
+      '<Route path="model-providers/tools" element={<Navigate to="/settings?section=system_tools" replace />} />',
+    );
+  });
+
+  it('keeps admin routes available', () => {
+    expect(routePaths).toContain('/admin');
+    expect(routePaths).toContain('users');
+    expect(routePaths).toContain('groups');
+    expect(routePaths).toContain('groups/:id');
+  });
+
+  it('keeps fallback navigation wired to the app root', () => {
+    expect(routerSource).toContain('<Route path="*" element={<Navigate to="/" replace />} />');
+  });
+});
+
+describe('runtime facade contract', () => {
+  it('keeps runtime facade modules present', () => {
+    expect(runtimeModeSource).toContain('export type RuntimeMode');
+    expect(runtimeFeaturesSource).toContain('export const runtimeFeatures');
+    expect(runtimeApiBaseSource).toContain('export function getApiBaseUrl');
+    expect(runtimeDesktopBridgeSource).toContain('export function openLogsDir');
+    expect(runtimeDesktopBridgeSource).toContain('export function openDataDir');
+    expect(runtimeDesktopBridgeSource).toContain('export function runtimeStatus');
+    expect(runtimeDesktopBridgeSource).toContain('export function exportDiagnostics');
+    expect(runtimeDesktopBridgeSource).toContain('handler.call(bridge)');
+  });
+
+  it('routes runtime mode checks through the facade', () => {
+    expect(routerSource).toContain('runtimeFeatures.hideRegister');
+    expect(routerSource).toContain('runtimeFeatures.hideCloudAdmin');
+    expect(routerSource).toContain('runtimeFeatures.hideEvo');
+    expect(mainLayoutSource).toContain('runtimeFeatures.hideEvo');
+    expect(loginSource).toContain('runtimeFeatures.hideRegister');
+    expect(defaultModelConfigPanelSource).toContain(
+      'import { runtimeFeatures } from "@/runtime/features";',
+    );
+    expect(defaultModelConfigPanelSource).toContain(
+      'runtimeFeatures.hideUserGroupSurfaces',
+    );
+    expect(mainLayoutSource).not.toContain('VITE_HIDE_EVO');
+    expect(routerSource).not.toContain('VITE_HIDE_EVO');
+    expect(loginSource).not.toContain('VITE_HIDE_EVO');
+  });
+
+  it('keeps frontend Docker build args available while the local runtime serves the frontend', () => {
+    expect(frontendDockerfileSource).toContain('ARG VITE_API_BASE_URL');
+    expect(frontendDockerfileSource).toContain('ARG VITE_LAZYMIND_MODE');
+    expect(frontendDockerfileSource).toContain('ARG VITE_HIDE_EVO');
+    expect(localRuntimeFrontendSource).toContain('VITE_LAZYMIND_MODE=');
+    expect(localRuntimeFrontendSource).toContain('filepath.Join(paths.RepoRoot, "frontend")');
+  });
+});
+
+describe('signin validation contract', () => {
+  it('keeps username and password validators exported', () => {
+    expect(formRulesSource).toContain('export const validateUsername');
+    expect(formRulesSource).toContain('export const validatePassword');
+    expect(formRulesSource).toContain('export const usernameRules');
+    expect(formRulesSource).toContain('export const passwordRules');
+  });
+
+  it('keeps username and password regex definitions', () => {
+    expect(formRulesSource).toMatch(/const\s+USERNAME_REGEX\s*=/);
+    expect(formRulesSource).toMatch(/const\s+PASSWORD_REGEX\s*=/);
+    expect(formRulesSource).toContain('USERNAME_MAX_LENGTH');
+  });
+});

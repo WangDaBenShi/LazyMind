@@ -1,0 +1,1897 @@
+import {
+  FC,
+  useState,
+  useEffect,
+  useRef,
+  useCallback,
+  useMemo,
+  MouseEvent,
+  ChangeEvent,
+} from "react";
+import {
+  Alert,
+  Badge,
+  Button,
+  Modal,
+  Tooltip,
+  Flex,
+  message,
+  notification,
+  Input,
+  TablePaginationConfig,
+  Tag,
+  Space,
+  Typography,
+} from "antd";
+import type { ColumnsType } from "antd/es/table";
+import { useLocation, useNavigate } from "react-router-dom";
+import moment from "moment";
+import {
+  AppstoreOutlined,
+  ArrowLeftOutlined,
+  CheckOutlined,
+  DatabaseOutlined,
+  HistoryOutlined,
+  PlusOutlined,
+  SearchOutlined,
+} from "@ant-design/icons";
+
+import SyncKnowledgeBaseCreationFlow, {
+  useSyncKnowledgeBaseCreation,
+} from "@/modules/knowledge/components/SyncKnowledgeBaseCreationFlow";
+import TypedConfirmModal, {
+  type TypedConfirmModalRef,
+} from "@/components/ui/TypedConfirmModal";
+import CreateUpdateModal, {
+  UpdateImperativeProps,
+} from "@/modules/knowledge/components/UpdateModal";
+import CreateKnowledgeBaseModal, {
+  CreateKnowledgeBaseModalRef,
+} from "@/modules/knowledge/components/CreateKnowledgeBaseModal";
+import UIUtils from "@/modules/knowledge/utils/ui";
+import { runtimeFeatures } from "@/runtime/features";
+import {
+  KnowledgeBaseServiceApi,
+} from "@/modules/knowledge/utils/request";
+import { ALL_TAGS } from "@/modules/knowledge/constants/common";
+import {
+  Dataset,
+  DatasetAclEnum,
+} from "@/api/generated/knowledge-client";
+import KnowledgeTag from "@/modules/knowledge/components/KnowledgeTag";
+import FileUtils from "@/modules/knowledge/utils/file";
+import {
+  effectiveProcessingLevel,
+  type ProcessingLevel,
+} from "@/modules/knowledge/utils/processingLevel";
+
+import { ListPageTable } from "@/components/ui";
+import { useTranslation } from "react-i18next";
+import { axiosInstance, BASE_URL } from "@/components/request";
+import { AgentAppsAuth } from "@/components/auth";
+import {
+  fetchModelFeatures,
+  isImageEmbedRequired,
+  MODEL_FEATURES_CHANGED_EVENT,
+} from "@/hooks/useModelFeatures";
+import { dataSourceScanApi } from "@/modules/dataSource/api/clients";
+import type { DataSourceItem, SourceType } from "@/modules/dataSource/constants/types";
+import { sourceTypeOptions } from "@/modules/dataSource/constants/sourceTypeOptions";
+import { mapScanSourceToDataSource } from "@/modules/dataSource/mappers/scanSourceToDataSource";
+import {
+  getFirstScanBinding,
+  getScanSourceId,
+  inferSourceKind,
+  type ScanV2Binding,
+  type ScanV2Source,
+} from "@/modules/dataSource/utils/scanAccessors";
+import {
+  getConnectionMeta,
+  getSourceTypeTitle,
+  getStatusMeta,
+  getSyncModeLabel,
+  normalizeDataSourceStatus,
+} from "@/modules/dataSource/utils/status";
+import KnowledgeSquare from "./KnowledgeSquare";
+import {
+  mergeKnowledgeMarketDetail,
+  mergeKnowledgeMarketItems,
+  type KnowledgeSquareType,
+  type OfficialKnowledgeBase,
+} from "./knowledgeSquareData";
+import KnowledgeMarketTaskModal from "./KnowledgeMarketTaskModal";
+import KnowledgeMineFilterPopover from "./KnowledgeMineFilterPopover";
+import {
+  getKnowledgeMineOrderBy,
+  sortByDatasetOrder,
+  type KnowledgeMineCloudSource,
+  type KnowledgeMineSort,
+} from "./knowledgeMineFilters";
+import {
+  getLatestKnowledgeMarketTasks,
+  isKnowledgeMarketTaskFailed,
+  isKnowledgeMarketTaskPartiallyFailed,
+  isKnowledgeMarketTaskTerminal,
+} from "./knowledgeMarketTaskState";
+import {
+  getKnowledgeMarketItem,
+  getKnowledgeMarketTask,
+  installKnowledgeMarketItem,
+  listKnowledgeMarket,
+  listKnowledgeMarketDomains,
+  listKnowledgeMarketInstalls,
+  listKnowledgeMarketTasks,
+  updateAllKnowledgeMarketItems,
+  updateKnowledgeMarketItem,
+} from "@/modules/knowledge/api/knowledgeMarket";
+import {
+  clearCloudKnowledgeCreateParams,
+  getCloudKnowledgeCreateProvider,
+  isCloudKnowledgeCreateRequest,
+} from "@/modules/modelProvider/utils/cloudDocumentKnowledge";
+
+import "./index.scss";
+import "@/modules/dataSource/index.scss";
+
+const { Text } = Typography;
+
+const marketTaskNoticeOptions = {
+  className: "knowledge-task-notification",
+  icon: <span className="knowledge-task-notification-icon"><CheckOutlined /></span>,
+  closable: false,
+  role: "status" as const,
+};
+
+type SourceCategory = "local" | "cloudArchive" | "official";
+type KnowledgePageView = "mine" | "square";
+
+interface TrackedKnowledgeMarketJob {
+  jobId: string;
+  itemId: string;
+  jobType: "install" | "update" | "updateAll";
+  name: string;
+}
+
+interface KnowledgePageProps {
+  modelSettingsPath?: string;
+}
+
+const KnowledgePage: FC<KnowledgePageProps> = ({
+  modelSettingsPath = "/settings?section=models",
+}) => {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const { t } = useTranslation();
+  const [taskNotification, taskNotificationHolder] = notification.useNotification({
+    placement: "bottomRight",
+  });
+  const confirmRef = useRef<TypedConfirmModalRef>(null);
+  const createUpdateRef = useRef<UpdateImperativeProps>(null);
+  const createKnowledgeRef = useRef<CreateKnowledgeBaseModalRef>(null);
+
+  const [loading, setLoading] = useState(false);
+  const [pagination, setPagination] = useState<TablePaginationConfig>({
+    current: 1,
+    pageSize: 10,
+    total: 0,
+  });
+  const [dataSource, setDataSource] = useState<Dataset[] | undefined>([]);
+  const [localTags, setLocalTags] = useState<string[]>([]);
+  const [sourceCategory, setSourceCategory] = useState<SourceCategory>("local");
+  const [activeView, setActiveView] = useState<KnowledgePageView>("mine");
+  const [officialItems, setOfficialItems] = useState<OfficialKnowledgeBase[]>([]);
+  const [officialDomains, setOfficialDomains] = useState<
+    Record<KnowledgeSquareType, string[]>
+  >({ industry: [], evaluation: [] });
+  const [officialLoading, setOfficialLoading] = useState(false);
+  const [marketTaskModalOpen, setMarketTaskModalOpen] = useState(false);
+  const [trackedMarketJobs, setTrackedMarketJobs] = useState<
+    Record<string, TrackedKnowledgeMarketJob>
+  >({});
+  const [marketProgress, setMarketProgress] = useState<Record<string, number>>({});
+  const [mineSearch, setMineSearch] = useState("");
+  const [mineLocalTag, setMineLocalTag] = useState(ALL_TAGS);
+  const [mineOfficialTag, setMineOfficialTag] = useState(ALL_TAGS);
+  const [mineSort, setMineSort] = useState<KnowledgeMineSort>("all");
+  const [mineCloudSource, setMineCloudSource] =
+    useState<KnowledgeMineCloudSource>("all");
+  const [mineFilterOpen, setMineFilterOpen] = useState(false);
+  const [cloudSources, setCloudSources] = useState<DataSourceItem[]>([]);
+  const [officialDatasetOrder, setOfficialDatasetOrder] = useState<
+    string[] | null
+  >(null);
+  const [officialSortLoading, setOfficialSortLoading] = useState(false);
+  const [embeddingReady, setEmbeddingReady] = useState<boolean | null>(null);
+  const [multimodalEmbeddingReady, setMultimodalEmbeddingReady] = useState<
+    boolean | null
+  >(null);
+  const isAdmin = AgentAppsAuth.getUserInfo()?.role === "system-admin";
+  const syncCreateVm = useSyncKnowledgeBaseCreation({
+    onSuccess: () => {
+      getTableData();
+      createKnowledgeRef.current?.onClose();
+    },
+  });
+  const cloudCreateRequestRef = useRef<string | null>(null);
+  const localTagsRequestSeqRef = useRef(0);
+  const mineTableRequestSeqRef = useRef(0);
+  const officialSortRequestSeqRef = useRef(0);
+  const marketRequestSeqRef = useRef(0);
+  const finishedMarketJobIds = useRef(new Set<string>());
+  const activeMarketTaskCount = Object.keys(trackedMarketJobs).length;
+  const marketTaskRefreshKey = Object.keys(trackedMarketJobs).sort().join(",");
+  const activeMarketJobTypes = useMemo(() => {
+    const types: Record<string, "install" | "update"> = {};
+    Object.values(trackedMarketJobs).forEach((job) => {
+      if (job.itemId && job.jobType !== "updateAll") {
+        types[job.itemId] = job.jobType;
+      }
+    });
+    return types;
+  }, [trackedMarketJobs]);
+  const isCloudArchiveView = sourceCategory === "cloudArchive";
+  const isOfficialView = sourceCategory === "official";
+  const createActionDisabled = false;
+  const createActionDisabledTooltip = isAdmin ? (
+    <span>
+      {embeddingReady === false
+        ? t("knowledge.embeddingNotReadyBannerAdmin")
+        : t("knowledge.multimodalEmbeddingNotReadyBannerAdmin")}
+      <a
+        href={modelSettingsPath}
+        style={{ marginLeft: 8, color: "#fff", textDecoration: "underline" }}
+        onClick={(e: MouseEvent<HTMLAnchorElement>) => {
+          e.preventDefault();
+          navigate(modelSettingsPath);
+        }}
+      >
+        {t("knowledge.goToConfig")}
+      </a>
+    </span>
+  ) : embeddingReady === false ? (
+    t("knowledge.embeddingNotReadyBanner")
+  ) : (
+    t("knowledge.multimodalEmbeddingNotReadyBanner")
+  );
+
+  useEffect(() => {
+    if (
+      syncCreateVm.cloudConnectionLoading ||
+      !isCloudKnowledgeCreateRequest(location.search) ||
+      cloudCreateRequestRef.current === location.search
+    ) {
+      return;
+    }
+
+    cloudCreateRequestRef.current = location.search;
+    const provider = getCloudKnowledgeCreateProvider(location.search);
+    setActiveView("mine");
+    setSourceCategory("cloudArchive");
+    if (provider) {
+      syncCreateVm.handleCreateFromCloudDocuments(provider);
+    } else {
+      createKnowledgeRef.current?.onOpen();
+    }
+    navigate(
+      {
+        pathname: location.pathname,
+        search: clearCloudKnowledgeCreateParams(location.search),
+      },
+      { replace: true },
+    );
+  }, [
+    location.pathname,
+    location.search,
+    navigate,
+    syncCreateVm.cloudConnectionLoading,
+    syncCreateVm.handleCreateFromCloudDocuments,
+  ]);
+
+  const loadKnowledgeMarket = useCallback(async (showLoading = false) => {
+    const requestId = ++marketRequestSeqRef.current;
+    if (showLoading) setOfficialLoading(true);
+    try {
+      const [catalog, domainsResponse, installsResponse] = await Promise.all([
+        listKnowledgeMarket(),
+        listKnowledgeMarketDomains(),
+        listKnowledgeMarketInstalls(),
+      ]);
+      if (requestId !== marketRequestSeqRef.current) return;
+      setOfficialItems(
+        mergeKnowledgeMarketItems(catalog, installsResponse.items || []),
+      );
+      setOfficialDomains({
+        industry: domainsResponse.domains?.industry || [],
+        evaluation: domainsResponse.domains?.evaluation || [],
+      });
+    } catch {
+      // The shared request interceptor displays the localized error.
+    } finally {
+      if (showLoading && requestId === marketRequestSeqRef.current) {
+        setOfficialLoading(false);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadKnowledgeMarket(true);
+  }, [loadKnowledgeMarket]);
+
+  useEffect(() => {
+    void getLocalTags();
+    void checkEmbeddingReady();
+
+    const onFeaturesChanged = () => {
+      void checkEmbeddingReady();
+    };
+    window.addEventListener(MODEL_FEATURES_CHANGED_EVENT, onFeaturesChanged);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void checkEmbeddingReady();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      localTagsRequestSeqRef.current += 1;
+      window.removeEventListener(
+        MODEL_FEATURES_CHANGED_EVENT,
+        onFeaturesChanged,
+      );
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, []);
+
+  async function checkEmbeddingReady() {
+    try {
+      const features = await fetchModelFeatures(true);
+      const imageEmbedRequired = isImageEmbedRequired(features);
+
+      const [embResp, multiResp] = await Promise.all([
+        axiosInstance
+          .get<
+            { data?: { ready: boolean } } | { ready: boolean }
+          >(`${BASE_URL}/api/core/model_providers/models/ready?model_type=embed_main`)
+          .catch(() => null),
+        imageEmbedRequired
+          ? axiosInstance
+              .get<
+                { data?: { ready: boolean } } | { ready: boolean }
+              >(`${BASE_URL}/api/core/model_providers/models/ready?model_type=embed_image`)
+              .catch(() => null)
+          : Promise.resolve(null),
+      ]);
+      const unwrap = (resp: typeof embResp): boolean | null => {
+        if (!resp) return null;
+        const d =
+          resp.data && typeof resp.data === "object" && "data" in resp.data
+            ? (resp.data as { data?: { ready: boolean } }).data
+            : (resp.data as { ready: boolean });
+        return d?.ready ?? null;
+      };
+      setEmbeddingReady(unwrap(embResp));
+      // null means "not applicable" — does not trigger disabled state.
+      setMultimodalEmbeddingReady(
+        imageEmbedRequired ? unwrap(multiResp) : null,
+      );
+    } catch {
+      setEmbeddingReady(null);
+      setMultimodalEmbeddingReady(null);
+    }
+  }
+
+  useEffect(() => {
+    if (activeView === "mine" && sourceCategory !== "official") {
+      getTableData(1, pagination.pageSize);
+    } else {
+      mineTableRequestSeqRef.current += 1;
+      setLoading(false);
+    }
+    return () => {
+      mineTableRequestSeqRef.current += 1;
+    };
+  }, [
+    activeView,
+    sourceCategory,
+    mineSearch,
+    mineLocalTag,
+    mineSort,
+    mineCloudSource,
+  ]);
+
+  const loadCloudSources = useCallback(
+    async (
+      page = 1,
+      pageSize = 10,
+      keyword = "",
+      selectedSort: KnowledgeMineSort = "all",
+      selectedCloudSource: KnowledgeMineCloudSource = "all",
+    ) => {
+      const requestSeq = mineTableRequestSeqRef.current + 1;
+      mineTableRequestSeqRef.current = requestSeq;
+      setLoading(true);
+
+      try {
+        const orderBy = getKnowledgeMineOrderBy(selectedSort);
+        const scanOptions = orderBy
+          ? { params: { order_by: orderBy } }
+          : undefined;
+        const needsClientFilter = selectedCloudSource !== "all";
+
+        const sourceListPromise = (async () => {
+          let sourceList: ScanV2Source[] = [];
+          let sourceTotal = 0;
+          if (needsClientFilter) {
+            const scanPageSize = 200;
+            let scanPage = 1;
+            do {
+              const response = await dataSourceScanApi.listSources(
+                {
+                  page: scanPage,
+                  pageSize: scanPageSize,
+                  keyword: keyword.trim() || undefined,
+                },
+                scanOptions,
+              );
+              const pageItems = (response.data.items || []) as ScanV2Source[];
+              sourceList.push(...pageItems);
+              sourceTotal = Number(response.data.total || 0);
+              if (
+                pageItems.length === 0 ||
+                sourceList.length >= sourceTotal
+              ) {
+                break;
+              }
+              scanPage += 1;
+            } while (true);
+          } else {
+            const response = await dataSourceScanApi.listSources(
+              {
+                page,
+                pageSize,
+                keyword: keyword.trim() || undefined,
+              },
+              scanOptions,
+            );
+            sourceList = (response.data.items || []) as ScanV2Source[];
+            sourceTotal = Number(response.data.total || 0);
+          }
+          return { sourceList, sourceTotal };
+        })();
+
+        const { sourceList, sourceTotal } = await sourceListPromise;
+        if (mineTableRequestSeqRef.current !== requestSeq) return;
+        const filteredSourceList = sourceList.filter(
+          (source) =>
+            normalizeDataSourceStatus(source.status) !== "deleted" &&
+            (selectedCloudSource === "all" ||
+              inferSourceKind(source) === selectedCloudSource),
+        );
+        const visibleSourceList = needsClientFilter
+          ? filteredSourceList.slice((page - 1) * pageSize, page * pageSize)
+          : filteredSourceList;
+        const filteredTotal = needsClientFilter
+          ? filteredSourceList.length
+          : sourceTotal;
+
+        if (mineTableRequestSeqRef.current !== requestSeq) return;
+        const nextSources = await Promise.all(
+          visibleSourceList.map(async (source) => {
+            const sourceId = getScanSourceId(source);
+            if (!sourceId) {
+              return mapScanSourceToDataSource(source, t);
+            }
+            try {
+              const detailResponse = await dataSourceScanApi.getSource({ sourceId });
+              const detailSource = {
+                ...source,
+                ...detailResponse.data.source,
+                summary: source.summary,
+              } as ScanV2Source;
+              const bindings = (detailResponse.data.bindings || []) as ScanV2Binding[];
+              return mapScanSourceToDataSource(
+                detailSource,
+                t,
+                undefined,
+                getFirstScanBinding(bindings),
+                bindings,
+              );
+            } catch {
+              return mapScanSourceToDataSource(source, t);
+            }
+          }),
+        );
+
+        if (mineTableRequestSeqRef.current !== requestSeq) return;
+        setCloudSources(nextSources);
+        setPagination({
+          current: page,
+          pageSize,
+          total: filteredTotal,
+        });
+      } catch {
+        if (mineTableRequestSeqRef.current !== requestSeq) return;
+        setCloudSources([]);
+        setPagination({
+          current: page,
+          pageSize,
+          total: 0,
+        });
+      } finally {
+        if (mineTableRequestSeqRef.current === requestSeq) {
+          setLoading(false);
+        }
+      }
+    },
+    [t],
+  );
+
+  const resolveCloudArchiveDatasetId = useCallback((record: DataSourceItem) => {
+    return `${record.datasetId || ""}`.trim();
+  }, []);
+
+  const navigateToKnowledgeDetail = useCallback(
+    (record: DataSourceItem) => {
+      const datasetId = resolveCloudArchiveDatasetId(record);
+      if (!datasetId) {
+        message.warning(t("knowledge.noData"));
+        return;
+      }
+      navigate({
+        pathname: `/lib/knowledge/detail/${datasetId}`,
+      });
+    },
+    [navigate, resolveCloudArchiveDatasetId, t],
+  );
+
+  const handleCloudArchiveEdit = useCallback(
+    async (record: DataSourceItem) => {
+      const sourceId = `${record.id || ""}`.trim();
+      if (!sourceId) {
+        message.warning(t("admin.dataSourceDetailNotFound"));
+        return;
+      }
+
+      try {
+        const [detailResponse, summaryResponse] = await Promise.all([
+          dataSourceScanApi.getSource({ sourceId }),
+          dataSourceScanApi.getSourceSummary({ sourceId }).catch(() => null),
+        ]);
+        const detailSource = {
+          ...record,
+          ...detailResponse.data.source,
+          summary: summaryResponse?.data,
+        } as ScanV2Source;
+        const bindings = (detailResponse.data.bindings || []) as ScanV2Binding[];
+        const mappedRecord = mapScanSourceToDataSource(
+          detailSource,
+          t,
+          record,
+          getFirstScanBinding(bindings),
+          bindings,
+        );
+        syncCreateVm.openEditWizard(mappedRecord);
+      } catch {
+        // API errors are reported by the shared request interceptor.
+      }
+    },
+    [syncCreateVm, t],
+  );
+
+  const handleCloudArchiveDelete = useCallback(
+    (record: DataSourceItem) => {
+      const datasetId = resolveCloudArchiveDatasetId(record);
+      if (!datasetId) {
+        message.warning(t("knowledge.noData"));
+        return;
+      }
+
+      const knowledgeName = record.knowledgeBase || record.name || datasetId;
+      confirmRef.current?.onOpen({
+        id: datasetId,
+        title: t("knowledge.deleteTitle", { name: knowledgeName }),
+        content: t("knowledge.deleteContent"),
+        confirmText: t("knowledge.deleteConfirmText", {
+          name: knowledgeName,
+        }),
+      });
+    },
+    [resolveCloudArchiveDatasetId, t],
+  );
+
+  const cloudSourceColumns = useMemo<ColumnsType<DataSourceItem>>(
+    () => [
+      {
+        title: t("knowledge.knowledgeBaseName"),
+        dataIndex: "name",
+        key: "name",
+        width: 260,
+        render: (_value, record) => (
+          <div className="data-source-table-name">
+            <span className={`data-source-icon data-source-icon-${record.type}`}>
+              {sourceTypeOptions.find((item) => item.type === record.type)?.icon}
+            </span>
+            <div className="data-source-table-copy">
+              <Button
+                type="link"
+                className="data-source-link-button"
+                onClick={() => navigateToKnowledgeDetail(record)}
+              >
+                {record.name}
+              </Button>
+              <Tooltip title={record.description} placement="topLeft">
+                <Text type="secondary" className="data-source-ellipsis" tabIndex={0}>
+                  {record.description}
+                </Text>
+              </Tooltip>
+            </div>
+          </div>
+        ),
+      },
+      {
+        title: t("admin.dataSourceTableType"),
+        dataIndex: "type",
+        key: "type",
+        width: 150,
+        render: (type: SourceType) => (
+          <Tag className="data-source-type-tag">{getSourceTypeTitle(type, t)}</Tag>
+        ),
+      },
+      {
+        title: t("admin.dataSourceTableSyncStrategy"),
+        key: "syncMode",
+        width: 190,
+        render: (_value, record) => (
+          <div className="data-source-sync-cell">
+            <Text strong>{getSyncModeLabel(record.syncMode, t)}</Text>
+            <Text type="secondary">{record.scheduleLabel}</Text>
+          </div>
+        ),
+      },
+      {
+        title: t("admin.dataSourceTableConnectionStatus"),
+        key: "status",
+        width: 110,
+        render: (_value, record) => {
+          const statusMeta = getStatusMeta(record.status, t);
+          const connectionMeta = getConnectionMeta(record.connectionState, t);
+          return (
+            <Space direction="vertical" size={4}>
+              <Tag color={statusMeta.color}>{statusMeta.text}</Tag>
+              <Tag color={connectionMeta.color}>{connectionMeta.text}</Tag>
+            </Space>
+          );
+        },
+      },
+      {
+        title: t("admin.dataSourceTableLastSync"),
+        key: "lastSync",
+        width: 180,
+        render: (_value, record) => (
+          <div className="data-source-sync-cell">
+            <Text>{record.lastSync}</Text>
+            <Text type="secondary">{record.nextSync}</Text>
+          </div>
+        ),
+      },
+      {
+        title: t("common.actions"),
+        key: "actions",
+        width: 140,
+        fixed: "right",
+        className: "data-source-action-column",
+        render: (_value, record) => (
+          <Flex gap={10} wrap align="center">
+            <Button
+              className="link-btn"
+              type="link"
+              onClick={() => {
+                void handleCloudArchiveEdit(record);
+              }}
+            >
+              {t("common.edit")}
+            </Button>
+            <Button
+              className="link-btn"
+              type="link"
+              danger
+              onClick={() => handleCloudArchiveDelete(record)}
+            >
+              {t("common.delete")}
+            </Button>
+          </Flex>
+        ),
+      },
+    ],
+    [handleCloudArchiveDelete, handleCloudArchiveEdit, navigateToKnowledgeDetail, t],
+  );
+
+  const trackMarketJob = useCallback((job: TrackedKnowledgeMarketJob) => {
+    setTrackedMarketJobs((current) =>
+      current[job.jobId] ? current : { ...current, [job.jobId]: job },
+    );
+    if (job.itemId) {
+      setMarketProgress((current) =>
+        job.itemId in current ? current : { ...current, [job.itemId]: 0 },
+      );
+    }
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let timer: number | undefined;
+    const restoreTasks = async () => {
+      try {
+        const lists = await Promise.all(
+          ["install", "update", "update_all"].map((type) =>
+            listKnowledgeMarketTasks(`knowledge_market_${type}`, {
+              signal: controller.signal,
+              silentError: true,
+            }),
+          ),
+        );
+        const tasks = await Promise.all(
+          getLatestKnowledgeMarketTasks(
+            lists.flatMap((list) => list.items || []),
+          ).map((task) =>
+            getKnowledgeMarketTask(task.job_id, {
+              signal: controller.signal,
+              silentError: true,
+            }).catch(() => null),
+          ),
+        );
+        if (controller.signal.aborted) return;
+        tasks.forEach((task) => {
+          if (
+            !task ||
+            finishedMarketJobIds.current.has(task.job_id) ||
+            isKnowledgeMarketTaskTerminal({
+              jobType: task.job_type,
+              jobStatus: task.job_status,
+              stage: task.stage,
+              overallPercent: task.overall_percent,
+              progress: task.progress,
+            })
+          ) {
+            return;
+          }
+          trackMarketJob({
+            jobId: task.job_id,
+            itemId: task.market_item_id,
+            jobType:
+              task.job_type === "knowledge_market_install"
+                ? "install"
+                : task.job_type === "knowledge_market_update"
+                  ? "update"
+                  : "updateAll",
+            name: task.name || t("knowledge.taskTypeUpdateAll"),
+          });
+        });
+        if (tasks.some((task) => !task)) {
+          timer = window.setTimeout(restoreTasks, 2000);
+        }
+      } catch {
+        if (!controller.signal.aborted) {
+          timer = window.setTimeout(restoreTasks, 2000);
+        }
+      }
+    };
+    void restoreTasks();
+    return () => {
+      controller.abort();
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [marketTaskRefreshKey, t, trackMarketJob]);
+
+  const handleOfficialInstall = useCallback(
+    async (item: OfficialKnowledgeBase) => {
+      try {
+        const task = await installKnowledgeMarketItem(item.id);
+        trackMarketJob({
+          jobId: task.job_id,
+          itemId: item.id,
+          jobType: "install",
+          name: item.name,
+        });
+        taskNotification.open({
+          ...marketTaskNoticeOptions,
+          message: t("knowledge.marketTaskAdded"),
+          description: t("knowledge.marketTaskAddedDescription", { name: item.name }),
+        });
+        void loadKnowledgeMarket();
+      } catch {
+        // The shared request interceptor displays the localized error.
+      }
+    },
+    [loadKnowledgeMarket, t, taskNotification, trackMarketJob],
+  );
+
+  const handleOfficialUpdate = useCallback(
+    async (item: OfficialKnowledgeBase) => {
+      try {
+        const task = await updateKnowledgeMarketItem(item.id);
+        trackMarketJob({
+          jobId: task.job_id,
+          itemId: item.id,
+          jobType: "update",
+          name: item.name,
+        });
+        taskNotification.open({
+          ...marketTaskNoticeOptions,
+          message: t("knowledge.marketTaskAdded"),
+          description: t("knowledge.marketTaskAddedDescription", { name: item.name }),
+        });
+        void loadKnowledgeMarket();
+      } catch {
+        // The shared request interceptor displays the localized error.
+      }
+    },
+    [loadKnowledgeMarket, t, taskNotification, trackMarketJob],
+  );
+
+  const handleOfficialOpen = useCallback(
+    (item?: OfficialKnowledgeBase) => {
+      if (item?.datasetId) {
+        navigate(`/lib/knowledge/detail/${item.datasetId}`);
+        return;
+      }
+      setActiveView("mine");
+      setSourceCategory("official");
+    },
+    [navigate],
+  );
+
+  const handleOfficialQuery = useCallback(
+    (item: OfficialKnowledgeBase) => {
+      if (!item.onlineAccessUrl) {
+        message.info(t("knowledge.onlineQueryUnavailable"));
+        return;
+      }
+      navigate({
+        pathname: "/agent/chat/home",
+        search: `?officialKnowledge=${encodeURIComponent(item.id)}`,
+      });
+    },
+    [navigate, t],
+  );
+
+  const handleOfficialLoadDetail = useCallback(
+    async (item: OfficialKnowledgeBase) => {
+      try {
+        const detail = await getKnowledgeMarketItem(item.id);
+        return mergeKnowledgeMarketDetail(item, detail);
+      } catch {
+        return item;
+      }
+    },
+    [],
+  );
+
+  const handleOfficialUninstall = useCallback(
+    (item: OfficialKnowledgeBase) => {
+      if (!item.datasetId) return;
+      Modal.confirm({
+        title: t("knowledge.uninstallConfirmTitle", { name: item.name }),
+        content: t("knowledge.uninstallConfirmContent"),
+        okText: t("knowledge.uninstall"),
+        okButtonProps: { danger: true },
+        cancelText: t("common.cancel"),
+        onOk: async () => {
+          await KnowledgeBaseServiceApi().datasetServiceDeleteDataset({
+            dataset: item.datasetId,
+          });
+          message.success(t("knowledge.uninstallSuccess", { name: item.name }));
+          await loadKnowledgeMarket();
+        },
+      });
+    },
+    [loadKnowledgeMarket, t],
+  );
+
+  const loadOfficialDatasetOrder = useCallback(
+    async (selectedSort: KnowledgeMineSort) => {
+      const requestSeq = officialSortRequestSeqRef.current + 1;
+      officialSortRequestSeqRef.current = requestSeq;
+      const orderBy = getKnowledgeMineOrderBy(selectedSort);
+      if (!orderBy) {
+        setOfficialDatasetOrder(null);
+        setOfficialSortLoading(false);
+        return;
+      }
+
+      setOfficialSortLoading(true);
+      try {
+        const datasetIds: string[] = [];
+        const seenPageTokens = new Set<string>();
+        let pageToken: string | undefined;
+        do {
+          const response = await KnowledgeBaseServiceApi().datasetServiceListDatasets(
+            {
+              pageToken,
+              pageSize: 100,
+              orderBy,
+            },
+            { params: { source: "official_installed" } },
+          );
+          (response.data.datasets || []).forEach((dataset) => {
+            if (dataset.dataset_id) datasetIds.push(dataset.dataset_id);
+          });
+          const nextPageToken = response.data.next_page_token || undefined;
+          if (!nextPageToken || seenPageTokens.has(nextPageToken)) break;
+          seenPageTokens.add(nextPageToken);
+          pageToken = nextPageToken;
+        } while (pageToken);
+
+        if (officialSortRequestSeqRef.current === requestSeq) {
+          setOfficialDatasetOrder(datasetIds);
+        }
+      } catch {
+        if (officialSortRequestSeqRef.current === requestSeq) {
+          setOfficialDatasetOrder(null);
+        }
+      } finally {
+        if (officialSortRequestSeqRef.current === requestSeq) {
+          setOfficialSortLoading(false);
+        }
+      }
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (activeView !== "mine" || sourceCategory !== "official") {
+      officialSortRequestSeqRef.current += 1;
+      setOfficialSortLoading(false);
+      return;
+    }
+    void loadOfficialDatasetOrder(mineSort);
+  }, [activeView, loadOfficialDatasetOrder, mineSort, sourceCategory]);
+
+  const installedOfficialItems = useMemo(() => {
+    const items = officialItems.filter(
+      (item) => {
+        if (!item.installed) return false;
+        if (
+          mineOfficialTag !== ALL_TAGS &&
+          !item.tags.includes(mineOfficialTag)
+        ) {
+          return false;
+        }
+        const keyword = mineSearch.trim().toLocaleLowerCase();
+        return !keyword || [item.name, item.desc, item.domain, ...item.tags]
+          .join(" ")
+          .toLocaleLowerCase()
+          .includes(keyword);
+      },
+    );
+    return sortByDatasetOrder(items, officialDatasetOrder, (item) => item.datasetId);
+  }, [mineOfficialTag, mineSearch, officialDatasetOrder, officialItems]);
+
+  const officialFilterTags = useMemo(
+    () =>
+      Array.from(
+        new Set([
+          ...officialItems
+            .filter((item) => item.installed)
+            .flatMap((item) => item.tags),
+        ]),
+      ).sort((left, right) => left.localeCompare(right, "zh-CN")),
+    [officialItems],
+  );
+
+  useEffect(() => {
+    if (mineLocalTag !== ALL_TAGS && !localTags.includes(mineLocalTag)) {
+      setMineLocalTag(ALL_TAGS);
+    }
+  }, [localTags, mineLocalTag]);
+
+  useEffect(() => {
+    if (
+      mineOfficialTag !== ALL_TAGS &&
+      !officialFilterTags.includes(mineOfficialTag)
+    ) {
+      setMineOfficialTag(ALL_TAGS);
+    }
+  }, [mineOfficialTag, officialFilterTags]);
+
+  const handleUpdateAllOfficial = useCallback(async () => {
+    try {
+      const task = await updateAllKnowledgeMarketItems();
+      trackMarketJob({
+        jobId: task.job_id,
+        itemId: "",
+        jobType: "updateAll",
+        name: t("knowledge.taskTypeUpdateAll"),
+      });
+      taskNotification.open({
+        ...marketTaskNoticeOptions,
+        message: t("knowledge.marketTaskAdded"),
+        description: t("knowledge.taskTypeUpdateAll"),
+      });
+    } catch {
+      // The shared request interceptor displays the localized error.
+    }
+  }, [t, taskNotification, trackMarketJob]);
+
+  useEffect(() => {
+    const jobs = Object.values(trackedMarketJobs);
+    if (jobs.length === 0) return;
+
+    let stopped = false;
+    const controller = new AbortController();
+    let timer: number | undefined;
+    const poll = async () => {
+      const taskResults = await Promise.all(
+        jobs.map(async (job) => {
+          try {
+            const detail = await getKnowledgeMarketTask(job.jobId, {
+              signal: controller.signal,
+              silentError: true,
+            });
+            return { job, detail };
+          } catch {
+            return null;
+          }
+        }),
+      );
+      if (stopped) return;
+
+      const terminalJobIds = taskResults
+        .filter((result) => {
+          if (!result) return false;
+          return isKnowledgeMarketTaskTerminal(
+            {
+              jobType: result.job.jobType,
+              jobStatus: result.detail.job_status,
+              stage: result.detail.stage,
+              overallPercent: result.detail.overall_percent,
+              progress: result.detail.progress,
+            },
+          );
+        })
+        .map((result) => result!.job.jobId);
+      setMarketProgress((current) => {
+        const next = { ...current };
+        taskResults.forEach((result) => {
+          if (!result) return;
+          const { job, detail } = result;
+          const terminal = isKnowledgeMarketTaskTerminal(
+            {
+              jobType: job.jobType,
+              jobStatus: detail.job_status,
+              stage: detail.stage,
+              overallPercent: detail.overall_percent,
+              progress: detail.progress,
+            },
+          );
+          if (job.itemId) {
+            if (terminal) delete next[job.itemId];
+            else next[job.itemId] = detail.overall_percent;
+          }
+        });
+        return next;
+      });
+
+      taskResults.forEach((result) => {
+        if (!result || !terminalJobIds.includes(result.job.jobId)) return;
+        if (finishedMarketJobIds.current.has(result.job.jobId)) return;
+        finishedMarketJobIds.current.add(result.job.jobId);
+        const failed = isKnowledgeMarketTaskFailed({
+          jobType: result.job.jobType,
+          jobStatus: result.detail.job_status,
+          stage: result.detail.stage,
+          overallPercent: result.detail.overall_percent,
+          progress: result.detail.progress,
+        });
+        const partiallyFailed = isKnowledgeMarketTaskPartiallyFailed({
+          jobType: result.job.jobType,
+          jobStatus: result.detail.job_status,
+          stage: result.detail.stage,
+          overallPercent: result.detail.overall_percent,
+          progress: result.detail.progress,
+        });
+        if (partiallyFailed) {
+          taskNotification.warning({
+            message: t("knowledge.marketTaskPartiallyFailed", { name: result.job.name }),
+          });
+        } else if (failed) {
+          taskNotification.error({
+            message: t("knowledge.marketTaskFailed", { name: result.job.name }),
+          });
+        } else {
+          taskNotification.open({
+            ...marketTaskNoticeOptions,
+            message: t("knowledge.marketTaskCompleted"),
+            description: result.job.name,
+          });
+        }
+      });
+
+      if (terminalJobIds.length > 0) {
+        setTrackedMarketJobs((current) => {
+          const next = { ...current };
+          terminalJobIds.forEach((jobId) => delete next[jobId]);
+          return next;
+        });
+        void loadKnowledgeMarket();
+      }
+      if (terminalJobIds.length < jobs.length) {
+        timer = window.setTimeout(poll, 2000);
+      }
+    };
+
+    void poll();
+    return () => {
+      stopped = true;
+      controller.abort();
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [loadKnowledgeMarket, t, taskNotification, trackedMarketJobs]);
+
+  useEffect(() => {
+    if (!officialItems.some((item) => item.active)) return;
+    const timer = window.setTimeout(() => {
+      void loadKnowledgeMarket();
+    }, 2500);
+    return () => window.clearTimeout(timer);
+  }, [loadKnowledgeMarket, officialItems]);
+
+  const columns: ColumnsType<Dataset> = [
+    {
+      title: t("knowledge.nameDescription"),
+      dataIndex: "display_name",
+      render: (name: string, data: Dataset) => {
+        return (
+          <div className="knowledge-list-name-cell">
+            <span className="knowledge-list-name-icon"><DatabaseOutlined /></span>
+            <span className="knowledge-list-name-copy">
+              <Button
+                className="knowledge-list-name-button"
+                type="link"
+                onClick={() => {
+                  navigate({ pathname: `/lib/knowledge/detail/${data.dataset_id}` });
+                }}
+              >
+                <Tooltip title={name}><span>{name}</span></Tooltip>
+              </Button>
+              <Tooltip title={data.desc} placement="topLeft">
+                <span className="knowledge-list-description">{data.desc || "-"}</span>
+              </Tooltip>
+            </span>
+          </div>
+        );
+      },
+    },
+    {
+      title: t("knowledge.tags"),
+      dataIndex: "tags",
+      width: 170,
+      render: (knowledgeBaseTags: string[]) => {
+        return (
+          <div className="knowledge-list-tags">
+            {(knowledgeBaseTags || []).slice(0, 2).map((tag, index) => (
+              <KnowledgeTag key={`${tag}-${index}`} title={tag} checkable={false} />
+            ))}
+            {!knowledgeBaseTags?.length ? <span>-</span> : null}
+          </div>
+        );
+      },
+    },
+    {
+      title: t("knowledge.parseSize"),
+      dataIndex: "document_size",
+      width: 100,
+      render: (document_size: string) => {
+        return FileUtils.formatFileSize(document_size);
+      },
+    },
+    {
+      title: t("knowledge.documentCountLabel"),
+      dataIndex: "document_count",
+      width: 88,
+      render: (count: number) => t("knowledge.documentCount", { count: count || 0 }),
+    },
+    {
+      title: t("knowledge.updateDate"),
+      dataIndex: "update_time",
+      width: 116,
+      render: (time: string) => (time ? moment(time).format("YYYY-MM-DD") : "-"),
+    },
+    {
+      title: t("common.actions"),
+      key: "action",
+      width: 190,
+      fixed: "right",
+      render: (data: Dataset) => {
+        if (!data.acl?.includes(DatasetAclEnum.DatasetWrite)) {
+          return null;
+        }
+        return (
+          <Flex gap={10} wrap align="center">
+            <Button
+              className="link-btn"
+              type="link"
+              onClick={(event: MouseEvent<HTMLElement>) => {
+                event.stopPropagation();
+                createUpdateRef.current?.onOpen(data);
+              }}
+            >
+              {t("common.edit")}
+            </Button>
+            {!runtimeFeatures.hideUserGroupSurfaces && (
+                <Button
+                  className="link-btn"
+                  type="link"
+                  onClick={(event: MouseEvent<HTMLElement>) => {
+                    event.stopPropagation();
+                    navigate({
+                      pathname: `/lib/knowledge/auth/${data.dataset_id}`,
+                    });
+                  }}
+                >
+                {t("knowledge.authorize")}
+              </Button>
+            )}
+            <Button
+              className="link-btn"
+              type="link"
+              danger
+              onClick={(event: MouseEvent<HTMLElement>) => {
+                event.stopPropagation();
+                const knowledgeName =
+                  data.display_name || data.dataset_id || "";
+                confirmRef.current?.onOpen({
+                  id: data.dataset_id || "",
+                  title: t("knowledge.deleteTitle", { name: knowledgeName }),
+                  content: t("knowledge.deleteContent"),
+                  confirmText: t("knowledge.deleteConfirmText", {
+                    name: knowledgeName,
+                  }),
+                });
+              }}
+            >
+              {t("common.delete")}
+            </Button>
+          </Flex>
+        );
+      },
+    },
+  ];
+
+  const officialColumns = useMemo<ColumnsType<OfficialKnowledgeBase>>(
+    () => [
+      {
+        title: t("knowledge.nameDescription"),
+        dataIndex: "name",
+        render: (name, item) => (
+          <div className="knowledge-list-name-cell">
+            <span className="knowledge-list-name-icon is-official"><AppstoreOutlined /></span>
+            <span className="knowledge-list-name-copy">
+              <Button
+                className="knowledge-list-name-button"
+                type="link"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  handleOfficialOpen(item);
+                }}
+              >
+                <Tooltip title={name}><span>{name}</span></Tooltip>
+              </Button>
+              <Tooltip title={item.desc} placement="topLeft">
+                <span className="knowledge-list-description">{item.desc}</span>
+              </Tooltip>
+            </span>
+          </div>
+        ),
+      },
+      {
+        title: t("knowledge.source"),
+        dataIndex: "source",
+        width: 132,
+        render: (source: string) => {
+          const sourceLabel = source || t("knowledge.officialKnowledge");
+          return (
+            <Tooltip title={sourceLabel} placement="topLeft">
+              <span className="knowledge-list-source is-official">
+                <span className="knowledge-list-source-text">{sourceLabel}</span>
+              </span>
+            </Tooltip>
+          );
+        },
+      },
+      {
+        title: t("knowledge.tags"),
+        dataIndex: "tags",
+        width: 170,
+        render: (itemTags: string[]) => (
+          <div className="knowledge-list-tags">
+            {itemTags.slice(0, 2).map((tag) => <span key={tag}>{tag}</span>)}
+          </div>
+        ),
+      },
+      {
+        title: t("knowledge.domainFilter"),
+        dataIndex: "domain",
+        width: 110,
+      },
+      {
+        title: t("knowledge.updateDate"),
+        dataIndex: "updated",
+        width: 116,
+      },
+      {
+        title: t("common.actions"),
+        key: "actions",
+        width: 220,
+        fixed: "right",
+        render: (_, item) => (
+          <Flex gap={10} align="center">
+            {item.onlineAccessUrl ? (
+              <Button
+                className="link-btn"
+                type="link"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  handleOfficialQuery(item);
+                }}
+              >
+                {t("knowledge.onlineQuery")}
+              </Button>
+            ) : null}
+            <Button
+              className="link-btn"
+              type="link"
+              loading={item.active || marketProgress[item.id] !== undefined}
+              disabled={item.active || marketProgress[item.id] !== undefined}
+              onClick={(event) => {
+                event.stopPropagation();
+                handleOfficialUpdate(item);
+              }}
+            >
+              {t("knowledge.checkForUpdates")}
+            </Button>
+            <Button
+              className="link-btn"
+              type="link"
+              danger
+              disabled={item.active || marketProgress[item.id] !== undefined}
+              onClick={(event) => {
+                event.stopPropagation();
+                handleOfficialUninstall(item);
+              }}
+            >
+              {t("knowledge.uninstall")}
+            </Button>
+          </Flex>
+        ),
+      },
+    ],
+    [
+      handleOfficialOpen,
+      handleOfficialQuery,
+      handleOfficialUninstall,
+      handleOfficialUpdate,
+      marketProgress,
+      t,
+    ],
+  );
+
+  async function getLocalTags() {
+    const requestSeq = localTagsRequestSeqRef.current + 1;
+    localTagsRequestSeqRef.current = requestSeq;
+    const nextTags = new Set<string>();
+    const seenPageTokens = new Set<string>();
+    let pageToken: string | undefined;
+
+    try {
+      do {
+        const response = await KnowledgeBaseServiceApi().datasetServiceListDatasets(
+          { pageToken, pageSize: 100 },
+          { params: { source: "manual" } },
+        );
+        if (localTagsRequestSeqRef.current !== requestSeq) return;
+        (response.data.datasets || []).forEach((dataset) => {
+          (dataset.tags || []).forEach((tag) => {
+            if (tag && tag !== ALL_TAGS) nextTags.add(tag);
+          });
+        });
+        const nextPageToken = response.data.next_page_token || undefined;
+        if (!nextPageToken || seenPageTokens.has(nextPageToken)) break;
+        seenPageTokens.add(nextPageToken);
+        pageToken = nextPageToken;
+      } while (pageToken);
+
+      if (localTagsRequestSeqRef.current === requestSeq) {
+        setLocalTags(
+          Array.from(nextTags).sort((left, right) =>
+            left.localeCompare(right, "zh-CN"),
+          ),
+        );
+      }
+    } catch {
+      if (localTagsRequestSeqRef.current === requestSeq) {
+        setLocalTags([]);
+      }
+    }
+  }
+
+  const handleSuccess = (
+    data: Dataset[],
+    total: number,
+    newPagination: TablePaginationConfig,
+  ) => {
+    setDataSource(data);
+    setPagination({
+      ...newPagination,
+      total,
+    });
+  };
+
+  const initData = () => {
+    setDataSource([]);
+    setCloudSources([]);
+    setPagination({
+      current: 1,
+      pageSize: 10,
+      total: 0,
+    });
+  };
+
+  function getTableData(page = 1, pageSize = pagination.pageSize) {
+    if (sourceCategory === "official") {
+      setLoading(false);
+      return;
+    }
+
+    if (sourceCategory === "cloudArchive") {
+      void loadCloudSources(
+        page,
+        pageSize || 10,
+        mineSearch,
+        mineSort,
+        mineCloudSource,
+      );
+      return;
+    }
+
+    const requestSeq = mineTableRequestSeqRef.current + 1;
+    mineTableRequestSeqRef.current = requestSeq;
+    const newPagination = {
+      ...pagination,
+      current: page,
+      pageSize: pageSize,
+    };
+    setPagination(newPagination);
+
+    const pageToken = UIUtils.generatePageToken({
+      page: page - 1,
+      pageSize: pageSize || 10,
+      total: pagination.total || 0,
+    });
+
+    setLoading(true);
+
+    KnowledgeBaseServiceApi()
+      .datasetServiceListDatasets({
+        pageToken,
+        pageSize: pageSize,
+        orderBy: getKnowledgeMineOrderBy(mineSort),
+        keyword: mineSearch.trim() || undefined,
+        tags: mineLocalTag !== ALL_TAGS ? [mineLocalTag] : [],
+      }, {
+        params: { source: "manual" },
+      })
+      .then((res) => {
+        if (mineTableRequestSeqRef.current !== requestSeq) return;
+        handleSuccess(
+          (res.data.datasets as unknown as Dataset[]) || [],
+          res.data.total_size || 0,
+          newPagination,
+        );
+      })
+      .catch(() => {
+        if (mineTableRequestSeqRef.current !== requestSeq) return;
+        setDataSource([]);
+        setPagination({ ...newPagination, total: 0 });
+      })
+      .finally(() => {
+        if (mineTableRequestSeqRef.current === requestSeq) {
+          setLoading(false);
+        }
+      });
+  }
+
+  function onDelete(id: string) {
+    KnowledgeBaseServiceApi()
+      .datasetServiceDeleteDataset({ dataset: id })
+      .then(() => {
+        message.success(t("knowledge.deleteSuccess"));
+        void getLocalTags();
+        getTableData();
+      });
+  }
+
+  async function onUpdate(
+    data: Dataset & { processing_level?: ProcessingLevel },
+  ): Promise<Dataset | void> {
+    setLoading(true);
+    try {
+      if (data.dataset_id) {
+        const { processing_level: nextLevel, ...dataset } = data;
+        const current = dataSource.find(
+          (item) => item.dataset_id === data.dataset_id,
+        ) as (Dataset & { processing_level?: ProcessingLevel }) | undefined;
+        if (
+          nextLevel &&
+          nextLevel !== effectiveProcessingLevel(current?.processing_level)
+        ) {
+          await axiosInstance.patch(
+            `${BASE_URL}/api/core/datasets/${encodeURIComponent(data.dataset_id)}/processing-level`,
+            { processing_level: nextLevel },
+          );
+        }
+        return KnowledgeBaseServiceApi()
+          .datasetServiceUpdateDataset({
+            dataset: data.dataset_id,
+            dataset2: dataset,
+          })
+          .then(() => {
+            message.success(t("knowledge.editSuccess"));
+            void getLocalTags();
+            getTableData();
+          });
+      }
+      return KnowledgeBaseServiceApi()
+        .datasetServiceCreateDataset({
+          dataset: data,
+        })
+        .then((response) => {
+          message.success(
+            data.dataset_id
+              ? t("knowledge.editSuccess")
+              : t("knowledge.createSuccess"),
+          );
+          void getLocalTags();
+          getTableData();
+          return response.data;
+        });
+    } finally {
+      setLoading(false);
+    }
+  }
+  function onTableChange(newPagination: TablePaginationConfig) {
+    setPagination({
+      current: newPagination.current,
+      pageSize: newPagination.pageSize,
+    });
+
+    getTableData(newPagination.current, newPagination.pageSize);
+  }
+
+  const backgroundTasksButton = (
+    <Button
+      className="knowledge-background-tasks-button"
+      icon={<HistoryOutlined />}
+      aria-label={t("knowledge.backgroundTasksCount", {
+        count: activeMarketTaskCount,
+      })}
+      aria-haspopup="dialog"
+      aria-expanded={marketTaskModalOpen}
+      onClick={() => setMarketTaskModalOpen(true)}
+    >
+      {t("knowledge.backgroundTasks")}
+      {activeMarketTaskCount > 0 ? (
+        <Badge
+          className="knowledge-task-count"
+          count={activeMarketTaskCount}
+          overflowCount={Infinity}
+          size="small"
+        />
+      ) : null}
+    </Button>
+  );
+  const createKnowledgeButton = (
+    <Tooltip title={createActionDisabled ? createActionDisabledTooltip : undefined}>
+      <span>
+        <Button
+          type="primary"
+          icon={<PlusOutlined />}
+          disabled={createActionDisabled}
+          onClick={() => createKnowledgeRef.current?.onOpen()}
+        >
+          {t("knowledge.createKnowledgeBase")}
+        </Button>
+      </span>
+    </Tooltip>
+  );
+
+  return (
+    <div className="knowledge-list-page">
+      {taskNotificationHolder}
+      <div className="knowledge-page-header">
+        <div>
+          {new URLSearchParams(location.search).get("from") === "settings-knowledge" ? (
+            <Button
+              className="knowledge-settings-return"
+              icon={<ArrowLeftOutlined />}
+              onClick={() => navigate("/settings?section=knowledge")}
+              type="text"
+            >
+              {t("knowledge.backToKnowledgeSettings")}
+            </Button>
+          ) : null}
+          <h1>{t("layout.knowledgeBase")}</h1>
+          <p>{t("knowledge.pageDescription")}</p>
+        </div>
+        {activeView === "square" ? (
+          <div className="knowledge-page-header-actions">
+            {backgroundTasksButton}
+          </div>
+        ) : null}
+      </div>
+
+      {embeddingReady === false ? (
+        <Alert
+          banner
+          className="knowledge-embedding-warning"
+          message={
+            isAdmin ? (
+              <span>
+                {t("knowledge.embeddingNotReadyBannerAdmin")}
+                <a
+                  href={modelSettingsPath}
+                  style={{ marginLeft: 8, fontWeight: 500 }}
+                  onClick={(e: MouseEvent<HTMLAnchorElement>) => {
+                    e.preventDefault();
+                    navigate(modelSettingsPath);
+                  }}
+                >
+                  {t("knowledge.goToConfig")}
+                </a>
+              </span>
+            ) : (
+              t("knowledge.embeddingNotReadyBanner")
+            )
+          }
+          showIcon
+          type="warning"
+        />
+      ) : null}
+      {multimodalEmbeddingReady === false ? (
+        <Alert
+          banner
+          className="knowledge-embedding-warning"
+          message={
+            isAdmin ? (
+              <span>
+                {t("knowledge.multimodalEmbeddingNotReadyBannerAdmin")}
+                <a
+                  href={modelSettingsPath}
+                  style={{ marginLeft: 8, fontWeight: 500 }}
+                  onClick={(e: MouseEvent<HTMLAnchorElement>) => {
+                    e.preventDefault();
+                    navigate(modelSettingsPath);
+                  }}
+                >
+                  {t("knowledge.goToConfig")}
+                </a>
+              </span>
+            ) : (
+              t("knowledge.multimodalEmbeddingNotReadyBanner")
+            )
+          }
+          showIcon
+          type="warning"
+        />
+      ) : null}
+
+      <div className="knowledge-view-tabs" role="tablist" aria-label={t("knowledge.viewTabs")}>
+        <button
+          type="button"
+          role="tab"
+          className={activeView === "mine" ? "is-active" : ""}
+          aria-selected={activeView === "mine"}
+          onClick={() => {
+            setMineFilterOpen(false);
+            setActiveView("mine");
+          }}
+        >
+          <span className="knowledge-view-tab-icon"><DatabaseOutlined /></span>
+          <span><strong>{t("knowledge.myKnowledge")}</strong><small>{t("knowledge.myKnowledgeDescription")}</small></span>
+        </button>
+        <button
+          type="button"
+          role="tab"
+          className={activeView === "square" ? "is-active" : ""}
+          aria-selected={activeView === "square"}
+          onClick={() => {
+            setMineFilterOpen(false);
+            setActiveView("square");
+          }}
+        >
+          <span className="knowledge-view-tab-icon"><AppstoreOutlined /></span>
+          <span><strong>{t("knowledge.knowledgeSquare")}</strong><small>{t("knowledge.knowledgeSquareDescription")}</small></span>
+        </button>
+      </div>
+
+      {activeView === "square" ? (
+        <KnowledgeSquare
+          items={officialItems}
+          domains={officialDomains}
+          loading={officialLoading}
+          progressByItem={marketProgress}
+          activeJobTypeByItem={activeMarketJobTypes}
+          onInstall={handleOfficialInstall}
+          onUpdate={handleOfficialUpdate}
+          onOpen={handleOfficialOpen}
+          onQuery={handleOfficialQuery}
+          onLoadDetail={handleOfficialLoadDetail}
+        />
+      ) : (
+        <div className="knowledge-mine-view">
+          <div className="knowledge-source-tabs-row">
+            <div className="knowledge-source-tabs" role="tablist" aria-label={t("knowledge.sourceCategory")}>
+              {([
+                ["local", t("knowledge.localUpload")],
+                ["cloudArchive", t("knowledge.cloudArchiveCreated")],
+                ["official", t("knowledge.installedOfficialKnowledge")],
+              ] as Array<[SourceCategory, string]>).map(([value, label]) => (
+                <button
+                  key={value}
+                  type="button"
+                  role="tab"
+                  className={sourceCategory === value ? "is-active" : ""}
+                  aria-selected={sourceCategory === value}
+                  onClick={() => {
+                    setMineFilterOpen(false);
+                    if (value !== sourceCategory && value !== "official") initData();
+                    setSourceCategory(value);
+                  }}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            <div className="knowledge-source-actions">
+              {backgroundTasksButton}
+              {createKnowledgeButton}
+            </div>
+          </div>
+
+          <div
+            className={`knowledge-mine-toolbar ${isOfficialView ? "has-update-all" : ""}`}
+          >
+            <Input.Search
+              allowClear
+              prefix={<SearchOutlined />}
+              value={mineSearch}
+              placeholder={
+                isCloudArchiveView
+                  ? t("admin.dataSourceAssetSearchPlaceholder")
+                  : t("knowledge.squareSearchPlaceholder")
+              }
+              onFocus={() => setMineFilterOpen(false)}
+              onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                setMineSearch(event.target.value)
+              }
+            />
+            {isOfficialView ? (
+              <Button
+                type="primary"
+                disabled={
+                  !officialItems.some((item) => item.installed) ||
+                  Object.values(trackedMarketJobs).some(
+                    (job) => job.jobType === "updateAll",
+                  )
+                }
+                onClick={handleUpdateAllOfficial}
+              >
+                {t("knowledge.updateAllWithCount", { count: officialItems.filter((item) => item.updateAvailable).length })}
+              </Button>
+            ) : null}
+            <KnowledgeMineFilterPopover
+              t={t}
+              tags={isOfficialView ? officialFilterTags : localTags}
+              primaryFilter={isCloudArchiveView ? "cloudSource" : "tags"}
+              open={mineFilterOpen}
+              selectedTag={
+                isOfficialView ? mineOfficialTag : mineLocalTag
+              }
+              selectedSort={mineSort}
+              selectedCloudSource={mineCloudSource}
+              onOpenChange={setMineFilterOpen}
+              onTagChange={(tag) => {
+                if (isOfficialView) setMineOfficialTag(tag);
+                else setMineLocalTag(tag);
+              }}
+              onSortChange={setMineSort}
+              onCloudSourceChange={setMineCloudSource}
+            />
+            <Button
+              onClick={() => {
+                if (sourceCategory !== "local") initData();
+                setMineSearch("");
+                setMineLocalTag(ALL_TAGS);
+                setMineOfficialTag(ALL_TAGS);
+                setMineSort("all");
+                setMineCloudSource("all");
+                setSourceCategory("local");
+                setMineFilterOpen(false);
+              }}
+            >
+              {t("common.reset")}
+            </Button>
+          </div>
+
+          <ListPageTable
+            rootClassName={`knowledge-mine-table ${isCloudArchiveView ? "data-source-asset-table" : ""}`}
+            rowKey={isCloudArchiveView || isOfficialView ? "id" : "dataset_id"}
+            columns={
+              (isCloudArchiveView
+                ? cloudSourceColumns
+                : isOfficialView
+                  ? officialColumns
+                  : columns) as ColumnsType<any>
+            }
+            loading={isOfficialView ? officialLoading || officialSortLoading : loading}
+            dataSource={
+              isCloudArchiveView
+                ? cloudSources
+                : isOfficialView
+                  ? installedOfficialItems
+                  : dataSource
+            }
+            expandable={{ showExpandColumn: false }}
+            pagination={
+              isOfficialView
+                ? false
+                : {
+                    ...pagination,
+                    showSizeChanger: true,
+                    showTotal: (total: number) => t("common.totalItems", { total }),
+                  }
+            }
+            onChange={isOfficialView ? undefined : onTableChange}
+            onRow={(record: any) => ({
+              onClick: () => {
+                if (isOfficialView) {
+                  handleOfficialOpen(record as OfficialKnowledgeBase);
+                  return;
+                }
+                if (!isCloudArchiveView && "dataset_id" in record && record.dataset_id) {
+                  navigate(`/lib/knowledge/detail/${record.dataset_id}`);
+                }
+              },
+            })}
+            scroll={{ x: isCloudArchiveView ? 1240 : isOfficialView ? 1080 : 960 }}
+          />
+        </div>
+      )}
+
+      <TypedConfirmModal ref={confirmRef} onClick={onDelete} />
+
+      <CreateUpdateModal
+        ref={createUpdateRef}
+        onUpdate={onUpdate}
+        embeddingReady={
+          embeddingReady === false || multimodalEmbeddingReady === false
+            ? false
+            : embeddingReady
+        }
+      />
+      <CreateKnowledgeBaseModal
+        ref={createKnowledgeRef}
+        syncCreateVm={syncCreateVm}
+        embeddingReady={embeddingReady === false || multimodalEmbeddingReady === false ? false : embeddingReady}
+        onCreate={onUpdate}
+      />
+      <SyncKnowledgeBaseCreationFlow vm={syncCreateVm} hideProviderModal />
+      <KnowledgeMarketTaskModal
+        open={marketTaskModalOpen}
+        refreshKey={marketTaskRefreshKey}
+        onClose={() => setMarketTaskModalOpen(false)}
+      />
+    </div>
+  );
+};
+
+export default KnowledgePage;

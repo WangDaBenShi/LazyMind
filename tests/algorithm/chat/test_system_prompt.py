@@ -1,0 +1,169 @@
+from __future__ import annotations
+
+from lazymind.chat.engine.prompts.system_prompt import (
+    build_standard_prompt_bundle,
+    build_system_prompt,
+)
+
+
+def test_system_prompt_uses_user_timezone_time() -> None:
+    bundle = build_standard_prompt_bundle(
+        False,
+        environment_context={
+            'time': {
+                'now': '2026-05-11T11:48:00.000Z',
+                'timezone': 'Asia/Shanghai',
+            },
+        },
+    )
+
+    assert 'Current user date: 2026-05-11 (Asia/Shanghai)' in bundle.system_prompt
+    assert '19:48:00' not in bundle.system_prompt
+    assert 'Current user time: 19:48:00 (Asia/Shanghai)' in bundle.current_input
+    assert 'Use this context to interpret relative time expressions' not in bundle.system_prompt
+    assert 'User timezone:' not in bundle.system_prompt
+
+
+def test_system_prompt_falls_back_to_raw_time_when_timezone_is_invalid() -> None:
+    bundle = build_standard_prompt_bundle(
+        False,
+        environment_context={
+            'time': {
+                'now': '2026-05-11T11:48:00.000Z',
+                'timezone': 'Bad/Timezone',
+            },
+        },
+    )
+
+    assert 'Current user date: 2026-05-11' in bundle.system_prompt
+    assert '11:48:00' not in bundle.system_prompt
+    assert 'Current user time: 11:48:00' in bundle.current_input
+    assert '2026-05-11T11:48:00' not in bundle.current_input
+
+
+def test_system_prompt_includes_cross_tool_policy_when_tools_are_active() -> None:
+    prompt = build_system_prompt(True)
+
+    assert '# Tool use policy' in prompt
+    assert 'get_*Toolkit_methods' in prompt
+
+
+def test_system_prompt_omits_tool_policy_without_tools() -> None:
+    prompt = build_system_prompt(False)
+
+    assert '# Tool use policy' not in prompt
+
+
+def test_main_chat_prompt_describes_editable_writing_blocks() -> None:
+    prompt = build_system_prompt(False)
+
+    assert '# Editable writing blocks' in prompt
+    assert '```editable' in prompt
+    assert 'articles, marketing or sales copy' in prompt
+    assert 'Do not put citation refs or source links' in prompt
+
+
+def test_system_prompt_does_not_embed_tool_specific_web_guidance() -> None:
+    prompt = build_system_prompt(True)
+
+    assert '# Tool use policy' in prompt
+    assert 'one search intent' not in prompt
+
+
+def test_system_prompt_does_not_classify_request_language_from_urls() -> None:
+    bundle = build_standard_prompt_bundle(
+        True,
+        current_query=(
+            '帮我看看这个计划 '
+            'https://sensetime.feishu.cn/wiki/CTxvwpohviXgZiklv36cEJVwnac '
+            '有什么问题，有哪些改进意见'
+        ),
+        environment_context={'locale': 'en-US'},
+    )
+
+    assert 'Selected response language' not in bundle.current_input
+    assert 'Selected response language' not in bundle.system_prompt
+    assert 'Reply in the language the user is currently using.' in bundle.system_prompt
+    assert 'UI locale: en-US' in bundle.system_prompt
+
+
+def test_system_prompt_appends_partitioned_active_tool_contracts() -> None:
+    prompt = build_system_prompt(
+        True,
+        tool_prompt_appendices={
+            'output_contract': ['Preserve the returned citation markers.'],
+            'safety': ['Confirm before deleting remote data.'],
+        },
+    )
+
+    assert '## Tool-specific safety constraints' in prompt
+    assert 'Confirm before deleting remote data.' in prompt
+    assert '## Tool output contracts' in prompt
+    assert 'Preserve the returned citation markers.' in prompt
+    assert prompt.index('## Tool-specific safety constraints') < prompt.index('## Tool output contracts')
+
+
+def test_tool_output_contract_keeps_detailed_image_and_citation_guards() -> None:
+    from lazymind.chat.service.component.tool_registry import (
+        IMAGE_MARKDOWN_OUTPUT_APPENDIX,
+        RETRIEVAL_CITATION_OUTPUT_APPENDIX,
+        collect_system_prompt_appendices,
+    )
+
+    prompt = build_system_prompt(
+        True,
+        tool_prompt_appendices=collect_system_prompt_appendices(
+            [],
+            extra_appendices=(
+                IMAGE_MARKDOWN_OUTPUT_APPENDIX,
+                RETRIEVAL_CITATION_OUTPUT_APPENDIX,
+            ),
+        ),
+    )
+
+    assert 'NEVER invent hosts or prefixes' in prompt
+    assert 'Do not paste bare filesystem paths' in prompt
+    assert 'For every claim in the final answer that relies on retrieval' in prompt
+    assert 'the final answer must copy at least one of those `ref` values exactly' not in prompt
+    assert 'cite at least one result from each category' not in prompt
+    assert 'Never invent or rewrite refs' in prompt
+
+
+def test_system_prompt_ignores_tool_appendices_when_no_tools_are_registered() -> None:
+    prompt = build_system_prompt(
+        False,
+        tool_prompt_appendices={'output_contract': ['Must not be injected.']},
+    )
+
+    assert 'Must not be injected.' not in prompt
+
+
+def test_system_prompt_explains_profile_operations_by_yaml_type() -> None:
+    prompt = build_system_prompt(
+        True,
+        profile=(
+            'personal:\n'
+            '  nickname: Neo\n'
+            '  interests: [AI]\n'
+            '  headline: null\n'
+        ),
+    )
+
+    assert 'nickname: Neo' in prompt
+    assert 'A YAML string supports `set` and `clear`' in prompt
+    assert 'A YAML `null` supports `set` and `clear`' in prompt
+    assert 'A YAML list of strings supports `add`, `remove`, and `clear`' in prompt
+    assert 'Use only existing leaf dot paths' in prompt
+
+
+def test_profile_languages_are_not_selected_as_reply_language() -> None:
+    bundle = build_standard_prompt_bundle(
+        True,
+        current_query='What changed?',
+        profile='locale:\n  languages: [Chinese]\n',
+        environment_context={'locale': 'zh-CN'},
+    )
+
+    assert 'Selected response language' not in bundle.current_input
+    assert 'profile locale.languages' not in bundle.current_input
+    assert 'languages: [Chinese]' in bundle.system_prompt

@@ -1,0 +1,1070 @@
+package market
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/google/uuid"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+
+	skillmetadata "lazymind/core/skillv2/metadata"
+	skillsearch "lazymind/core/skillv2/search"
+	skillpackage "lazymind/core/skillv2/skillpackage"
+)
+
+type ServiceDeps struct {
+	DB         *gorm.DB
+	BlobStore  *BlobStore
+	Downloader ZipDownloader
+}
+
+type AdminServiceDeps = ServiceDeps
+
+type Service struct {
+	db         *gorm.DB
+	blobStore  *BlobStore
+	downloader ZipDownloader
+}
+
+type AdminService = Service
+
+func NewService(deps ServiceDeps) *Service {
+	return &Service{db: deps.DB, blobStore: deps.BlobStore, downloader: deps.Downloader}
+}
+
+func NewAdminService(deps AdminServiceDeps) *AdminService {
+	return (*AdminService)(NewService(ServiceDeps(deps)))
+}
+
+type InstallRequest struct {
+	MarketItemID string
+	UserID       string
+	UserName     string
+}
+
+type InstallResponse struct {
+	SkillID string
+}
+
+type GetInstalledTreeRequest struct {
+	SkillID string
+	UserID  string
+}
+
+type ZipDownloader interface {
+	Download(ctx context.Context, url string) (string, error)
+}
+
+type PublishRequest struct {
+	AdminUserID string
+	Tags        []string
+	Source      SourceInput
+}
+
+type SourceInput struct {
+	Type       string
+	UploadID   string
+	StoredPath string
+	Filename   string
+	URL        string
+}
+
+type PublishResponse struct {
+	MarketItemID  string
+	SourceSkillID string
+}
+
+type EditRequest struct {
+	AdminUserID  string
+	MarketItemID string
+	VersionNote  *string
+	Tags         *[]string
+}
+
+type EditResponse struct {
+	MarketItemID string
+}
+
+type UnpublishRequest struct {
+	AdminUserID  string
+	MarketItemID string
+}
+
+type UnpublishResponse struct {
+	MarketItemID string
+}
+
+type DeleteRequest struct {
+	MarketItemID string
+}
+
+type DeleteResponse struct {
+	MarketItemID  string
+	SourceSkillID string
+}
+
+type TreeNode struct {
+	Name     string
+	Path     string
+	Type     string
+	Children []TreeNode
+	BlobHash string
+	Size     int64
+	Mime     string
+	FileType string
+	Binary   bool
+}
+
+func (n TreeNode) HasPath(path string) bool {
+	if n.Path == path {
+		return true
+	}
+	for _, child := range n.Children {
+		if child.HasPath(path) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Service) Install(ctx context.Context, req InstallRequest) (InstallResponse, error) {
+	var out InstallResponse
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var item skillMarketItemRow
+		if err := tx.Where("id = ? AND status = ?", req.MarketItemID, "published").Take(&item).Error; err != nil {
+			return err
+		}
+		now := time.Now()
+		installedSkillID, err := existingInstalledSkillID(ctx, tx, item.ID, req.UserID)
+		if err != nil {
+			return err
+		}
+		if installedSkillID != "" {
+			out.SkillID = installedSkillID
+			return nil
+		}
+		restoredSkillID, err := restoreTrashedInstalledSkill(ctx, tx, item, req.UserID, now)
+		if err != nil {
+			return err
+		}
+		if restoredSkillID != "" {
+			if err := recordMarketInstall(ctx, tx, item.ID, req.UserID, restoredSkillID, now); err != nil {
+				return err
+			}
+			out.SkillID = restoredSkillID
+			return nil
+		}
+		if err := detachLegacyPublisherSource(ctx, tx, item, req.UserID, now); err != nil {
+			return err
+		}
+		skillID, _, err := copyHeadRevision(ctx, tx, item.SourceSkillID, req.UserID, req.UserName, "market_install", req.UserID)
+		if err != nil {
+			return err
+		}
+		installedTags, _ := json.Marshal(normalizeMarketTags(decodeMarketTags(item.Tags)))
+		if err := tx.Model(&skillRow{}).Where("id = ?", skillID).Update("tags", installedTags).Error; err != nil {
+			return err
+		}
+		if err := skillsearch.RebuildSkillTx(ctx, tx, skillID, now); err != nil {
+			return err
+		}
+		if err := recordMarketInstall(ctx, tx, item.ID, req.UserID, skillID, now); err != nil {
+			return err
+		}
+		out.SkillID = skillID
+		return nil
+	})
+	return out, err
+}
+
+func existingInstalledSkillID(ctx context.Context, tx *gorm.DB, marketItemID, userID string) (string, error) {
+	var row skillMarketInstallRow
+	result := tx.WithContext(ctx).
+		Table("skill_market_installs AS installs").
+		Select("installs.*").
+		Joins("JOIN skills AS skills ON skills.id = installs.skill_id AND skills.owner_user_id = installs.user_id AND skills.deleted_at IS NULL").
+		Joins("JOIN skill_market_items AS market_items ON market_items.id = installs.market_item_id AND market_items.source_skill_id <> installs.skill_id").
+		Where("installs.market_item_id = ? AND installs.user_id = ?", marketItemID, userID).
+		Limit(1).
+		Find(&row)
+	if result.Error != nil {
+		return "", result.Error
+	}
+	if result.RowsAffected == 0 {
+		return "", nil
+	}
+	return row.SkillID, nil
+}
+
+func restoreTrashedInstalledSkill(ctx context.Context, tx *gorm.DB, item skillMarketItemRow, userID string, now time.Time) (string, error) {
+	var candidate struct {
+		ID           string `gorm:"column:id"`
+		RelativeRoot string `gorm:"column:relative_root"`
+	}
+	result := tx.WithContext(ctx).
+		Table("skills AS skills").
+		Select("skills.id, skills.relative_root").
+		Where("skills.owner_user_id = ? AND skills.deleted_at IS NOT NULL", userID).
+		Where(`EXISTS (
+			SELECT 1 FROM skill_revisions AS revisions
+			WHERE revisions.skill_id = skills.id
+				AND revisions.change_source = ?
+				AND revisions.source_ref_type = ?
+				AND revisions.source_ref_id = ?
+		)`, "market_install", "skill", item.SourceSkillID).
+		Order("skills.deleted_at DESC, skills.updated_at DESC, skills.id ASC").
+		Limit(1).
+		Scan(&candidate)
+	if result.Error != nil {
+		return "", result.Error
+	}
+	if result.RowsAffected == 0 {
+		return "", nil
+	}
+
+	var conflicts int64
+	if err := tx.WithContext(ctx).Model(&skillRow{}).
+		Where("owner_user_id = ? AND relative_root = ? AND deleted_at IS NULL AND id <> ?", userID, candidate.RelativeRoot, candidate.ID).
+		Count(&conflicts).Error; err != nil {
+		return "", err
+	}
+	if conflicts > 0 {
+		return "", fmt.Errorf("skill already exists")
+	}
+	if err := tx.WithContext(ctx).Model(&skillRow{}).
+		Where("id = ? AND owner_user_id = ? AND deleted_at IS NOT NULL", candidate.ID, userID).
+		Updates(map[string]any{
+			"deleted_at":       nil,
+			"trash_expires_at": nil,
+			"deleted_by":       nil,
+			"updated_at":       now,
+		}).Error; err != nil {
+		return "", err
+	}
+	if err := skillsearch.RebuildSkillTx(ctx, tx, candidate.ID, now); err != nil {
+		return "", err
+	}
+	return candidate.ID, nil
+}
+
+func detachLegacyPublisherSource(ctx context.Context, tx *gorm.DB, item skillMarketItemRow, userID string, now time.Time) error {
+	if item.CreatedBy == nil || strings.TrimSpace(*item.CreatedBy) != strings.TrimSpace(userID) {
+		return nil
+	}
+	result := tx.WithContext(ctx).Model(&skillRow{}).
+		Where("id = ? AND owner_user_id = ?", item.SourceSkillID, userID).
+		Updates(map[string]any{
+			"owner_user_id":   marketSourceOwnerID(item.ID),
+			"owner_user_name": "skill-market",
+			"updated_at":      now,
+		})
+	if result.Error != nil || result.RowsAffected == 0 {
+		return result.Error
+	}
+	return skillsearch.RebuildSkillTx(ctx, tx, item.SourceSkillID, now)
+}
+
+func recordMarketInstall(ctx context.Context, tx *gorm.DB, marketItemID, userID, skillID string, now time.Time) error {
+	row := skillMarketInstallRow{
+		MarketItemID: marketItemID,
+		UserID:       userID,
+		SkillID:      skillID,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	return tx.WithContext(ctx).Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "market_item_id"}, {Name: "user_id"}},
+		DoUpdates: clause.Assignments(map[string]any{
+			"skill_id":   skillID,
+			"updated_at": now,
+		}),
+	}).Create(&row).Error
+}
+
+func (s *Service) GetInstalledTree(ctx context.Context, req GetInstalledTreeRequest) (TreeNode, error) {
+	var skill skillRow
+	if err := s.db.WithContext(ctx).Where("id = ? AND owner_user_id = ?", req.SkillID, req.UserID).Take(&skill).Error; err != nil {
+		return TreeNode{}, err
+	}
+	if skill.HeadRevisionID == nil {
+		return TreeNode{}, fmt.Errorf("skill has no head revision")
+	}
+	var entries []skillRevisionEntryRow
+	if err := s.db.WithContext(ctx).Where("revision_id = ?", *skill.HeadRevisionID).Order("path ASC").Find(&entries).Error; err != nil {
+		return TreeNode{}, err
+	}
+	return buildTree(entries), nil
+}
+
+func (s *Service) Publish(ctx context.Context, req PublishRequest) (PublishResponse, error) {
+	files, err := s.filesFromSource(ctx, req.Source)
+	if err != nil {
+		return PublishResponse{}, err
+	}
+	meta, err := skillmetadata.FromFiles(files)
+	if err != nil {
+		return PublishResponse{}, err
+	}
+	tags, _ := json.Marshal(normalizeMarketTags(req.Tags))
+	normalizedName := strings.ToLower(strings.TrimSpace(meta.Name))
+	var out PublishResponse
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if tx.Dialector.Name() == "postgres" {
+			if err := tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?))", normalizedName).Error; err != nil {
+				return err
+			}
+		}
+		var conflicts int64
+		if err := tx.Table("skill_market_items AS market_items").
+			Joins("JOIN skills AS skills ON skills.id = market_items.source_skill_id AND skills.deleted_at IS NULL").
+			Where("LOWER(TRIM(skills.skill_name)) = ?", normalizedName).
+			Count(&conflicts).Error; err != nil {
+			return err
+		}
+		if conflicts > 0 {
+			return fmt.Errorf("skill market name already exists")
+		}
+		sourceSkillID := newID()
+		revisionID := newID()
+		marketItemID := newID()
+		now := time.Now()
+		adminID := req.AdminUserID
+		if err := tx.Create(&skillRow{
+			ID:                 sourceSkillID,
+			OwnerUserID:        marketSourceOwnerID(marketItemID),
+			OwnerUserName:      "skill-market",
+			CreateUserID:       req.AdminUserID,
+			CreateUserName:     req.AdminUserID,
+			Category:           skillmetadata.ExternalCategory,
+			SkillName:          meta.Name,
+			Description:        meta.Description,
+			Tags:               []byte(`[]`),
+			RelativeRoot:       path.Join(skillmetadata.ExternalCategory, meta.Name),
+			SkillMDPath:        "SKILL.md",
+			HeadRevisionID:     &revisionID,
+			Version:            1,
+			AutoEvoApplyStatus: "idle",
+			IsEnabled:          true,
+			UpdateStatus:       "up_to_date",
+			CreatedAt:          now,
+			UpdatedAt:          now,
+		}).Error; err != nil {
+			return err
+		}
+		entries, treeHash, err := entriesFromFiles(ctx, tx, revisionID, files, s.blobStore)
+		if err != nil {
+			return err
+		}
+		sourceRefID := strings.TrimSpace(req.Source.UploadID)
+		if sourceRefID == "" {
+			sourceRefID = strings.TrimSpace(req.Source.URL)
+		}
+		if err := tx.Create(&skillRevisionRow{
+			ID:            revisionID,
+			SkillID:       sourceSkillID,
+			RevisionNo:    1,
+			TreeHash:      treeHash,
+			ChangeSource:  "market_publish",
+			SourceRefType: req.Source.Type,
+			SourceRefID:   sourceRefID,
+			CreatedBy:     &adminID,
+			CreatedAt:     now,
+		}).Error; err != nil {
+			return err
+		}
+		if len(entries) > 0 {
+			if err := tx.Create(&entries).Error; err != nil {
+				return err
+			}
+		}
+		if err := createDraft(tx, sourceSkillID, revisionID, now); err != nil {
+			return err
+		}
+		if err := tx.Create(&skillMarketItemRow{
+			ID:            marketItemID,
+			SourceSkillID: sourceSkillID,
+			Status:        "published",
+			Tags:          tags,
+			CreatedBy:     &adminID,
+			UpdatedBy:     &adminID,
+			PublishedAt:   &now,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		}).Error; err != nil {
+			return err
+		}
+		if err := skillsearch.RebuildSkillTx(ctx, tx, sourceSkillID, now); err != nil {
+			return err
+		}
+		out = PublishResponse{MarketItemID: marketItemID, SourceSkillID: sourceSkillID}
+		return nil
+	})
+	return out, err
+}
+
+func (s *Service) Edit(ctx context.Context, req EditRequest) (EditResponse, error) {
+	now := time.Now()
+	updates := map[string]any{"updated_by": req.AdminUserID, "updated_at": now}
+	if req.VersionNote != nil {
+		updates["version_note"] = strings.TrimSpace(*req.VersionNote)
+	}
+	if req.Tags != nil {
+		tags, _ := json.Marshal(normalizeMarketTags(*req.Tags))
+		updates["tags"] = tags
+	}
+	err := s.db.WithContext(ctx).Model(&skillMarketItemRow{}).Where("id = ?", req.MarketItemID).Updates(updates).Error
+	return EditResponse{MarketItemID: req.MarketItemID}, err
+}
+
+func (s *Service) ValidateNameAvailable(ctx context.Context, name, excludeMarketItemID string) error {
+	query := s.db.WithContext(ctx).
+		Table("skill_market_items AS market_items").
+		Joins("JOIN skills AS skills ON skills.id = market_items.source_skill_id AND skills.deleted_at IS NULL").
+		Where("LOWER(TRIM(skills.skill_name)) = ?", strings.ToLower(strings.TrimSpace(name)))
+	if strings.TrimSpace(excludeMarketItemID) != "" {
+		query = query.Where("market_items.id <> ?", excludeMarketItemID)
+	}
+	var conflicts int64
+	if err := query.Count(&conflicts).Error; err != nil {
+		return err
+	}
+	if conflicts > 0 {
+		return fmt.Errorf("skill market name already exists")
+	}
+	return nil
+}
+
+func (s *Service) Unpublish(ctx context.Context, req UnpublishRequest) (UnpublishResponse, error) {
+	now := time.Now()
+	updates := map[string]any{"status": "unpublished", "updated_by": req.AdminUserID, "updated_at": now}
+	err := s.db.WithContext(ctx).Model(&skillMarketItemRow{}).Where("id = ?", req.MarketItemID).Updates(updates).Error
+	return UnpublishResponse{MarketItemID: req.MarketItemID}, err
+}
+
+func (s *Service) Delete(ctx context.Context, req DeleteRequest) (DeleteResponse, error) {
+	marketItemID := strings.TrimSpace(req.MarketItemID)
+	if marketItemID == "" {
+		return DeleteResponse{}, fmt.Errorf("market item id is required")
+	}
+
+	var out DeleteResponse
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var item skillMarketItemRow
+		if err := tx.Where("id = ?", marketItemID).Take(&item).Error; err != nil {
+			return err
+		}
+
+		var source skillRow
+		result := tx.Where("id = ?", item.SourceSkillID).Limit(1).Find(&source)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected > 0 && source.OwnerUserID != marketSourceOwnerID(item.ID) {
+			return fmt.Errorf("market source skill ownership mismatch")
+		}
+
+		if err := tx.Where("market_item_id = ?", item.ID).Delete(&skillMarketInstallRow{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("id = ?", item.ID).Delete(&skillMarketItemRow{}).Error; err != nil {
+			return err
+		}
+		if result.RowsAffected > 0 {
+			if err := deleteMarketSourceSkillGraphTx(ctx, tx, source.ID); err != nil {
+				return err
+			}
+		}
+
+		out = DeleteResponse{MarketItemID: item.ID, SourceSkillID: item.SourceSkillID}
+		return nil
+	})
+	return out, err
+}
+
+func deleteMarketSourceSkillGraphTx(ctx context.Context, tx *gorm.DB, skillID string) error {
+	tx = tx.WithContext(ctx)
+	var revisionIDs []string
+	if err := tx.Model(&skillRevisionRow{}).Where("skill_id = ?", skillID).Pluck("id", &revisionIDs).Error; err != nil {
+		return err
+	}
+	blobHashes := make(map[string]struct{})
+	if len(revisionIDs) > 0 {
+		var revisionBlobHashes []string
+		if err := tx.Model(&skillRevisionEntryRow{}).
+			Where("revision_id IN ? AND blob_hash IS NOT NULL", revisionIDs).
+			Pluck("blob_hash", &revisionBlobHashes).Error; err != nil {
+			return err
+		}
+		for _, hash := range revisionBlobHashes {
+			blobHashes[hash] = struct{}{}
+		}
+	}
+	var draftBlobHashes []string
+	if err := tx.Model(&skillDraftEntryRow{}).
+		Where("skill_id = ? AND blob_hash IS NOT NULL", skillID).
+		Pluck("blob_hash", &draftBlobHashes).Error; err != nil {
+		return err
+	}
+	for _, hash := range draftBlobHashes {
+		blobHashes[hash] = struct{}{}
+	}
+
+	if len(revisionIDs) > 0 {
+		if err := tx.Where("revision_id IN ?", revisionIDs).Delete(&skillRevisionEntryRow{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("id IN ?", revisionIDs).Delete(&skillRevisionRow{}).Error; err != nil {
+			return err
+		}
+	}
+	if err := tx.Where("skill_id = ?", skillID).Delete(&skillDraftEntryRow{}).Error; err != nil {
+		return err
+	}
+	if err := tx.Where("skill_id = ?", skillID).Delete(&skillDraftRow{}).Error; err != nil {
+		return err
+	}
+	if err := deleteMarketSourceReviewGraphTx(tx, skillID); err != nil {
+		return err
+	}
+	if tx.Migrator().HasTable(&skillSearchIndexRow{}) {
+		if err := tx.Where("skill_id = ?", skillID).Delete(&skillSearchIndexRow{}).Error; err != nil {
+			return err
+		}
+	}
+	if err := tx.Where("id = ?", skillID).Delete(&skillRow{}).Error; err != nil {
+		return err
+	}
+	return deleteUnreferencedMarketSourceBlobsTx(tx, blobHashes)
+}
+
+func deleteMarketSourceReviewGraphTx(tx *gorm.DB, skillID string) error {
+	if !tx.Migrator().HasTable("skill_draft_review_sessions") {
+		return nil
+	}
+	var reviewIDs []string
+	if err := tx.Table("skill_draft_review_sessions").Where("skill_id = ?", skillID).Pluck("id", &reviewIDs).Error; err != nil {
+		return err
+	}
+	if len(reviewIDs) == 0 {
+		return nil
+	}
+	if tx.Migrator().HasTable("skill_draft_review_action_items") {
+		if err := tx.Exec("DELETE FROM skill_draft_review_action_items WHERE review_session_id IN ?", reviewIDs).Error; err != nil {
+			return err
+		}
+	}
+	if tx.Migrator().HasTable("skill_draft_review_action_batches") {
+		if err := tx.Exec("DELETE FROM skill_draft_review_action_batches WHERE review_session_id IN ?", reviewIDs).Error; err != nil {
+			return err
+		}
+	}
+	return tx.Exec("DELETE FROM skill_draft_review_sessions WHERE id IN ?", reviewIDs).Error
+}
+
+func deleteUnreferencedMarketSourceBlobsTx(tx *gorm.DB, blobHashes map[string]struct{}) error {
+	for hash := range blobHashes {
+		var revisionRefs int64
+		if err := tx.Model(&skillRevisionEntryRow{}).Where("blob_hash = ?", hash).Count(&revisionRefs).Error; err != nil {
+			return err
+		}
+		if revisionRefs > 0 {
+			continue
+		}
+		var draftRefs int64
+		if err := tx.Model(&skillDraftEntryRow{}).Where("blob_hash = ?", hash).Count(&draftRefs).Error; err != nil {
+			return err
+		}
+		if draftRefs == 0 {
+			if err := tx.Where("hash = ?", hash).Delete(&skillBlobRow{}).Error; err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+type LocalObjectStore struct {
+	root string
+}
+
+func NewLocalObjectStore(root string) *LocalObjectStore {
+	return &LocalObjectStore{root: root}
+}
+
+func (s *LocalObjectStore) Put(ctx context.Context, key string, data []byte) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	p := filepath.Join(s.root, filepath.FromSlash(key))
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(p, data, 0o644)
+}
+
+type BlobStore struct {
+	db      *gorm.DB
+	objects *LocalObjectStore
+}
+
+func NewBlobStore(db *gorm.DB, objects *LocalObjectStore) *BlobStore {
+	return &BlobStore{db: db, objects: objects}
+}
+
+func (s *BlobStore) put(ctx context.Context, tx *gorm.DB, filePath string, data []byte) (blobInfo, error) {
+	if tx == nil {
+		tx = s.db
+	}
+	sum := sha256.Sum256(data)
+	hash := hex.EncodeToString(sum[:])
+	mime, fileType, binary := classifyFile(filePath, data)
+	info := blobInfo{Hash: hash, Size: int64(len(data)), Mime: mime, FileType: fileType, Binary: binary}
+	var existing skillBlobRow
+	result := tx.Where("hash = ?", hash).Limit(1).Find(&existing)
+	if result.Error != nil {
+		return blobInfo{}, result.Error
+	}
+	if result.RowsAffected > 0 {
+		return blobInfo{Hash: hash, Size: existing.Size, Mime: existing.Mime, FileType: existing.FileType, Binary: existing.Binary}, nil
+	}
+	row := skillBlobRow{Hash: hash, Size: int64(len(data)), Mime: mime, FileType: fileType, Binary: binary, CreatedAt: time.Now()}
+	if binary {
+		key := strings.Join([]string{"skillv2", hash[:2], hash}, "/")
+		if err := s.objects.Put(ctx, key, data); err != nil {
+			return blobInfo{}, err
+		}
+		row.StorageBackend = "local_file"
+		row.StorageKey = &key
+	} else {
+		row.StorageBackend = "postgres"
+		row.Content = data
+	}
+	if err := tx.Create(&row).Error; err != nil {
+		return blobInfo{}, err
+	}
+	return info, nil
+}
+
+type blobInfo struct {
+	Hash     string
+	Size     int64
+	Mime     string
+	FileType string
+	Binary   bool
+}
+
+func copyHeadRevision(ctx context.Context, tx *gorm.DB, sourceSkillID, ownerUserID, ownerUserName, changeSource, createdBy string) (string, string, error) {
+	var source skillRow
+	if err := tx.Where("id = ?", sourceSkillID).Take(&source).Error; err != nil {
+		return "", "", err
+	}
+	if source.HeadRevisionID == nil {
+		return "", "", fmt.Errorf("source skill has no head revision")
+	}
+	var meta skillmetadata.Metadata
+	var err error
+	if source.Category == skillmetadata.ExternalCategory {
+		meta, err = skillmetadata.FromRevisionWithFallback(ctx, tx, *source.HeadRevisionID, skillmetadata.Metadata{
+			Name:        source.SkillName,
+			Description: source.Description,
+		})
+	} else {
+		meta, err = skillmetadata.FromRevision(ctx, tx, *source.HeadRevisionID)
+	}
+	if err != nil {
+		return "", "", err
+	}
+	var conflicts int64
+	if err := tx.Model(&skillRow{}).
+		Where("owner_user_id = ? AND category = ? AND skill_name = ? AND deleted_at IS NULL", ownerUserID, skillmetadata.ExternalCategory, meta.Name).
+		Count(&conflicts).Error; err != nil {
+		return "", "", err
+	}
+	if conflicts > 0 {
+		return "", "", fmt.Errorf("skill already exists")
+	}
+	var sourceRev skillRevisionRow
+	if err := tx.Where("id = ? AND skill_id = ?", *source.HeadRevisionID, source.ID).Take(&sourceRev).Error; err != nil {
+		return "", "", err
+	}
+	var sourceEntries []skillRevisionEntryRow
+	if err := tx.Where("revision_id = ?", sourceRev.ID).Order("path ASC").Find(&sourceEntries).Error; err != nil {
+		return "", "", err
+	}
+	now := time.Now()
+	skillID := newID()
+	revisionID := newID()
+	var createdByPtr *string
+	if createdBy != "" {
+		createdByPtr = &createdBy
+	}
+	copy := source
+	copy.ID = skillID
+	copy.OwnerUserID = ownerUserID
+	copy.OwnerUserName = ownerUserName
+	copy.CreateUserID = createdBy
+	copy.CreateUserName = ownerUserName
+	copy.HeadRevisionID = &revisionID
+	copy.Category = skillmetadata.ExternalCategory
+	copy.SkillName = meta.Name
+	copy.Description = meta.Description
+	copy.RelativeRoot = path.Join(copy.Category, copy.SkillName)
+	copy.Version = 1
+	copy.CreatedAt = now
+	copy.UpdatedAt = now
+	if err := tx.Create(&copy).Error; err != nil {
+		return "", "", err
+	}
+	entries := make([]skillRevisionEntryRow, 0, len(sourceEntries))
+	for _, entry := range sourceEntries {
+		entry.RevisionID = revisionID
+		entries = append(entries, entry)
+	}
+	treeHash := hashEntries(entries)
+	if err := tx.Create(&skillRevisionRow{
+		ID:               revisionID,
+		SkillID:          skillID,
+		ParentRevisionID: nil,
+		RevisionNo:       1,
+		TreeHash:         treeHash,
+		ChangeSource:     changeSource,
+		SourceRefType:    "skill",
+		SourceRefID:      sourceSkillID,
+		CreatedBy:        createdByPtr,
+		CreatedAt:        now,
+	}).Error; err != nil {
+		return "", "", err
+	}
+	if len(entries) > 0 {
+		if err := tx.Create(&entries).Error; err != nil {
+			return "", "", err
+		}
+	}
+	if err := createDraft(tx, skillID, revisionID, now); err != nil {
+		return "", "", err
+	}
+	return skillID, revisionID, nil
+}
+
+func createDraft(tx *gorm.DB, skillID, revisionID string, now time.Time) error {
+	return tx.Create(&skillDraftRow{SkillID: skillID, BaseRevisionID: &revisionID, Version: 1, CreatedAt: now, UpdatedAt: now}).Error
+}
+
+func entriesFromFiles(ctx context.Context, tx *gorm.DB, revisionID string, files map[string][]byte, blobs *BlobStore) ([]skillRevisionEntryRow, string, error) {
+	paths := make([]string, 0, len(files))
+	dirs := map[string]bool{}
+	for filePath := range files {
+		paths = append(paths, filePath)
+		for dir := path.Dir(filePath); dir != "." && dir != "/"; dir = path.Dir(dir) {
+			dirs[dir] = true
+		}
+	}
+	sort.Strings(paths)
+	dirPaths := make([]string, 0, len(dirs))
+	for dir := range dirs {
+		dirPaths = append(dirPaths, dir)
+	}
+	sort.Strings(dirPaths)
+	entries := make([]skillRevisionEntryRow, 0, len(dirPaths)+len(paths))
+	for _, dir := range dirPaths {
+		entries = append(entries, skillRevisionEntryRow{RevisionID: revisionID, Path: dir, EntryType: "dir", FileType: "unknown", Mode: 0o755})
+	}
+	for _, filePath := range paths {
+		blob, err := blobs.put(ctx, tx, filePath, files[filePath])
+		if err != nil {
+			return nil, "", err
+		}
+		hash := blob.Hash
+		entries = append(entries, skillRevisionEntryRow{RevisionID: revisionID, Path: filePath, EntryType: "file", BlobHash: &hash, Size: blob.Size, Mime: blob.Mime, FileType: blob.FileType, Binary: blob.Binary, Mode: 0o644})
+	}
+	return entries, hashEntries(entries), nil
+}
+
+func buildTree(entries []skillRevisionEntryRow) TreeNode {
+	root := TreeNode{Name: "", Path: "", Type: "dir"}
+	nodeByPath := map[string]*TreeNode{"": &root}
+	for _, entry := range entries {
+		parts := strings.Split(entry.Path, "/")
+		parentPath := ""
+		for i, part := range parts {
+			currentPath := strings.Join(parts[:i+1], "/")
+			if _, ok := nodeByPath[currentPath]; ok {
+				parentPath = currentPath
+				continue
+			}
+			nodeType := "dir"
+			if i == len(parts)-1 {
+				nodeType = entry.EntryType
+			}
+			node := TreeNode{Name: part, Path: currentPath, Type: nodeType}
+			if i == len(parts)-1 {
+				if entry.BlobHash != nil {
+					node.BlobHash = *entry.BlobHash
+				}
+				node.Size = entry.Size
+				node.Mime = entry.Mime
+				node.FileType = entry.FileType
+				node.Binary = entry.Binary
+			}
+			parent := nodeByPath[parentPath]
+			parent.Children = append(parent.Children, node)
+			nodeByPath[currentPath] = &parent.Children[len(parent.Children)-1]
+			parentPath = currentPath
+		}
+	}
+	sortTree(root.Children)
+	return root
+}
+
+func sortTree(nodes []TreeNode) {
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].Path < nodes[j].Path })
+	for i := range nodes {
+		sortTree(nodes[i].Children)
+	}
+}
+
+func hashEntries(entries []skillRevisionEntryRow) string {
+	lines := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		hash := ""
+		if entry.BlobHash != nil {
+			hash = *entry.BlobHash
+		}
+		lines = append(lines, entry.Path+"\x00"+entry.EntryType+"\x00"+hash)
+	}
+	sort.Strings(lines)
+	sum := sha256.Sum256([]byte(strings.Join(lines, "\n")))
+	return hex.EncodeToString(sum[:])
+}
+
+func (s *Service) filesFromSource(ctx context.Context, source SourceInput) (map[string][]byte, error) {
+	sourceType := strings.ToLower(strings.TrimSpace(source.Type))
+	zipPath := strings.TrimSpace(source.StoredPath)
+	if sourceType == "url" {
+		if strings.TrimSpace(source.URL) == "" {
+			return nil, fmt.Errorf("url required")
+		}
+		if s.downloader == nil {
+			return nil, fmt.Errorf("zip downloader is not configured")
+		}
+		downloadedPath, err := s.downloader.Download(ctx, source.URL)
+		if err != nil {
+			return nil, err
+		}
+		defer os.Remove(downloadedPath)
+		zipPath = downloadedPath
+	} else if sourceType != "uploaded_zip" {
+		return nil, fmt.Errorf("unsupported market skill source type %q", source.Type)
+	}
+	if zipPath == "" {
+		return nil, fmt.Errorf("skill package stored path is required")
+	}
+	pkg, err := skillpackage.ReadZip(zipPath)
+	if err != nil {
+		return nil, err
+	}
+	files := pkg.Files
+	if _, ok := files["SKILL.md"]; !ok {
+		return nil, fmt.Errorf("skill package must contain SKILL.md")
+	}
+	return files, nil
+}
+
+func normalizeMarketTags(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	tags := make([]string, 0, len(values))
+	for _, value := range values {
+		tag := strings.TrimSpace(value)
+		if tag == "" {
+			continue
+		}
+		if _, ok := seen[tag]; ok {
+			continue
+		}
+		seen[tag] = struct{}{}
+		tags = append(tags, tag)
+	}
+	sort.Strings(tags)
+	return tags
+}
+
+func decodeMarketTags(raw []byte) []string {
+	var tags []string
+	_ = json.Unmarshal(raw, &tags)
+	return tags
+}
+
+func classifyFile(filePath string, data []byte) (string, string, bool) {
+	ext := strings.ToLower(path.Ext(filePath))
+	switch ext {
+	case ".md", ".markdown":
+		return "text/markdown", "markdown", false
+	case ".png":
+		return "image/png", "image", true
+	case ".py", ".txt", ".json", ".yaml", ".yml", ".toml", ".js", ".ts":
+		return "text/plain", "text", false
+	}
+	if utf8.Valid(data) {
+		return "text/plain", "text", false
+	}
+	return "application/octet-stream", "binary", true
+}
+
+func newID() string {
+	if id, err := uuid.NewRandom(); err == nil {
+		return id.String()
+	}
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
+
+type skillRow struct {
+	ID                    string     `gorm:"column:id;type:varchar(36);primaryKey"`
+	OwnerUserID           string     `gorm:"column:owner_user_id;type:text;not null"`
+	OwnerUserName         string     `gorm:"column:owner_user_name;type:text;not null;default:''"`
+	CreateUserID          string     `gorm:"column:create_user_id;type:text;not null"`
+	CreateUserName        string     `gorm:"column:create_user_name;type:text;not null;default:''"`
+	Category              string     `gorm:"column:category;type:text;not null"`
+	SkillName             string     `gorm:"column:skill_name;type:text;not null"`
+	OriginBuiltinSkillUID string     `gorm:"column:origin_builtin_skill_uid;type:text;not null;default:''"`
+	Description           string     `gorm:"column:description;type:text"`
+	Tags                  []byte     `gorm:"column:tags;type:json"`
+	RelativeRoot          string     `gorm:"column:relative_root;type:text;not null"`
+	SkillMDPath           string     `gorm:"column:skill_md_path;type:text;not null;default:'SKILL.md'"`
+	HeadRevisionID        *string    `gorm:"column:head_revision_id;type:varchar(36)"`
+	Version               int64      `gorm:"column:version;not null;default:1"`
+	AutoEvo               bool       `gorm:"column:auto_evo;not null;default:false"`
+	AutoEvoApplyStatus    string     `gorm:"column:auto_evo_apply_status;type:text;not null;default:'idle'"`
+	AutoEvoGeneration     int64      `gorm:"column:auto_evo_generation;not null;default:0"`
+	AutoEvoStartedAt      *time.Time `gorm:"column:auto_evo_started_at"`
+	AutoEvoFinishedAt     *time.Time `gorm:"column:auto_evo_finished_at"`
+	AutoEvoError          string     `gorm:"column:auto_evo_error;type:text;not null;default:''"`
+	IsEnabled             bool       `gorm:"column:is_enabled;not null;default:true"`
+	UpdateStatus          string     `gorm:"column:update_status;type:text;not null;default:'up_to_date'"`
+	Ext                   []byte     `gorm:"column:ext;type:json"`
+	CreatedAt             time.Time  `gorm:"column:created_at;not null"`
+	UpdatedAt             time.Time  `gorm:"column:updated_at;not null"`
+}
+
+func (skillRow) TableName() string { return "skills" }
+
+type skillBlobRow struct {
+	Hash           string    `gorm:"column:hash;type:text;primaryKey"`
+	Size           int64     `gorm:"column:size;not null"`
+	Mime           string    `gorm:"column:mime;type:text"`
+	FileType       string    `gorm:"column:file_type;type:text;not null;default:'unknown'"`
+	Binary         bool      `gorm:"column:binary;not null;default:false"`
+	StorageBackend string    `gorm:"column:storage_backend;type:text;not null"`
+	StorageKey     *string   `gorm:"column:storage_key;type:text"`
+	Content        []byte    `gorm:"column:content;type:blob"`
+	CreatedAt      time.Time `gorm:"column:created_at;not null"`
+}
+
+func (skillBlobRow) TableName() string { return "skill_blobs" }
+
+type skillRevisionRow struct {
+	ID               string    `gorm:"column:id;type:varchar(36);primaryKey"`
+	SkillID          string    `gorm:"column:skill_id;type:varchar(36);not null"`
+	ParentRevisionID *string   `gorm:"column:parent_revision_id;type:varchar(36)"`
+	RevisionNo       int64     `gorm:"column:revision_no;not null"`
+	TreeHash         string    `gorm:"column:tree_hash;type:text;not null"`
+	Message          string    `gorm:"column:message;type:text"`
+	ChangeSource     string    `gorm:"column:change_source;type:text;not null;default:'draft_commit'"`
+	SourceRefType    string    `gorm:"column:source_ref_type;type:text;not null;default:''"`
+	SourceRefID      string    `gorm:"column:source_ref_id;type:text;not null;default:''"`
+	CreatedBy        *string   `gorm:"column:created_by;type:varchar(36)"`
+	CreatedAt        time.Time `gorm:"column:created_at;not null"`
+}
+
+func (skillRevisionRow) TableName() string { return "skill_revisions" }
+
+type skillRevisionEntryRow struct {
+	RevisionID string  `gorm:"column:revision_id;type:varchar(36);primaryKey"`
+	Path       string  `gorm:"column:path;type:text;primaryKey"`
+	EntryType  string  `gorm:"column:entry_type;type:text;not null"`
+	BlobHash   *string `gorm:"column:blob_hash;type:text"`
+	Size       int64   `gorm:"column:size"`
+	Mime       string  `gorm:"column:mime;type:text"`
+	FileType   string  `gorm:"column:file_type;type:text;not null;default:'unknown'"`
+	Binary     bool    `gorm:"column:binary;not null;default:false"`
+	Mode       int     `gorm:"column:mode;not null;default:420"`
+}
+
+func (skillRevisionEntryRow) TableName() string { return "skill_revision_entries" }
+
+type skillDraftRow struct {
+	SkillID        string     `gorm:"column:skill_id;type:varchar(36);primaryKey"`
+	BaseRevisionID *string    `gorm:"column:base_revision_id;type:varchar(36)"`
+	DraftStatus    string     `gorm:"column:draft_status;type:text;not null;default:''"`
+	DraftUpdatedAt *time.Time `gorm:"column:draft_updated_at"`
+	TaskID         string     `gorm:"column:task_id;type:text;not null;default:''"`
+	ConversationID *string    `gorm:"column:conversation_id;type:varchar(128)"`
+	UpdatedBy      *string    `gorm:"column:updated_by;type:varchar(36)"`
+	Version        int64      `gorm:"column:version;not null;default:1"`
+	CreatedAt      time.Time  `gorm:"column:created_at;not null"`
+	UpdatedAt      time.Time  `gorm:"column:updated_at;not null"`
+}
+
+func (skillDraftRow) TableName() string { return "skill_drafts" }
+
+type skillDraftEntryRow struct {
+	SkillID  string  `gorm:"column:skill_id;type:varchar(36);primaryKey"`
+	Path     string  `gorm:"column:path;type:text;primaryKey"`
+	BlobHash *string `gorm:"column:blob_hash;type:text"`
+}
+
+func (skillDraftEntryRow) TableName() string { return "skill_draft_entries" }
+
+type skillSearchIndexRow struct {
+	SkillID string `gorm:"column:skill_id;type:varchar(36);primaryKey"`
+}
+
+func (skillSearchIndexRow) TableName() string { return "skill_search_indexes" }
+
+type skillMarketItemRow struct {
+	ID            string     `gorm:"column:id;type:varchar(36);primaryKey"`
+	SourceSkillID string     `gorm:"column:source_skill_id;type:varchar(36);not null"`
+	Status        string     `gorm:"column:status;type:text;not null;default:'draft'"`
+	Tags          []byte     `gorm:"column:tags;type:json;not null;default:'[]'"`
+	Icon          string     `gorm:"column:icon;type:text;not null;default:''"`
+	SortOrder     int        `gorm:"column:sort_order;not null;default:0"`
+	VersionNote   string     `gorm:"column:version_note;type:text;not null;default:''"`
+	CreatedBy     *string    `gorm:"column:created_by;type:varchar(36)"`
+	UpdatedBy     *string    `gorm:"column:updated_by;type:varchar(36)"`
+	PublishedAt   *time.Time `gorm:"column:published_at"`
+	CreatedAt     time.Time  `gorm:"column:created_at;not null"`
+	UpdatedAt     time.Time  `gorm:"column:updated_at;not null"`
+}
+
+func (skillMarketItemRow) TableName() string { return "skill_market_items" }
+
+type skillMarketInstallRow struct {
+	MarketItemID string    `gorm:"column:market_item_id;type:varchar(36);primaryKey"`
+	UserID       string    `gorm:"column:user_id;type:text;primaryKey"`
+	SkillID      string    `gorm:"column:skill_id;type:varchar(36);not null"`
+	CreatedAt    time.Time `gorm:"column:created_at;not null"`
+	UpdatedAt    time.Time `gorm:"column:updated_at;not null"`
+}
+
+func (skillMarketInstallRow) TableName() string { return "skill_market_installs" }
+
+func marketSourceOwnerID(marketItemID string) string {
+	return "skill-market:" + marketItemID
+}

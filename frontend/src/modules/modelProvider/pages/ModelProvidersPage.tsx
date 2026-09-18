@@ -1,0 +1,2135 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AutoComplete, Button, Empty, Form, Input, Modal, Popconfirm, Select, Tag, Tooltip, message } from "antd";
+import type { InputRef } from "antd";
+import { useTranslation } from "react-i18next";
+import { localizeErrorCode } from "@/components/request";
+import {
+  CheckCircleFilled,
+  DeleteOutlined,
+  DownOutlined,
+  EditOutlined,
+  KeyOutlined,
+  LoadingOutlined,
+  PlusCircleOutlined,
+  RightOutlined,
+  SearchOutlined,
+  UpOutlined,
+} from "@ant-design/icons";
+import { listRemoteGroupModels, modelProvidersApi, unwrapModelProviderData, updateGroupModelMaxInputTokens, type RemoteGroupModel } from "../api";
+import { getProviderLogoUrl } from "../providerBranding";
+import {
+  LLM_MAX_INPUT_TOKENS_MAX_LENGTH,
+  isLlmChatCapability,
+  parseLlmMaxInputTokens,
+  resolveLlmMaxInputTokens,
+} from "../maxInputTokens";
+import "../index.scss";
+
+export type ModelCapability =
+  | "LLM_CHAT"
+  | "EMBEDDING"
+  | "VLM"
+  | "RERANK"
+  | "ASR"
+  | "TTS"
+  | "TEXT_TO_IMAGE"
+  | "TEXT_TO_VIDEO"
+  | "MULTIMODAL_EMBEDDING"
+  | "IMAGE_EDITING"
+  | "LLM_SELF_EVOLUTION";
+
+interface ProviderModel {
+  id: string;
+  name: string;
+  capability: ModelCapability;
+  builtIn: boolean;
+  enabled: boolean;
+  maxInputTokens?: string;
+}
+
+interface ProviderOption {
+  id: string;
+  name: string;
+  brand: string;
+  logoUrl?: string;
+  headline: string;
+  backendDescription?: string;
+  source: string;
+  baseUrl: string;
+  capabilities: ModelCapability[];
+  models: ProviderModel[];
+}
+
+interface ProviderConnectionGroup {
+  id: string;
+  name: string;
+  source: string;
+  baseUrl: string;
+  apiKeyPreview?: string;
+  apiKeyConfigured: boolean;
+  verified: boolean;
+  models: ProviderModel[];
+}
+
+interface AddedProvider extends ProviderOption {
+  groups: ProviderConnectionGroup[];
+}
+
+interface AddedProviderSection {
+  key: string;
+  provider: AddedProvider;
+  displayName: string;
+  groups: ProviderConnectionGroup[];
+  defaultBaseUrl: string;
+}
+
+interface ProviderConfigModalState {
+  provider: ProviderOption | AddedProvider;
+  group?: ProviderConnectionGroup;
+}
+
+interface ProviderConfigFormValues {
+  name?: string;
+  apiKey?: string;
+  baseUrl?: string;
+}
+
+interface VerifyGroupModalState {
+  provider: AddedProvider;
+  group: ProviderConnectionGroup;
+}
+
+interface VerifyGroupFormValues {
+  apiKey?: string;
+}
+
+interface CustomModelModalState {
+  provider: AddedProvider;
+  group: ProviderConnectionGroup;
+}
+
+interface EditModelWindowModalState {
+  provider: AddedProvider;
+  group: ProviderConnectionGroup;
+  model: ProviderModel;
+}
+
+interface EditModelWindowFormValues {
+  maxInputTokens: string;
+}
+
+interface CustomModelFormValues {
+  providerId: string;
+  groupId: string;
+  name: string;
+  capability: ModelCapability;
+  maxInputTokens?: string;
+}
+
+const capabilityLabelKeys: Record<ModelCapability, string> = {
+  LLM_CHAT: "modelProvider.capability.llmChat",
+  EMBEDDING: "modelProvider.capability.embedding",
+  VLM: "modelProvider.capability.vlm",
+  RERANK: "modelProvider.capability.rerank",
+  ASR: "modelProvider.capability.asr",
+  TTS: "modelProvider.capability.tts",
+  TEXT_TO_IMAGE: "modelProvider.capability.textToImage",
+  TEXT_TO_VIDEO: "modelProvider.capability.textToVideo",
+  MULTIMODAL_EMBEDDING: "modelProvider.capability.multimodalEmbedding",
+  IMAGE_EDITING: "modelProvider.capability.imageEditing",
+  LLM_SELF_EVOLUTION: "modelProvider.capability.selfEvolution",
+};
+
+const builtInProviders: ProviderOption[] = [
+  {
+    id: "tongyi",
+    name: "Tongyi-Qianwen",
+    brand: "通义",
+    headline: "覆盖文本、向量、多模态、语音与重排序能力，适合作为默认全能供应商。",
+    source: "tongyi",
+    baseUrl: "https://dashscope.aliyuncs.com/",
+    capabilities: ["LLM_CHAT", "EMBEDDING", "VLM", "RERANK", "ASR", "TTS", "TEXT_TO_IMAGE"],
+    models: [
+      { id: "qwen-plus", name: "qwen-plus", capability: "LLM_CHAT", builtIn: true, enabled: true },
+      { id: "deepseek-r1", name: "deepseek-r1", capability: "LLM_CHAT", builtIn: true, enabled: true },
+      { id: "text-embedding-v2", name: "text-embedding-v2", capability: "EMBEDDING", builtIn: true, enabled: true },
+      { id: "qwen-vl-max", name: "qwen-vl-max", capability: "VLM", builtIn: true, enabled: true },
+      { id: "gte-rerank", name: "gte-rerank", capability: "RERANK", builtIn: true, enabled: true },
+      { id: "qwen3-asr-flash", name: "qwen3-asr-flash", capability: "ASR", builtIn: true, enabled: true },
+      { id: "sambert-zhide-v1", name: "sambert-zhide-v1", capability: "TTS", builtIn: true, enabled: true },
+      { id: "wanx2-1-t2i-turbo", name: "wanx2.1-t2i-turbo", capability: "TEXT_TO_IMAGE", builtIn: true, enabled: true },
+    ],
+  },
+  {
+    id: "openai",
+    name: "OpenAI",
+    brand: "◎",
+    headline: "通用模型生态完整，适合接入对话、向量、语音与多模态任务。",
+    source: "openai",
+    baseUrl: "https://api.openai.com/v1/",
+    capabilities: ["LLM_CHAT", "EMBEDDING", "VLM", "TTS", "ASR"],
+    models: [
+      { id: "gpt-4-1", name: "gpt-4.1", capability: "LLM_CHAT", builtIn: true, enabled: true },
+      { id: "gpt-4o", name: "gpt-4o", capability: "VLM", builtIn: true, enabled: true },
+      { id: "text-embedding-3-large", name: "text-embedding-3-large", capability: "EMBEDDING", builtIn: true, enabled: true },
+      { id: "whisper-1", name: "whisper-1", capability: "ASR", builtIn: true, enabled: true },
+      { id: "gpt-4o-mini-tts", name: "gpt-4o-mini-tts", capability: "TTS", builtIn: true, enabled: true },
+    ],
+  },
+  {
+    id: "anthropic",
+    name: "Anthropic",
+    brand: "AI",
+    headline: "长文本和稳健推理体验突出，适合高质量文本对话场景。",
+    source: "anthropic",
+    baseUrl: "https://api.anthropic.com/v1/",
+    capabilities: ["LLM_CHAT", "VLM"],
+    models: [
+      { id: "claude-sonnet-4-5", name: "claude-sonnet-4.5", capability: "LLM_CHAT", builtIn: true, enabled: true },
+      { id: "claude-opus-4-1", name: "claude-opus-4.1", capability: "LLM_CHAT", builtIn: true, enabled: true },
+    ],
+  },
+  {
+    id: "deepseek",
+    name: "DeepSeek",
+    brand: "DS",
+    headline: "推理模型性价比高，适合默认问答主模型或自进化任务。",
+    source: "deepseek",
+    baseUrl: "https://api.deepseek.com",
+    capabilities: ["LLM_CHAT", "LLM_SELF_EVOLUTION"],
+    models: [
+      { id: "deepseek-chat", name: "deepseek-chat", capability: "LLM_CHAT", builtIn: true, enabled: true },
+      { id: "deepseek-reasoner", name: "deepseek-reasoner", capability: "LLM_SELF_EVOLUTION", builtIn: true, enabled: true },
+    ],
+  },
+];
+
+// SenseNova base URL values and new-platform defaults.
+const SENSENOVA_CLASSIC_BASE_URL = "https://api.sensenova.cn/compatible-mode/v1/";
+const SENSENOVA_NEW_BASE_URL = "https://token.sensenova.cn/v1/chat/completions/";
+
+const SENSENOVA_DEFAULT_VERIFY_MODEL = "sensenova-6.7-flash-lite";
+
+function isSensenovaProvider(provider?: Pick<ProviderOption, "source" | "name"> | null): boolean {
+  if (!provider) return false;
+  return provider.source === "sensenova" || provider.name?.toLowerCase() === "sensenova";
+}
+
+export function isOpenAIProvider(provider?: Pick<ProviderOption, "source" | "name"> | null): boolean {
+  if (!provider) return false;
+  return normalizeProviderKey(provider.source || provider.name) === "openai";
+}
+
+export function hasOpenAIRequestPath(
+  provider: Pick<ProviderOption, "source" | "name"> | null | undefined,
+  baseUrl?: string
+): boolean {
+  if (!isOpenAIProvider(provider) || !baseUrl) return false;
+
+  try {
+    const segments = new URL(baseUrl).pathname.split("/").filter(Boolean);
+    const v1Index = segments.findIndex((segment) => segment.toLowerCase() === "v1");
+    return v1Index >= 0 && v1Index < segments.length - 1;
+  } catch {
+    return false;
+  }
+}
+
+function isSensenovaNewBaseUrl(url?: string): boolean {
+  return normalizeBaseUrlForCompare(url) === normalizeBaseUrlForCompare(SENSENOVA_NEW_BASE_URL);
+}
+
+function getAddedProviderSectionKey(
+  provider: Pick<AddedProvider, "id" | "source" | "name">,
+  baseUrl?: string
+): string {
+  if (!isSensenovaProvider(provider)) {
+    return provider.id;
+  }
+  if (isSensenovaNewBaseUrl(baseUrl)) {
+    return `${provider.id}:token-plan`;
+  }
+  if (normalizeBaseUrlForCompare(baseUrl) === normalizeBaseUrlForCompare(SENSENOVA_CLASSIC_BASE_URL)) {
+    return `${provider.id}:classic`;
+  }
+  return `${provider.id}:custom`;
+}
+
+function buildAddedProviderSections(
+  providers: AddedProvider[],
+  sensenovaClassicLabel: string,
+  sensenovaTokenPlanLabel: string
+): AddedProviderSection[] {
+  return providers.flatMap((provider) => {
+    if (!isSensenovaProvider(provider)) {
+      return [{
+        key: provider.id,
+        provider,
+        displayName: provider.name,
+        groups: provider.groups,
+        defaultBaseUrl: provider.baseUrl,
+      }];
+    }
+
+    const classicGroups = provider.groups.filter(
+      (group) => getAddedProviderSectionKey(provider, group.baseUrl) === `${provider.id}:classic`
+    );
+    const tokenPlanGroups = provider.groups.filter(
+      (group) => getAddedProviderSectionKey(provider, group.baseUrl) === `${provider.id}:token-plan`
+    );
+    const customGroups = provider.groups.filter(
+      (group) => getAddedProviderSectionKey(provider, group.baseUrl) === `${provider.id}:custom`
+    );
+    const sections: AddedProviderSection[] = [];
+
+    if (classicGroups.length) {
+      sections.push({
+        key: `${provider.id}:classic`,
+        provider,
+        displayName: `${provider.name} · ${sensenovaClassicLabel}`,
+        groups: classicGroups,
+        defaultBaseUrl: SENSENOVA_CLASSIC_BASE_URL,
+      });
+    }
+    if (tokenPlanGroups.length) {
+      sections.push({
+        key: `${provider.id}:token-plan`,
+        provider,
+        displayName: `${provider.name} · ${sensenovaTokenPlanLabel}`,
+        groups: tokenPlanGroups,
+        defaultBaseUrl: SENSENOVA_NEW_BASE_URL,
+      });
+    }
+    if (customGroups.length) {
+      sections.push({
+        key: `${provider.id}:custom`,
+        provider,
+        displayName: provider.name,
+        groups: customGroups,
+        defaultBaseUrl: customGroups[0].baseUrl,
+      });
+    }
+    return sections;
+  });
+}
+
+function createConnectionGroup(provider: ProviderOption, overrides: Partial<ProviderConnectionGroup> = {}): ProviderConnectionGroup {
+  return {
+    id: overrides.id || `${provider.id}-default`,
+    name: overrides.name || provider.name,
+    source: provider.source,
+    baseUrl: overrides.baseUrl || provider.baseUrl,
+    apiKeyPreview: overrides.apiKeyPreview,
+    apiKeyConfigured: overrides.apiKeyConfigured ?? false,
+    verified: overrides.verified ?? false,
+    models: overrides.models || provider.models.map((model) => ({ ...model })),
+  };
+}
+
+enum ModelProviderModelType {
+  VLM = "vlm",
+  LLM = "llm",
+  Embedding = "embed",
+  MultimodalEmbedding = "multimodal_embedding",
+  TextToImage = "text2image",
+  TextToVideo = "text2video",
+  TTS = "tts",
+  STT = "stt",
+  Rerank = "rerank",
+  ImageEditing = "image_editing",
+}
+
+const modelTypeByCapability: Record<ModelCapability, ModelProviderModelType> = {
+  EMBEDDING: ModelProviderModelType.Embedding,
+  VLM: ModelProviderModelType.VLM,
+  RERANK: ModelProviderModelType.Rerank,
+  ASR: ModelProviderModelType.STT,
+  TTS: ModelProviderModelType.TTS,
+  TEXT_TO_IMAGE: ModelProviderModelType.TextToImage,
+  TEXT_TO_VIDEO: ModelProviderModelType.TextToVideo,
+  MULTIMODAL_EMBEDDING: ModelProviderModelType.MultimodalEmbedding,
+  IMAGE_EDITING: ModelProviderModelType.ImageEditing,
+  LLM_CHAT: ModelProviderModelType.LLM,
+  LLM_SELF_EVOLUTION: ModelProviderModelType.LLM,
+};
+
+export function getModelTypeForCapability(
+  capability: ModelCapability,
+): string {
+  return modelTypeByCapability[capability];
+}
+
+function normalizeProviderKey(value: string) {
+  return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-") || "provider";
+}
+
+function getProviderBrand(name: string) {
+  const trimmed = name.trim();
+  if (!trimmed) return "AI";
+  if (/openai/i.test(trimmed)) return "◎";
+  return trimmed
+    .split(/[\s-]+/)
+    .map((part) => part[0])
+    .join("")
+    .slice(0, 2)
+    .toUpperCase();
+}
+
+export function mapModelTypeToCapability(modelType?: string): ModelCapability {
+  const normalized = (modelType || "").toLowerCase();
+  if (normalized === ModelProviderModelType.MultimodalEmbedding) return "MULTIMODAL_EMBEDDING";
+  if (normalized === ModelProviderModelType.Embedding || normalized.includes("embedding")) return "EMBEDDING";
+  if (normalized.includes("rerank")) return "RERANK";
+  if (normalized === ModelProviderModelType.STT || normalized === "asr") return "ASR";
+  if (normalized === ModelProviderModelType.TTS) return "TTS";
+  if (normalized === ModelProviderModelType.ImageEditing) return "IMAGE_EDITING";
+  if (normalized === ModelProviderModelType.TextToImage) return "TEXT_TO_IMAGE";
+  if (normalized === ModelProviderModelType.TextToVideo) return "TEXT_TO_VIDEO";
+  if (normalized === ModelProviderModelType.VLM.toLowerCase() || normalized.includes("vision")) return "VLM";
+  return "LLM_CHAT";
+}
+
+const createModelProviderFallbacks = (t: ReturnType<typeof useTranslation>["t"]) => ({
+  providerDescription: t("modelProvider.providerDescriptionFallback"),
+  providerDescriptions: {
+    claude: t("modelProvider.providerDescriptions.claude", { defaultValue: "" }),
+    deepseek: t("modelProvider.providerDescriptions.deepseek", { defaultValue: "" }),
+    doubao: t("modelProvider.providerDescriptions.doubao", { defaultValue: "" }),
+    glm: t("modelProvider.providerDescriptions.glm", { defaultValue: "" }),
+    kimi: t("modelProvider.providerDescriptions.kimi", { defaultValue: "" }),
+    minimax: t("modelProvider.providerDescriptions.minimax", { defaultValue: "" }),
+    openai: t("modelProvider.providerDescriptions.openai", { defaultValue: "" }),
+    openrouter: t("modelProvider.providerDescriptions.openrouter", { defaultValue: "" }),
+    qwen: t("modelProvider.providerDescriptions.qwen", { defaultValue: "" }),
+    sensenova: t("modelProvider.providerDescriptions.sensenova", { defaultValue: "" }),
+    siliconflow: t("modelProvider.providerDescriptions.siliconflow", { defaultValue: "" }),
+  } as Record<string, string>,
+});
+
+type ModelProviderFallbacks = ReturnType<typeof createModelProviderFallbacks>;
+
+function getLocalizedProviderDescription(
+  name: string,
+  fallbackDescription: string | undefined,
+  fallbacks: ModelProviderFallbacks
+) {
+  const providerKey = normalizeProviderKey(name).replace(/-/g, "");
+  const translatedDescription = fallbacks.providerDescriptions[providerKey];
+  return fallbackDescription || translatedDescription || fallbacks.providerDescription;
+}
+
+interface ApiProvider {
+  id: string;
+  name: string;
+  description?: string;
+  base_url?: string;
+}
+
+interface ApiGroup {
+  id: string;
+  name: string;
+  base_url?: string;
+  api_key?: string;
+  api_key_configured?: boolean;
+  api_key_preview?: string;
+  is_verified?: boolean;
+  user_model_provider_id: string;
+}
+
+interface SavedProviderGroup extends ApiGroup {
+  check?: CheckModelProviderResult;
+  auto_selection?: AutoModelSelection;
+}
+
+interface AutoModelSelection {
+  provider_name: string;
+  configured: Array<{ model_key: string; name: string }>;
+  missing: string[];
+}
+
+interface CheckModelProviderResult {
+  success: boolean;
+  message?: string;
+}
+
+export function resolveSavedProviderGroupVerified(group: {
+  is_verified?: boolean;
+  check?: CheckModelProviderResult;
+}): boolean {
+  if (typeof group.is_verified === "boolean") {
+    return group.is_verified;
+  }
+  return group.check?.success === true;
+}
+
+interface ApiModel {
+  id: string;
+  name: string;
+  model_type?: string;
+  is_default?: boolean;
+  max_input_tokens?: string;
+}
+
+function mapApiProvider(provider: ApiProvider, fallbacks: ModelProviderFallbacks): ProviderOption {
+  const backendDescription = provider.description;
+
+  return {
+    id: provider.id,
+    name: provider.name,
+    brand: getProviderBrand(provider.name),
+    logoUrl: getProviderLogoUrl(provider.name),
+    headline: getLocalizedProviderDescription(provider.name, backendDescription, fallbacks),
+    backendDescription,
+    source: provider.name,
+    baseUrl: provider.base_url || "",
+    capabilities: [
+      "LLM_CHAT",
+      "EMBEDDING",
+      "MULTIMODAL_EMBEDDING",
+      "VLM",
+      "RERANK",
+      "ASR",
+      "TTS",
+      "TEXT_TO_IMAGE",
+      "TEXT_TO_VIDEO",
+      "IMAGE_EDITING",
+    ],
+    models: [],
+  };
+}
+
+function mapApiGroup(
+  provider: ProviderOption,
+  group: ApiGroup | ProviderConnectionGroup,
+  models: ApiModel[]
+): ProviderConnectionGroup {
+  const isApiGroup = "base_url" in group || "api_key" in group || "is_verified" in group;
+
+  return createConnectionGroup(provider, {
+    id: group.id,
+    name: group.name,
+    baseUrl: isApiGroup ? (group as ApiGroup).base_url || provider.baseUrl : (group as ProviderConnectionGroup).baseUrl || provider.baseUrl,
+    apiKeyPreview: isApiGroup
+      ? getSafeApiKeyPreview((group as ApiGroup).api_key_preview || (group as ApiGroup).api_key)
+      : (group as ProviderConnectionGroup).apiKeyPreview,
+    apiKeyConfigured: isApiGroup
+      ? Boolean((group as ApiGroup).api_key_configured || (group as ApiGroup).api_key)
+      : (group as ProviderConnectionGroup).apiKeyConfigured,
+    verified: isApiGroup ? Boolean((group as ApiGroup).is_verified) : (group as ProviderConnectionGroup).verified,
+    models: models.map((model) => ({
+      id: model.id,
+      name: model.name,
+      capability: mapModelTypeToCapability(model.model_type),
+      builtIn: Boolean(model.is_default),
+      enabled: true,
+      maxInputTokens: model.max_input_tokens,
+    })),
+  });
+}
+
+function ProviderLogo({ provider, compact = false }: { provider: ProviderOption; compact?: boolean }) {
+  return (
+    <span
+      aria-hidden="true"
+      className={`model-provider-logo is-${normalizeProviderKey(provider.name)}${compact ? " is-compact" : ""}`}
+    >
+      <span className="model-provider-logo-fallback">{provider.brand}</span>
+      {provider.logoUrl ? (
+        <img
+          alt=""
+          loading="lazy"
+          src={provider.logoUrl}
+          onError={(event) => {
+            event.currentTarget.style.display = "none";
+          }}
+        />
+      ) : null}
+    </span>
+  );
+}
+
+function CapabilityTag({ label, active = false }: { label: string; active?: boolean }) {
+  return (
+    <Tag className={`model-provider-capability${active ? " is-active" : ""}`}>
+      {label}
+    </Tag>
+  );
+}
+
+function normalizeModelName(value: string) {
+  return value.trim().toLowerCase();
+}
+
+function normalizeFormText(value?: string) {
+  return value?.trim() || "";
+}
+
+function maskApiKey(value?: string) {
+  const normalized = normalizeFormText(value);
+  if (!normalized) {
+    return "";
+  }
+  if (normalized.length <= 8) {
+    return "********";
+  }
+  return `${normalized.slice(0, 4)}...${normalized.slice(-4)}`;
+}
+
+function getSafeApiKeyPreview(value?: string) {
+  return maskApiKey(value) || "********";
+}
+
+function renderDescriptionWithLinks(description: string) {
+  const parts = description.split(/(https?:\/\/[^\s，。；、）)]+)/g);
+
+  return parts.map((part, index) => {
+    if (/^https?:\/\//.test(part)) {
+      return (
+        <a
+          href={part}
+          key={`${part}-${index}`}
+          rel="noreferrer"
+          target="_blank"
+          onClick={(event) => event.stopPropagation()}
+        >
+          {part}
+        </a>
+      );
+    }
+
+    return <span key={`${part}-${index}`}>{part}</span>;
+  });
+}
+
+function normalizeBaseUrlForCompare(value?: string) {
+  return normalizeFormText(value).replace(/\/+$/, "");
+}
+
+function isDefaultProviderBaseUrl(provider: Pick<ProviderOption, "baseUrl">, baseUrl?: string) {
+  return normalizeBaseUrlForCompare(baseUrl) === normalizeBaseUrlForCompare(provider.baseUrl);
+}
+
+export function shouldRedirectCustomBaseUrlToOpenAI(
+  provider: Pick<ProviderOption, "source" | "name" | "baseUrl">,
+  previousBaseUrl: string | undefined,
+  nextBaseUrl: string | undefined
+) {
+  if (
+    isOpenAIProvider(provider) ||
+    normalizeBaseUrlForCompare(previousBaseUrl) === normalizeBaseUrlForCompare(nextBaseUrl) ||
+    isDefaultProviderBaseUrl(provider, nextBaseUrl)
+  ) {
+    return false;
+  }
+  // SenseNova's Token Plan endpoint is an official preset, not a private deployment.
+  return !isSensenovaProvider(provider) || !isSensenovaNewBaseUrl(nextBaseUrl);
+}
+
+interface ModelProviderPageProps {
+  onConfigurationChanged?: () => void | Promise<void>;
+  highlightProviderId?: string;
+}
+
+export default function ModelProviderPage({
+  onConfigurationChanged,
+  highlightProviderId,
+}: ModelProviderPageProps) {
+  const { t, i18n } = useTranslation();
+  const currentLanguage = i18n.resolvedLanguage || i18n.language || "zh-CN";
+  const [providerConfigForm] = Form.useForm<ProviderConfigFormValues>();
+  const [customModelForm] = Form.useForm<CustomModelFormValues>();
+  const [editModelWindowForm] = Form.useForm<EditModelWindowFormValues>();
+  const [verifyGroupForm] = Form.useForm<VerifyGroupFormValues>();
+
+  const [providerOptions, setProviderOptions] = useState<ProviderOption[]>(builtInProviders);
+  const [addedProviderList, setAddedProviderList] = useState<AddedProvider[]>([]);
+  const [configModal, setConfigModal] = useState<ProviderConfigModalState | null>(null);
+  const [customModelModal, setCustomModelModal] = useState<CustomModelModalState | null>(null);
+  const [editModelWindowModal, setEditModelWindowModal] = useState<EditModelWindowModalState | null>(null);
+  const [remoteModels, setRemoteModels] = useState<RemoteGroupModel[]>([]);
+  const [remoteModelsLoading, setRemoteModelsLoading] = useState(false);
+  const [contextWindowMode, setContextWindowMode] = useState<"auto" | "manual">("auto");
+  const [verifyGroupModal, setVerifyGroupModal] = useState<VerifyGroupModalState | null>(null);
+  const [expandedProviderIds, setExpandedProviderIds] = useState<Record<string, boolean>>({});
+  const [keyword, setKeyword] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [providerSearchLoading, setProviderSearchLoading] = useState(false);
+  const [providerConfigSaving, setProviderConfigSaving] = useState(false);
+  const [verifyingGroupIds, setVerifyingGroupIds] = useState<Record<string, boolean>>({});
+  const [expandedGroupIds, setExpandedGroupIds] = useState<Record<string, boolean>>({});
+  const [loadingGroupModelIds, setLoadingGroupModelIds] = useState<Record<string, boolean>>({});
+  const [sensenovaBaseUrlPreset, setSensenovaBaseUrlPreset] = useState<string>("");
+  const [contextWindowExpanded, setContextWindowExpanded] = useState(false);
+  const watchedProviderBaseUrl = Form.useWatch("baseUrl", providerConfigForm);
+  const watchedProviderApiKey = Form.useWatch("apiKey", providerConfigForm);
+  const watchedCustomCapability = Form.useWatch("capability", customModelForm);
+  const providerApiKeyInputRef = useRef<InputRef>(null);
+  const verifyApiKeyInputRef = useRef<InputRef>(null);
+  const providerSearchRequestIdRef = useRef(0);
+  const initialProvidersLoadedRef = useRef(false);
+  const addedProviderListRef = useRef<AddedProvider[]>([]);
+  addedProviderListRef.current = addedProviderList;
+  const highlightedProviderRef = useRef<HTMLElement | null>(null);
+  const focusedProviderHighlightRef = useRef<string | null>(null);
+  const localizedFallbacks = useMemo(() => createModelProviderFallbacks(t), [i18n.language, t]);
+  const getCapabilityLabel = useCallback((capability: ModelCapability) => t(capabilityLabelKeys[capability]), [t]);
+  const configProvider = configModal?.provider || null;
+  const activeVerifyKey = verifyGroupModal
+    ? `${verifyGroupModal.provider.id}:${verifyGroupModal.group.id}`
+    : "";
+  const verifyGroupBusy = activeVerifyKey ? Boolean(verifyingGroupIds[activeVerifyKey]) : false;
+  const verifyApiKeyRequired = verifyGroupModal
+    ? isDefaultProviderBaseUrl(verifyGroupModal.provider, verifyGroupModal.group.baseUrl)
+    : true;
+  const baseUrlChanged = configProvider
+    ? !isDefaultProviderBaseUrl(
+        configProvider,
+        watchedProviderBaseUrl ?? providerConfigForm.getFieldValue("baseUrl") ?? configProvider.baseUrl
+      )
+    : false;
+  const apiKeyRequired = !!configProvider && !baseUrlChanged;
+
+  const fetchProviderOptions = useCallback(async (searchKeyword = "") => {
+    const providerResponse = await modelProvidersApi.apiCoreModelProvidersGet({
+      keyword: searchKeyword.trim() || undefined,
+    });
+    const providerData = unwrapModelProviderData<{ providers?: ApiProvider[] }>(providerResponse.data);
+    return (providerData.providers || []).map((provider) => mapApiProvider(provider, localizedFallbacks));
+  }, [localizedFallbacks]);
+
+  const searchProviderOptions = useCallback(
+    async (searchKeyword: string) => {
+      const requestId = providerSearchRequestIdRef.current + 1;
+      providerSearchRequestIdRef.current = requestId;
+      setProviderSearchLoading(true);
+
+      try {
+        const providers = await fetchProviderOptions(searchKeyword);
+        if (providerSearchRequestIdRef.current === requestId) {
+          setProviderOptions(providers);
+        }
+      } catch (error) {
+        if (providerSearchRequestIdRef.current === requestId) {
+        }
+      } finally {
+        if (providerSearchRequestIdRef.current === requestId) {
+          setProviderSearchLoading(false);
+        }
+      }
+    },
+    [fetchProviderOptions]
+  );
+
+  const loadModelProviders = useCallback(async () => {
+    const isFirstLoad = !initialProvidersLoadedRef.current;
+    if (isFirstLoad) {
+      setLoading(true);
+    }
+    try {
+      const providers = await fetchProviderOptions();
+      setProviderOptions(providers);
+
+      const withGroupsResponse = await modelProvidersApi.apiCoreModelProvidersWithGroupsGet();
+      const withGroupsData = unwrapModelProviderData<{ providers?: ApiProvider[] }>(withGroupsResponse.data);
+      const addedIds = new Set((withGroupsData.providers || []).map((provider) => provider.id));
+      const previousModelsByGroupId = new Map<string, ProviderModel[]>();
+      for (const item of addedProviderListRef.current) {
+        for (const group of item.groups) {
+          if (group.models.length) {
+            previousModelsByGroupId.set(group.id, group.models);
+          }
+        }
+      }
+      const addedProviders = await Promise.all(
+        providers
+          .filter((provider) => addedIds.has(provider.id))
+          .map(async (provider): Promise<AddedProvider> => {
+            const groupResponse = await modelProvidersApi.apiCoreModelProvidersModelProviderIdGroupsGet({
+              modelProviderId: provider.id,
+            });
+            const groupData = unwrapModelProviderData<{ groups?: ApiGroup[] }>(groupResponse.data);
+            const groups = (groupData.groups || []).map((group) =>
+              mapApiGroup(provider, group, previousModelsByGroupId.get(group.id) || [])
+            );
+            return { ...provider, groups };
+          })
+      );
+
+      setAddedProviderList(addedProviders);
+    } catch (error) {
+    } finally {
+      initialProvidersLoadedRef.current = true;
+      setLoading(false);
+    }
+  }, [fetchProviderOptions]);
+
+  useEffect(() => {
+    void loadModelProviders();
+    // Group models are fetched on expand. Re-running this on i18n identity
+    // changes (tab blur/focus) used to wipe them and show an empty list.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (!initialProvidersLoadedRef.current) {
+      return;
+    }
+    void fetchProviderOptions().then(setProviderOptions);
+  }, [currentLanguage, fetchProviderOptions]);
+
+  useEffect(() => {
+    if (!initialProvidersLoadedRef.current) {
+      return;
+    }
+
+    const debounceTimer = window.setTimeout(() => {
+      void searchProviderOptions(keyword);
+    }, 300);
+
+    return () => window.clearTimeout(debounceTimer);
+  }, [keyword, searchProviderOptions]);
+
+  const addedProviderIds = useMemo(
+    () => new Set(addedProviderList.map((provider) => provider.id)),
+    [addedProviderList]
+  );
+  const addedProviderSections = useMemo(
+    () => buildAddedProviderSections(
+      addedProviderList,
+      t("modelProvider.sensenovaClassicMode"),
+      t("modelProvider.sensenovaTokenPlanMode")
+    ),
+    [addedProviderList, t]
+  );
+
+  useEffect(() => {
+    if (!highlightProviderId) {
+      return;
+    }
+
+    const targetSectionKeys = addedProviderSections
+      .filter(({ provider }) => provider.id === highlightProviderId)
+      .map(({ key }) => key);
+    if (targetSectionKeys.length === 0) {
+      return;
+    }
+
+    setExpandedProviderIds((current) => {
+      if (targetSectionKeys.every((key) => current[key])) {
+        return current;
+      }
+      return targetSectionKeys.reduce<Record<string, boolean>>(
+        (next, key) => ({ ...next, [key]: true }),
+        current
+      );
+    });
+  }, [addedProviderSections, highlightProviderId]);
+
+  useEffect(() => {
+    if (
+      !highlightProviderId ||
+      !highlightedProviderRef.current ||
+      focusedProviderHighlightRef.current === highlightProviderId
+    ) {
+      return;
+    }
+    focusedProviderHighlightRef.current = highlightProviderId;
+    const frame = window.requestAnimationFrame(() => {
+      highlightedProviderRef.current?.scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+      });
+      highlightedProviderRef.current?.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [addedProviderSections, highlightProviderId]);
+
+  const visibleProviders = [...providerOptions].sort((a, b) => b.name.localeCompare(a.name));
+
+  const openProviderConfig = (
+    provider: AddedProvider | ProviderOption,
+    group?: ProviderConnectionGroup,
+    baseUrlOverride?: string
+  ) => {
+    const configuredProvider = addedProviderList.find((item) => item.id === provider.id);
+    const providerDraft = configuredProvider || provider;
+    const groupDraft = group || createConnectionGroup(providerDraft);
+
+    setConfigModal({ provider: providerDraft, group });
+    const currentBaseUrl = normalizeFormText(baseUrlOverride) || groupDraft.baseUrl || providerDraft.baseUrl;
+    providerConfigForm.setFieldsValue({
+      name: groupDraft.name,
+      apiKey: "",
+      baseUrl: currentBaseUrl,
+    });
+
+    // Sync the sensenova base URL preset Select with the form value.
+    if (isSensenovaProvider(providerDraft)) {
+      const normalized = normalizeFormText(currentBaseUrl);
+      if (normalized === normalizeFormText(SENSENOVA_CLASSIC_BASE_URL)) {
+        setSensenovaBaseUrlPreset(SENSENOVA_CLASSIC_BASE_URL);
+      } else if (normalized === normalizeFormText(SENSENOVA_NEW_BASE_URL)) {
+        setSensenovaBaseUrlPreset(SENSENOVA_NEW_BASE_URL);
+      } else {
+        setSensenovaBaseUrlPreset("");
+      }
+    } else {
+      setSensenovaBaseUrlPreset("");
+    }
+  };
+
+  const closeProviderConfig = () => {
+    if (providerConfigSaving) {
+      return;
+    }
+    setConfigModal(null);
+    providerConfigForm.resetFields();
+    setSensenovaBaseUrlPreset("");
+  };
+
+  const saveProviderConfig = async (
+    values: ProviderConfigFormValues,
+    skipCustomBaseUrlRedirect = false
+  ): Promise<void> => {
+    const activeConfigModal = configModal;
+
+    if (!configProvider || !activeConfigModal || providerConfigSaving) {
+      return;
+    }
+
+    const groupName = normalizeFormText(values.name);
+    const baseUrl = normalizeFormText(values.baseUrl);
+    const apiKey = normalizeFormText(values.apiKey) || normalizeFormText(providerApiKeyInputRef.current?.input?.value);
+    const isCustomBaseUrl = !isDefaultProviderBaseUrl(configProvider, baseUrl);
+    const existingProvider = addedProviderList.find((provider) => provider.id === configProvider.id);
+    const existingGroup = activeConfigModal.group
+      ? existingProvider?.groups.find((group) => group.id === activeConfigModal.group?.id)
+      : undefined;
+
+    const previousBaseUrl = existingGroup?.baseUrl || configProvider.baseUrl;
+    if (!skipCustomBaseUrlRedirect && shouldRedirectCustomBaseUrlToOpenAI(configProvider, previousBaseUrl, baseUrl)) {
+      Modal.confirm({
+        centered: true,
+        title: t("modelProvider.privateDeploymentRedirectTitle"),
+        content: t("modelProvider.privateDeploymentRedirectContent"),
+        okText: t("modelProvider.goToOpenAI"),
+        cancelText: t("modelProvider.stayHere"),
+        onOk: async () => {
+          let openAIProvider = [...addedProviderList, ...providerOptions].find(isOpenAIProvider);
+          if (!openAIProvider) {
+            const providers = await fetchProviderOptions("OpenAI");
+            openAIProvider = providers.find(isOpenAIProvider);
+          }
+          if (!openAIProvider) {
+            message.error(t("modelProvider.openAINotFound"));
+            return Promise.reject(new Error("OpenAI provider not found"));
+          }
+          openProviderConfig(openAIProvider, undefined, baseUrl);
+        },
+        onCancel: () => saveProviderConfig(values, true),
+      });
+      return;
+    }
+
+    if (!isCustomBaseUrl && !apiKey && !existingGroup?.apiKeyConfigured) {
+      providerConfigForm.setFields([{ name: "apiKey", errors: [t("modelProvider.validation.apiKeyRequired")] }]);
+      return;
+    }
+
+    setProviderConfigSaving(true);
+    const closeVerificationNotice = apiKey
+      ? message.loading(t("modelProvider.message.verifyingApiKey"), 0)
+      : undefined;
+    try {
+      const payload = {
+        name: groupName || configProvider.name,
+        base_url: baseUrl,
+        verify: Boolean(apiKey),
+        ...(apiKey ? { api_key: apiKey } : {}),
+      };
+      const requestOptions = apiKey ? { timeout: 3 * 60 * 1000 } : undefined;
+      const savedGroup = activeConfigModal.group
+        ? unwrapModelProviderData<SavedProviderGroup>((await modelProvidersApi.apiCoreModelProvidersModelProviderIdGroupsGroupIdPatch({
+            modelProviderId: configProvider.id,
+            groupId: activeConfigModal.group.id,
+            updateModelProviderGroupOpenAPIRequest: payload,
+          }, requestOptions)).data)
+        : unwrapModelProviderData<SavedProviderGroup>((await modelProvidersApi.apiCoreModelProvidersModelProviderIdGroupsPost({
+            modelProviderId: configProvider.id,
+            createModelProviderGroupOpenAPIRequest: payload,
+          }, requestOptions)).data);
+      const nextGroup = mapApiGroup(
+        configProvider,
+        {
+          ...savedGroup,
+          api_key_configured: Boolean(apiKey || existingGroup?.apiKeyConfigured || savedGroup.api_key_configured || savedGroup.api_key),
+          api_key_preview: apiKey ? maskApiKey(apiKey) : existingGroup?.apiKeyPreview || savedGroup.api_key_preview,
+          is_verified: resolveSavedProviderGroupVerified(savedGroup),
+        },
+        existingGroup?.models || []
+      );
+
+      setAddedProviderList((current) =>
+        current.some((provider) => provider.id === configProvider.id)
+          ? current.map((provider) =>
+              provider.id === configProvider.id
+                ? {
+                    ...provider,
+                    groups: existingGroup
+                      ? provider.groups.map((group) => (group.id === nextGroup.id ? nextGroup : group))
+                      : [...provider.groups, nextGroup],
+                  }
+                : provider
+            )
+          : [
+              ...current,
+              {
+                ...configProvider,
+                groups: [nextGroup],
+              },
+            ]
+      );
+      setExpandedProviderIds((current) => ({
+        ...current,
+        [getAddedProviderSectionKey(configProvider, nextGroup.baseUrl)]: true,
+      }));
+      message.success(apiKey
+        ? t("modelProvider.message.groupVerifiedAndSaved", { name: nextGroup.name })
+        : t("modelProvider.message.groupSaved", { name: nextGroup.name }));
+      if (
+        !activeConfigModal.group
+        && savedGroup.auto_selection
+        && (
+          savedGroup.auto_selection.configured.length > 0
+          || savedGroup.auto_selection.missing.length > 0
+        )
+      ) {
+        const autoSelection = savedGroup.auto_selection;
+        const missingLabels = autoSelection.missing.map((modelKey) =>
+          t(`modelProvider.autoSelection.modelType.${modelKey}`)
+        );
+        Modal.info({
+          centered: true,
+          title: t("modelProvider.autoSelection.title"),
+          content: (
+            <div className="model-provider-auto-selection-result">
+              <p className="model-provider-auto-selection-warning">
+                {t("modelProvider.autoSelection.freeModelWarning")}
+              </p>
+              {autoSelection.configured.length > 0 ? (
+                <div className="model-provider-auto-selection-configured">
+                  <p>{t("modelProvider.autoSelection.configured")}</p>
+                  <ul>
+                    {autoSelection.configured.map((model) => (
+                      <li key={`${model.model_key}:${model.name}`}>
+                        <span>{t(`modelProvider.autoSelection.modelType.${model.model_key}`, {
+                          defaultValue: model.model_key,
+                        })}{t("modelProvider.autoSelection.modelTypeSeparator")}</span>
+                        <span>{model.name}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+              {missingLabels.length > 0 ? (
+                <p>{t("modelProvider.autoSelection.missing", {
+                  provider: autoSelection.provider_name,
+                  types: missingLabels.join("、"),
+                })}</p>
+              ) : null}
+            </div>
+          ),
+        });
+      }
+      void onConfigurationChanged?.();
+
+      setConfigModal(null);
+      providerConfigForm.resetFields();
+      setSensenovaBaseUrlPreset("");
+    } catch {
+      if (apiKey) {
+        message.error(t("modelProvider.message.groupVerifyFailed"));
+      }
+    } finally {
+      closeVerificationNotice?.();
+      setProviderConfigSaving(false);
+    }
+  };
+
+  const addProvider = (provider: ProviderOption) => {
+    openProviderConfig(provider);
+  };
+
+  const verifyProviderGroup = async (providerId: string, groupId: string, apiKey: string) => {
+    const provider = addedProviderList.find((item) => item.id === providerId);
+    const group = provider?.groups.find((item) => item.id === groupId);
+    if (!provider || !group) {
+      return;
+    }
+
+    const requestApiKey = normalizeFormText(apiKey) || normalizeFormText(verifyApiKeyInputRef.current?.input?.value);
+    const apiKeyRequiredForGroup = isDefaultProviderBaseUrl(provider, group.baseUrl);
+    if (apiKeyRequiredForGroup && !requestApiKey) {
+      message.warning(t("modelProvider.message.fillApiKeyBeforeVerify"));
+      return;
+    }
+
+    const verifyKey = `${providerId}:${groupId}`;
+    if (verifyingGroupIds[verifyKey]) {
+      return;
+    }
+
+    setVerifyingGroupIds((current) => ({ ...current, [verifyKey]: true }));
+    try {
+      const payload: Record<string, unknown> = {
+        provider_name: provider.name,
+        base_url: group.baseUrl,
+        api_key: requestApiKey,
+        dry_run: false,
+      };
+      const representativeChatModel = group.models.find((model) => model.capability === "LLM_CHAT")?.name;
+      if (representativeChatModel) {
+        payload.model = representativeChatModel;
+      }
+      // The new SenseNova platform URL requires a model name for connectivity check.
+      if (isSensenovaProvider(provider) && isSensenovaNewBaseUrl(group.baseUrl)) {
+        payload.model = SENSENOVA_DEFAULT_VERIFY_MODEL;
+      }
+      const checkResponse = await modelProvidersApi.apiCoreModelProvidersModelProviderIdGroupsGroupIdCheckPost(
+        {
+          modelProviderId: provider.id,
+          groupId: group.id,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          checkModelProviderOpenAPIRequest: payload as any,
+        },
+        { timeout: 3 * 60 * 1000 },
+      );
+      const checkResult = unwrapModelProviderData<CheckModelProviderResult>(checkResponse.data);
+      const isVerified = checkResult?.success === true;
+      setAddedProviderList((current) =>
+        current.map((provider) =>
+          provider.id === providerId
+            ? {
+                ...provider,
+                groups: provider.groups.map((group) =>
+                  group.id === groupId
+                    ? {
+                        ...group,
+                        verified: isVerified,
+                      }
+                    : group
+                ),
+              }
+            : provider
+        )
+      );
+      if (isVerified) {
+        await loadModelProviders();
+        message.success(t("modelProvider.message.groupVerified"));
+        void onConfigurationChanged?.();
+        return;
+      }
+      message.error(localizeErrorCode("2000509"));
+    } catch (error) {
+    } finally {
+      setVerifyingGroupIds((current) => {
+        const next = { ...current };
+        delete next[verifyKey];
+        return next;
+      });
+    }
+  };
+
+  const openVerifyGroupModal = (provider: AddedProvider, group: ProviderConnectionGroup) => {
+    setVerifyGroupModal({ provider, group });
+    verifyGroupForm.resetFields();
+  };
+
+  const closeVerifyGroupModal = () => {
+    if (!verifyGroupModal) {
+      return;
+    }
+    if (verifyGroupBusy) {
+      return;
+    }
+    setVerifyGroupModal(null);
+    verifyGroupForm.resetFields();
+  };
+
+  const submitVerifyGroup = async (values: VerifyGroupFormValues) => {
+    if (!verifyGroupModal) {
+      return;
+    }
+    await verifyProviderGroup(
+      verifyGroupModal.provider.id,
+      verifyGroupModal.group.id,
+      normalizeFormText(values.apiKey)
+    );
+    setVerifyGroupModal(null);
+    verifyGroupForm.resetFields();
+  };
+
+  const deleteProviderGroup = async (providerId: string, group: ProviderConnectionGroup) => {
+    const provider = addedProviderList.find((item) => item.id === providerId);
+    if (!provider) {
+      return;
+    }
+
+    try {
+      await modelProvidersApi.apiCoreModelProvidersModelProviderIdGroupsGroupIdDelete({
+        modelProviderId: providerId,
+        groupId: group.id,
+      }, group.models.some((model) => model.capability === "EMBEDDING")
+        ? { params: { confirm_indexed_downgrade: true } }
+        : undefined);
+      setAddedProviderList((current) =>
+        current
+          .map((item) =>
+            item.id === providerId
+              ? {
+                  ...item,
+                  groups: item.groups.filter((candidate) => candidate.id !== group.id),
+                }
+              : item
+          )
+          .filter((item) => item.groups.length > 0)
+      );
+      setExpandedGroupIds((current) => {
+        const next = { ...current };
+        delete next[`${providerId}:${group.id}`];
+        return next;
+      });
+      message.success(t("modelProvider.message.groupRemoved", { name: group.name }));
+      void onConfigurationChanged?.();
+    } catch (error) {
+    }
+  };
+
+  const deleteProviderSection = async (section: AddedProviderSection) => {
+    const { provider, groups, key } = section;
+    const groupIds = new Set(groups.map((group) => group.id));
+    try {
+      await Promise.all(
+        groups.map((group) =>
+          modelProvidersApi.apiCoreModelProvidersModelProviderIdGroupsGroupIdDelete({
+            modelProviderId: provider.id,
+            groupId: group.id,
+          }, group.models.some((model) => model.capability === "EMBEDDING")
+            ? { params: { confirm_indexed_downgrade: true } }
+            : undefined)
+        )
+      );
+      setAddedProviderList((current) =>
+        current
+          .map((item) => item.id === provider.id
+            ? { ...item, groups: item.groups.filter((group) => !groupIds.has(group.id)) }
+            : item)
+          .filter((item) => item.groups.length > 0)
+      );
+      setExpandedProviderIds((current) => {
+        const next = { ...current };
+        delete next[key];
+        return next;
+      });
+      setExpandedGroupIds((current) => {
+        const next = { ...current };
+        groups.forEach((group) => {
+          delete next[`${provider.id}:${group.id}`];
+        });
+        return next;
+      });
+      message.success(t("modelProvider.message.providerRemoved", { name: section.displayName }));
+      void onConfigurationChanged?.();
+    } catch (error) {
+    }
+  };
+
+  const loadGroupModels = async (providerId: string, groupId: string) => {
+    const provider = addedProviderList.find((item) => item.id === providerId);
+    const group = provider?.groups.find((item) => item.id === groupId);
+    const groupKey = `${providerId}:${groupId}`;
+    if (!provider || !group || loadingGroupModelIds[groupKey]) {
+      return;
+    }
+
+    setLoadingGroupModelIds((current) => ({ ...current, [groupKey]: true }));
+    try {
+      const modelResponse = await modelProvidersApi.apiCoreModelProvidersModelProviderIdGroupsGroupIdModelsGet({
+        modelProviderId: provider.id,
+        groupId: group.id,
+      });
+      const modelData = unwrapModelProviderData<{ models?: ApiModel[] }>(modelResponse.data);
+      const nextGroup = mapApiGroup(provider, group, modelData.models || []);
+      setAddedProviderList((current) =>
+        current.map((item) =>
+          item.id === providerId
+            ? {
+                ...item,
+                groups: item.groups.map((candidate) => (candidate.id === groupId ? nextGroup : candidate)),
+              }
+            : item
+        )
+      );
+    } catch (error) {
+    } finally {
+      setLoadingGroupModelIds((current) => {
+        const next = { ...current };
+        delete next[groupKey];
+        return next;
+      });
+    }
+  };
+
+  const toggleGroupModels = async (providerId: string, groupId: string) => {
+    const groupKey = `${providerId}:${groupId}`;
+    const willExpand = !expandedGroupIds[groupKey];
+    if (willExpand) {
+      await loadGroupModels(providerId, groupId);
+    }
+    setExpandedGroupIds((current) => ({ ...current, [groupKey]: willExpand }));
+  };
+
+  const toggleProviderModels = async (providerId: string) => {
+    const willExpand = !expandedProviderIds[providerId];
+    setExpandedProviderIds((current) => ({
+      ...current,
+      [providerId]: willExpand,
+    }));
+  };
+
+  const toggleContextWindow = () => {
+    setContextWindowExpanded((current) => !current);
+  };
+
+  const markContextWindowManual = () => {
+    setContextWindowMode("manual");
+  };
+
+  const loadRemoteModelNames = async () => {
+    const provider = customModelModal?.provider;
+    const group = customModelModal?.group;
+    if (!provider || !group || remoteModelsLoading) {
+      return;
+    }
+    setRemoteModelsLoading(true);
+    try {
+      const data = await listRemoteGroupModels(provider.id, group.id);
+      setRemoteModels(data.models || []);
+    } catch {
+      setRemoteModels([]);
+      message.error(t("modelProvider.error.loadRemoteModelsFailed"));
+    } finally {
+      setRemoteModelsLoading(false);
+    }
+  };
+
+  const appendGroupModel = (providerId: string, groupId: string, nextModel: ProviderModel) => {
+    setAddedProviderList((current) =>
+      current.map((item) =>
+        item.id === providerId
+          ? {
+              ...item,
+              groups: item.groups.map((candidate) =>
+                candidate.id === groupId
+                  ? { ...candidate, models: [...candidate.models, nextModel] }
+                  : candidate
+              ),
+            }
+          : item
+      )
+    );
+  };
+
+  const openCustomModelModal = (provider: AddedProvider, group: ProviderConnectionGroup) => {
+    setContextWindowExpanded(false);
+    setContextWindowMode("auto");
+    setRemoteModels([]);
+    setCustomModelModal({ provider, group });
+    customModelForm.setFieldsValue({
+      providerId: provider.id,
+      groupId: group.id,
+      capability: provider.capabilities[0] || "LLM_CHAT",
+      name: "",
+      maxInputTokens: undefined,
+    });
+  };
+
+  const closeCustomModelModal = () => {
+    setContextWindowExpanded(false);
+    setContextWindowMode("auto");
+    setRemoteModels([]);
+    setCustomModelModal(null);
+    customModelForm.resetFields();
+  };
+
+  const openEditModelWindowModal = (provider: AddedProvider, group: ProviderConnectionGroup, model: ProviderModel) => {
+    setEditModelWindowModal({ provider, group, model });
+    editModelWindowForm.setFieldsValue({
+      maxInputTokens: resolveLlmMaxInputTokens(model.maxInputTokens),
+    });
+  };
+
+  const closeEditModelWindowModal = () => {
+    setEditModelWindowModal(null);
+    editModelWindowForm.resetFields();
+  };
+
+  const saveEditModelWindow = async (values: EditModelWindowFormValues) => {
+    const target = editModelWindowModal;
+    if (!target) {
+      return;
+    }
+    const maxInputTokens = parseLlmMaxInputTokens(values.maxInputTokens);
+    if (!maxInputTokens) {
+      editModelWindowForm.setFields([{
+        name: "maxInputTokens",
+        errors: [t("modelProvider.validation.maxInputTokensInvalid")],
+      }]);
+      return;
+    }
+    try {
+      const updated = await updateGroupModelMaxInputTokens(
+        target.provider.id,
+        target.group.id,
+        target.model.id,
+        maxInputTokens,
+      );
+      setAddedProviderList((current) =>
+        current.map((provider) =>
+          provider.id === target.provider.id
+            ? {
+                ...provider,
+                groups: provider.groups.map((group) =>
+                  group.id === target.group.id
+                    ? {
+                        ...group,
+                        models: group.models.map((model) =>
+                          model.id === target.model.id
+                            ? { ...model, maxInputTokens: updated.max_input_tokens || maxInputTokens }
+                            : model
+                        ),
+                      }
+                    : group
+                ),
+              }
+            : provider
+        )
+      );
+      message.success(t("modelProvider.message.modelWindowUpdated"));
+      void onConfigurationChanged?.();
+      closeEditModelWindowModal();
+    } catch {
+      message.error(t("modelProvider.error.updateModelFailed"));
+    }
+  };
+
+  const addCustomModel = async (values: CustomModelFormValues) => {
+    const provider = addedProviderList.find((item) => item.id === values.providerId);
+    const group = provider?.groups.find((item) => item.id === values.groupId);
+    if (!provider || !group) {
+      return;
+    }
+
+    const normalizedName = normalizeModelName(values.name);
+    const duplicated = group.models.some((model) => normalizeModelName(model.name) === normalizedName);
+
+    if (duplicated) {
+      customModelForm.setFields([{ name: "name", errors: [t("modelProvider.validation.duplicateModelName")] }]);
+      return;
+    }
+
+    try {
+      let maxInputTokens: string | undefined;
+      if (isLlmChatCapability(values.capability) && contextWindowMode === "manual") {
+        maxInputTokens = parseLlmMaxInputTokens(values.maxInputTokens);
+        if (!maxInputTokens) {
+          customModelForm.setFields([{
+            name: "maxInputTokens",
+            errors: [t("modelProvider.validation.maxInputTokensInvalid")],
+          }]);
+          return;
+        }
+      }
+      const createdModel = unwrapModelProviderData<ApiModel>((await modelProvidersApi.apiCoreModelProvidersModelProviderIdGroupsGroupIdModelsPost({
+        modelProviderId: provider.id,
+        groupId: group.id,
+        addModelProviderGroupModelOpenAPIRequest: {
+          name: values.name.trim(),
+          model_type: getModelTypeForCapability(values.capability),
+          ...(maxInputTokens ? { max_input_tokens: maxInputTokens } : {}),
+        },
+      })).data);
+      const nextModel: ProviderModel = {
+        id: createdModel.id,
+        name: createdModel.name,
+        capability: mapModelTypeToCapability(
+          createdModel.model_type || getModelTypeForCapability(values.capability),
+        ),
+        builtIn: Boolean(createdModel.is_default),
+        enabled: true,
+        maxInputTokens: createdModel.max_input_tokens || maxInputTokens,
+      };
+      appendGroupModel(provider.id, group.id, nextModel);
+      message.success(t("modelProvider.message.modelAdded"));
+      void onConfigurationChanged?.();
+      closeCustomModelModal();
+    } catch (error) {
+    }
+  };
+
+  const deleteCustomModel = async (providerId: string, groupId: string, model: ProviderModel) => {
+    try {
+      await modelProvidersApi.apiCoreModelProvidersModelProviderIdGroupsGroupIdModelsModelIdDelete({
+        modelProviderId: providerId,
+        groupId,
+        modelId: model.id,
+      }, model.capability === "EMBEDDING"
+        ? { params: { confirm_indexed_downgrade: true } }
+        : undefined);
+      setAddedProviderList((current) =>
+        current.map((provider) =>
+          provider.id === providerId
+            ? {
+                ...provider,
+                groups: provider.groups.map((group) =>
+                  group.id === groupId
+                    ? {
+                        ...group,
+                        models: group.models.filter((item) => item.id !== model.id),
+                      }
+                    : group
+                ),
+              }
+            : provider
+        )
+      );
+      message.success(t("modelProvider.message.modelDeleted"));
+      void onConfigurationChanged?.();
+    } catch (error) {
+    }
+  };
+
+  return (
+    <div className="model-provider-page-content">
+      <section className="model-provider-shell">
+        <div className="model-provider-main-panel">
+          <section className="model-provider-added-section">
+            <div className="model-provider-panel-heading">
+              <h2 className="model-provider-section-title">{t("modelProvider.myGroupsTitle")}</h2>
+              <p className="model-provider-section-subtitle">{t("modelProvider.myGroupsSubtitle")}</p>
+            </div>
+
+            <div className="model-provider-added-list">
+              {addedProviderSections.length ? (
+                addedProviderSections.map((section, index) => {
+                  const { provider } = section;
+                  const isExpanded = expandedProviderIds[section.key] ?? index === 0;
+                  const modelListId = `model-provider-${normalizeProviderKey(section.key)}-models`;
+
+                  return (
+                    <article
+                      ref={provider.id === highlightProviderId ? highlightedProviderRef : undefined}
+                      className={`model-provider-added-card${isExpanded ? " is-expanded" : ""}${provider.id === highlightProviderId ? " is-config-highlighted" : ""}`}
+                      key={section.key}
+                      tabIndex={provider.id === highlightProviderId ? -1 : undefined}
+                    >
+                      <div className="model-provider-added-summary">
+                        <div className="model-provider-added-brand">
+                          <ProviderLogo provider={provider} />
+                          <div>
+                            <strong>{section.displayName}</strong>
+                            <span>
+                              {t("modelProvider.providerGroupCount", { source: provider.source, count: section.groups.length })}
+                            </span>
+                          </div>
+                        </div>
+
+                        <div className="model-provider-added-actions">
+                          <span className="model-provider-connection-badge">
+                            <CheckCircleFilled />
+                            {t("modelProvider.availableGroupCount", { count: section.groups.filter((group) => group.verified).length })}
+                          </span>
+                          <Button
+                            icon={<PlusCircleOutlined />}
+                            onClick={() => openProviderConfig(provider, undefined, section.defaultBaseUrl)}
+                          >
+                            {t("modelProvider.addGroup")}
+                          </Button>
+                          <Button
+                            aria-controls={modelListId}
+                            aria-expanded={isExpanded}
+                            className="model-provider-expand-button"
+                            onClick={() => void toggleProviderModels(section.key)}
+                          >
+                            {isExpanded ? t("modelProvider.collapseGroups") : t("modelProvider.expandGroups")}
+                            {isExpanded ? <UpOutlined /> : <DownOutlined />}
+                          </Button>
+                          <Popconfirm
+                            cancelText={t("common.cancel")}
+                            okButtonProps={{ danger: true }}
+                            okText={t("modelProvider.remove")}
+                            title={t("modelProvider.confirmRemoveProvider", { name: section.displayName })}
+                            description={section.groups.some((group) =>
+                              group.models.some((model) => model.capability === "EMBEDDING"))
+                              ? t("modelProvider.confirmDeleteEmbeddingDesc")
+                              : t("modelProvider.confirmRemoveProviderDesc")}
+                            onConfirm={() => deleteProviderSection(section)}
+                          >
+                            <Button aria-label={t("modelProvider.removeProviderAria", { name: section.displayName })} danger icon={<DeleteOutlined />} />
+                          </Popconfirm>
+                        </div>
+                      </div>
+
+                      {isExpanded ? (
+                        <div
+                          aria-label={t("modelProvider.providerModelListAria", { name: section.displayName })}
+                          className="model-provider-added-models"
+                          id={modelListId}
+                        >
+                          <div className="model-provider-group-rows" aria-label={t("modelProvider.providerGroupsAria", { name: section.displayName })}>
+                            {section.groups.map((group) => {
+                              const verifyKey = `${provider.id}:${group.id}`;
+
+                              return (
+                                <div className="model-provider-group-row" key={group.id}>
+                                  <div className="model-provider-group-header">
+                                    <div className="model-provider-group-meta">
+                                      <div className="model-provider-group-title-row">
+                                        <strong>{group.name}</strong>
+                                        <Tag className="model-provider-source-tag">source: {group.source}</Tag>
+                                        <Tag className={group.verified ? "model-provider-verified-tag" : "model-provider-pending-tag"}>
+                                          {group.verified ? t("modelProvider.verified") : t("modelProvider.pendingVerify")}
+                                        </Tag>
+                                      </div>
+                                      <span>{group.baseUrl}</span>
+                                    </div>
+
+                                    <div className="model-provider-group-actions">
+                                      <Button
+                                        className="model-provider-group-toggle"
+                                        loading={!!loadingGroupModelIds[`${provider.id}:${group.id}`]}
+                                        onClick={() => void toggleGroupModels(provider.id, group.id)}
+                                      >
+                                        {expandedGroupIds[`${provider.id}:${group.id}`] ? t("modelProvider.collapseModels") : t("modelProvider.expandModels")}
+                                        {expandedGroupIds[`${provider.id}:${group.id}`] ? <UpOutlined /> : <DownOutlined />}
+                                      </Button>
+                                      <Button onClick={() => openCustomModelModal(provider, group)}>
+                                        {t("modelProvider.customModel")}
+                                      </Button>
+                                      <Button icon={<EditOutlined />} onClick={() => openProviderConfig(provider, group)}>
+                                        {t("common.edit")}
+                                      </Button>
+                                      <Button
+                                        icon={<KeyOutlined />}
+                                        loading={!!verifyingGroupIds[verifyKey]}
+                                        type={group.verified ? "default" : "primary"}
+                                        onClick={() => openVerifyGroupModal(provider, group)}
+                                      >
+                                        {group.verified ? t("modelProvider.reverify") : t("modelProvider.verify")}
+                                      </Button>
+                                      <Popconfirm
+                                        cancelText={t("common.cancel")}
+                                        okButtonProps={{ danger: true }}
+                                        okText={t("common.delete")}
+                                        title={t("modelProvider.confirmDeleteGroup", { name: group.name })}
+                                        description={group.models.some((model) => model.capability === "EMBEDDING")
+                                          ? t("modelProvider.confirmDeleteEmbeddingDesc")
+                                          : t("modelProvider.confirmDeleteGroupDesc")}
+                                        onConfirm={() => deleteProviderGroup(provider.id, group)}
+                                      >
+                                        <Button aria-label={t("modelProvider.deleteGroupAria", { name: group.name })} danger icon={<DeleteOutlined />} />
+                                      </Popconfirm>
+                                    </div>
+                                  </div>
+
+                                  {expandedGroupIds[`${provider.id}:${group.id}`] ? (
+                                    <div className="model-provider-branch-model-rows" aria-label={t("modelProvider.groupModelListAria", { name: group.name })}>
+                                      {group.models.length ? (
+                                        group.models.map((model) => (
+                                          <div className="model-provider-model-row" key={model.id}>
+                                            <div className="model-provider-model-meta">
+                                              <strong>{model.name}</strong>
+                                              <CapabilityTag label={getCapabilityLabel(model.capability)} />
+                                              {model.builtIn ? null : <Tag className="model-provider-custom-tag">{t("modelProvider.custom")}</Tag>}
+                                              {isLlmChatCapability(model.capability) ? (
+                                                <span className="model-provider-model-max-input-tokens">
+                                                  {t("modelProvider.maxInputTokens", {
+                                                    value: resolveLlmMaxInputTokens(model.maxInputTokens),
+                                                  })}
+                                                </span>
+                                              ) : null}
+                                            </div>
+
+                                            <div className="model-provider-model-actions">
+                                              {model.builtIn ? (
+                                                <span>{t("modelProvider.cannotDelete")}</span>
+                                              ) : (
+                                                <>
+                                                  {isLlmChatCapability(model.capability) ? (
+                                                    <Button
+                                                      aria-label={t("modelProvider.editModelWindowAria", { name: model.name })}
+                                                      icon={<EditOutlined />}
+                                                      onClick={() => openEditModelWindowModal(provider, group, model)}
+                                                    />
+                                                  ) : null}
+                                                  <Popconfirm
+                                                    cancelText={t("common.cancel")}
+                                                    okButtonProps={{ danger: true }}
+                                                    okText={t("common.delete")}
+                                                    title={t("modelProvider.confirmDeleteModel", { name: model.name })}
+                                                    description={model.capability === "EMBEDDING"
+                                                      ? t("modelProvider.confirmDeleteEmbeddingDesc")
+                                                      : t("modelProvider.confirmDeleteModelDesc")}
+                                                    onConfirm={() => deleteCustomModel(provider.id, group.id, model)}
+                                                  >
+                                                    <Button aria-label={t("modelProvider.deleteModelAria", { name: model.name })} icon={<DeleteOutlined />} />
+                                                  </Popconfirm>
+                                                </>
+                                              )}
+                                            </div>
+                                          </div>
+                                        ))
+                                      ) : (
+                                        <div className="model-provider-model-empty">{t("modelProvider.noModels")}</div>
+                                      )}
+                                    </div>
+                                  ) : null}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      ) : null}
+                    </article>
+                  );
+                })
+              ) : (
+                <div className="model-provider-empty-state" role="status">
+                  <Empty description={t("modelProvider.emptyAddedProviders")} image={Empty.PRESENTED_IMAGE_SIMPLE} />
+                </div>
+              )}
+            </div>
+          </section>
+        </div>
+
+        <aside className="model-provider-side-panel" aria-label={t("modelProvider.builtInProvidersAria")}>
+          <div className="model-provider-side-header">
+            <h2 className="model-provider-section-title">{t("modelProvider.builtInProvidersTitle")}</h2>
+            <p className="model-provider-section-subtitle">{t("modelProvider.builtInProvidersSubtitle")}</p>
+          </div>
+
+          <Input
+            allowClear
+            aria-label={t("modelProvider.searchAria")}
+            disabled={loading}
+            placeholder={t("modelProvider.searchPlaceholder")}
+            size="large"
+            suffix={providerSearchLoading ? <LoadingOutlined /> : <SearchOutlined />}
+            value={keyword}
+            onChange={(event) => setKeyword(event.target.value)}
+          />
+
+          <div className="model-provider-list">
+            {visibleProviders.length ? (
+              visibleProviders.map((provider) => {
+                const isAdded = addedProviderIds.has(provider.id);
+                const providerDescription = getLocalizedProviderDescription(
+                  provider.name,
+                  provider.backendDescription || provider.headline,
+                  localizedFallbacks
+                );
+
+                return (
+                  <article className={`model-provider-card${isAdded ? " is-added" : ""}`} key={provider.id}>
+                    <div className="model-provider-card-header">
+                      <div className="model-provider-card-brand">
+                        <ProviderLogo provider={provider} />
+                        <div>
+                          <div className="model-provider-card-title-row">
+                            <strong>{provider.name}</strong>
+                            {isAdded ? <Tag className="model-provider-added-tag">{t("modelProvider.added")}</Tag> : null}
+                          </div>
+                          <Tooltip
+                            overlayClassName="model-provider-description-tooltip"
+                            placement="left"
+                            title={renderDescriptionWithLinks(providerDescription)}
+                          >
+                            <p className="model-provider-card-description">{providerDescription}</p>
+                          </Tooltip>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="model-provider-card-foot">
+                      <Button
+                        className="model-provider-add-button"
+                        icon={<PlusCircleOutlined />}
+                        type="primary"
+                        onClick={() => addProvider(provider)}
+                      >
+                        {isAdded ? t("modelProvider.addGroup") : t("modelProvider.configureAndAdd")}
+                      </Button>
+                    </div>
+                  </article>
+                );
+              })
+            ) : (
+              <div className="model-provider-empty-state" role="status">
+                <Empty description={t("modelProvider.noMatchedProviders")} image={Empty.PRESENTED_IMAGE_SIMPLE} />
+              </div>
+            )}
+          </div>
+        </aside>
+      </section>
+
+      <Modal
+        centered
+        confirmLoading={providerConfigSaving}
+        destroyOnHidden
+        maskClosable={!providerConfigSaving}
+        okText={normalizeFormText(watchedProviderApiKey) ? t("modelProvider.verifyAndSaveConfig") : t("modelProvider.saveConfig")}
+        open={!!configModal}
+        title={t("modelProvider.groupConfigTitle", { name: configProvider?.name || "" })}
+        width={520}
+        onCancel={closeProviderConfig}
+        onOk={() => providerConfigForm.submit()}
+      >
+        <Form<ProviderConfigFormValues>
+          className="model-provider-form"
+          form={providerConfigForm}
+          layout="vertical"
+          onFinish={saveProviderConfig}
+        >
+          <Form.Item
+            extra={t("modelProvider.groupNameExtra")}
+            label={t("modelProvider.groupName")}
+            name="name"
+            normalize={(value: string | undefined) => value?.trim()}
+            rules={[
+              { required: true, message: t("modelProvider.validation.groupNameRequired") },
+              { max: 80, message: t("modelProvider.validation.groupNameMax") },
+            ]}
+          >
+            <Input maxLength={80} placeholder={configProvider?.name || t("modelProvider.groupNamePlaceholder")} />
+          </Form.Item>
+
+          {isSensenovaProvider(configProvider) ? (
+            <div style={{ marginBottom: 24 }}>
+              <div style={{ marginBottom: 8, fontWeight: 500, fontSize: 14, color: "rgba(0,0,0,0.88)" }}>
+                Base URL
+              </div>
+              <Select
+                style={{ width: "100%" }}
+                options={[
+                  { label: t("modelProvider.sensenovaClassicMode"), value: SENSENOVA_CLASSIC_BASE_URL },
+                  { label: t("modelProvider.sensenovaTokenPlanMode"), value: SENSENOVA_NEW_BASE_URL },
+                  { label: t("modelProvider.baseUrlCustomOption"), value: "__custom__" },
+                ]}
+                placeholder={t("modelProvider.baseUrlSelectPlaceholder")}
+                value={sensenovaBaseUrlPreset || undefined}
+                onChange={(value) => {
+                  if (value === "__custom__") {
+                    setSensenovaBaseUrlPreset("");
+                    providerConfigForm.setFieldsValue({ baseUrl: "" });
+                  } else {
+                    setSensenovaBaseUrlPreset(value);
+                    providerConfigForm.setFieldsValue({ baseUrl: value });
+                  }
+                }}
+              />
+            </div>
+          ) : null}
+          <Form.Item
+            extra={baseUrlChanged ? t("modelProvider.baseUrlCustomExtra") : t("modelProvider.baseUrlDefaultExtra")}
+            label={isSensenovaProvider(configProvider) ? "" : "Base URL"}
+            name="baseUrl"
+            normalize={(value: string | undefined) => value?.trim()}
+            rules={[
+              { required: true, message: t("modelProvider.validation.baseUrlRequired") },
+              { type: "url", message: t("modelProvider.validation.baseUrlInvalid") },
+              { max: 512, message: t("modelProvider.validation.baseUrlMax") },
+              {
+                validator: (_, value?: string) => hasOpenAIRequestPath(configProvider, value)
+                  ? Promise.reject(new Error(t("modelProvider.validation.baseUrlRequestPath")))
+                  : Promise.resolve(),
+              },
+            ]}
+          >
+            <Input maxLength={512} placeholder="https://api.example.com/v1" />
+          </Form.Item>
+
+          <Form.Item
+            dependencies={["baseUrl"]}
+            extra={baseUrlChanged ? t("modelProvider.apiKeyCustomExtra") : t("modelProvider.apiKeyDefaultExtra")}
+            label="API Key"
+            name="apiKey"
+            normalize={(value: string | undefined) => value?.trim()}
+            required={apiKeyRequired}
+            rules={[
+              {
+                validator: (_, value?: string) => {
+                  const apiKey = normalizeFormText(value);
+
+                  if (apiKeyRequired && !apiKey) {
+                    return Promise.reject(new Error(t("modelProvider.validation.apiKeyRequired")));
+                  }
+
+                  if (apiKey.length > 512) {
+                    return Promise.reject(new Error(t("modelProvider.validation.apiKeyMax")));
+                  }
+
+                  if (/\s/.test(apiKey)) {
+                    return Promise.reject(new Error(t("modelProvider.validation.apiKeyNoSpaces")));
+                  }
+
+                  return Promise.resolve();
+                },
+              },
+            ]}
+          >
+            <Input.Password
+              autoComplete="off"
+              maxLength={512}
+              placeholder={apiKeyRequired ? t("modelProvider.apiKeyPlaceholder") : t("modelProvider.apiKeyOptionalPlaceholder")}
+              ref={providerApiKeyInputRef}
+              visibilityToggle={false}
+            />
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      <Modal
+        centered
+        confirmLoading={verifyGroupBusy}
+        destroyOnHidden
+        maskClosable={!verifyGroupBusy}
+        okText={t("modelProvider.verify")}
+        open={!!verifyGroupModal}
+        title={t("modelProvider.verifyGroupTitle", { name: verifyGroupModal?.group.name || "" })}
+        width={520}
+        onCancel={closeVerifyGroupModal}
+        onOk={() => verifyGroupForm.submit()}
+      >
+        <Form<VerifyGroupFormValues>
+          className="model-provider-form"
+          form={verifyGroupForm}
+          layout="vertical"
+          onFinish={submitVerifyGroup}
+        >
+          <Form.Item label="Base URL">
+            <Input value={verifyGroupModal?.group.baseUrl || ""} readOnly />
+          </Form.Item>
+          {verifyGroupModal?.group.apiKeyConfigured ? (
+            <div className="model-provider-key-status" role="status">
+              <KeyOutlined />
+              <span>
+                {t("modelProvider.keyConfiguredStatus", {
+                  preview: getSafeApiKeyPreview(verifyGroupModal.group.apiKeyPreview),
+                })}
+              </span>
+            </div>
+          ) : null}
+          <Form.Item
+            extra={verifyApiKeyRequired
+              ? t("modelProvider.verifyApiKeyExtra")
+              : t("modelProvider.verifyApiKeyOptionalExtra")}
+            label="API Key"
+            name="apiKey"
+            normalize={(value: string | undefined) => value?.trim()}
+            required={verifyApiKeyRequired}
+            rules={[
+              {
+                required: verifyApiKeyRequired,
+                message: t("modelProvider.validation.apiKeyRequired"),
+              },
+              { max: 512, message: t("modelProvider.validation.apiKeyMax") },
+              {
+                validator: (_, value?: string) =>
+                  /\s/.test(normalizeFormText(value))
+                    ? Promise.reject(new Error(t("modelProvider.validation.apiKeyNoSpaces")))
+                    : Promise.resolve(),
+              },
+            ]}
+          >
+            <Input.Password
+              autoComplete="off"
+              maxLength={512}
+              placeholder={verifyApiKeyRequired
+                ? t("modelProvider.verifyApiKeyPlaceholder")
+                : t("modelProvider.apiKeyOptionalPlaceholder")}
+              ref={verifyApiKeyInputRef}
+              visibilityToggle={false}
+            />
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      <Modal
+        centered
+        destroyOnHidden
+        okText={t("common.save")}
+        open={!!editModelWindowModal}
+        title={t("modelProvider.editModelWindowTitle", { name: editModelWindowModal?.model.name || "" })}
+        width={420}
+        onCancel={closeEditModelWindowModal}
+        onOk={() => editModelWindowForm.submit()}
+      >
+        <Form<EditModelWindowFormValues>
+          autoComplete="off"
+          className="model-provider-form"
+          form={editModelWindowForm}
+          layout="vertical"
+          onFinish={saveEditModelWindow}
+        >
+          <Form.Item
+            label={t("modelProvider.maxInputTokensLabel")}
+            name="maxInputTokens"
+            normalize={(value: string | undefined) => value?.trim()}
+            rules={[
+              { required: true, message: t("modelProvider.validation.maxInputTokensRequired") },
+              {
+                validator: (_, value?: string) =>
+                  parseLlmMaxInputTokens(value)
+                    ? Promise.resolve()
+                    : Promise.reject(new Error(t("modelProvider.validation.maxInputTokensInvalid"))),
+              },
+            ]}
+          >
+            <Input
+              autoComplete="off"
+              maxLength={LLM_MAX_INPUT_TOKENS_MAX_LENGTH}
+              placeholder={t("modelProvider.maxInputTokensPlaceholder")}
+            />
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      <Modal
+        centered
+        destroyOnHidden
+        okText={t("modelProvider.add")}
+        open={!!customModelModal}
+        title={t("modelProvider.addCustomModelTitle", { name: customModelModal?.group.name || "" })}
+        width={520}
+        onCancel={closeCustomModelModal}
+        onOk={() => customModelForm.submit()}
+      >
+        <Form<CustomModelFormValues>
+          autoComplete="off"
+          className="model-provider-form"
+          form={customModelForm}
+          layout="vertical"
+          onFinish={addCustomModel}
+        >
+          <Form.Item label={t("modelProvider.provider")} name="providerId" rules={[{ required: true, message: t("modelProvider.validation.providerRequired") }]}>
+            <Select disabled>
+              {customModelModal ? (
+                <Select.Option value={customModelModal.provider.id}>{customModelModal.provider.name}</Select.Option>
+              ) : null}
+            </Select>
+          </Form.Item>
+
+          <Form.Item label={t("modelProvider.group")} name="groupId" rules={[{ required: true, message: t("modelProvider.validation.groupRequired") }]}>
+            <Select disabled>
+              {customModelModal ? (
+                <Select.Option value={customModelModal.group.id}>{customModelModal.group.name}</Select.Option>
+              ) : null}
+            </Select>
+          </Form.Item>
+
+          <Form.Item
+            extra={t("modelProvider.modelNameExtra")}
+            label={t("modelProvider.modelName")}
+            name="name"
+            normalize={(value: string | undefined) => value?.trim()}
+            rules={[
+              { required: true, message: t("modelProvider.validation.modelNameRequired") },
+              { max: 120, message: t("modelProvider.validation.modelNameMax") },
+            ]}
+          >
+            <AutoComplete
+              allowClear
+              options={remoteModels.map((item) => ({ value: item.name }))}
+              filterOption={(input, option) =>
+                String(option?.value || "").toLowerCase().includes(input.trim().toLowerCase())
+              }
+            >
+              <Input
+                autoComplete="off"
+                autoCorrect="off"
+                maxLength={120}
+                placeholder={t("modelProvider.modelNamePlaceholder")}
+                spellCheck={false}
+                addonAfter={(
+                  <Button
+                    aria-label={t("modelProvider.fetchAvailableModels")}
+                    loading={remoteModelsLoading}
+                    size="small"
+                    type="text"
+                    icon={<SearchOutlined />}
+                    onClick={() => void loadRemoteModelNames()}
+                  />
+                )}
+              />
+            </AutoComplete>
+          </Form.Item>
+
+          <Form.Item label={t("modelProvider.modelType")} name="capability" rules={[{ required: true, message: t("modelProvider.validation.modelTypeRequired") }]}>
+            <Select
+              onChange={(value) => {
+                if (!isLlmChatCapability(value)) {
+                  setContextWindowExpanded(false);
+                  setContextWindowMode("auto");
+                  customModelForm.setFieldValue("maxInputTokens", undefined);
+                }
+              }}
+            >
+              {customModelModal?.provider.capabilities.map((capability) => (
+                <Select.Option key={capability} value={capability}>
+                  {getCapabilityLabel(capability)}
+                </Select.Option>
+              ))}
+            </Select>
+          </Form.Item>
+
+          {isLlmChatCapability(watchedCustomCapability) ? (
+            <div className="model-provider-context-window">
+              <button
+                aria-expanded={contextWindowExpanded}
+                aria-label={contextWindowExpanded ? t("modelProvider.maxInputTokensCollapse") : t("modelProvider.maxInputTokensExpand")}
+                className="model-provider-context-window-toggle"
+                type="button"
+                onClick={toggleContextWindow}
+              >
+                <span>{t("modelProvider.maxInputTokensLabel")}</span>
+                <RightOutlined className={contextWindowExpanded ? "is-expanded" : undefined} />
+              </button>
+              <Form.Item
+                hidden={!contextWindowExpanded}
+                name="maxInputTokens"
+                normalize={(value: string | undefined) => value?.trim()}
+                rules={contextWindowMode === "manual" ? [
+                  { required: true, message: t("modelProvider.validation.maxInputTokensRequired") },
+                  {
+                    validator: (_, value?: string) =>
+                      parseLlmMaxInputTokens(value)
+                        ? Promise.resolve()
+                        : Promise.reject(new Error(t("modelProvider.validation.maxInputTokensInvalid"))),
+                  },
+                ] : []}
+              >
+                <Input
+                  autoComplete="off"
+                  className="model-provider-context-window-input"
+                  maxLength={LLM_MAX_INPUT_TOKENS_MAX_LENGTH}
+                  placeholder={t("modelProvider.maxInputTokensAutoPlaceholder")}
+                  onChange={markContextWindowManual}
+                />
+              </Form.Item>
+            </div>
+          ) : null}
+        </Form>
+      </Modal>
+    </div>
+  );
+}

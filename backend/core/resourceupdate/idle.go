@@ -1,0 +1,609 @@
+package resourceupdate
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"gorm.io/gorm"
+
+	"lazymind/core/maintenance"
+	"lazymind/core/state"
+
+	"lazymind/core/common"
+	"lazymind/core/common/orm"
+)
+
+const (
+	conversationIdleTTLKeyPrefix        = "lazymind:conversation_idle:ttl:"
+	conversationIdleHistoryKeyPrefix    = "lazymind:conversation_idle:history:"
+	conversationIdleProcessingKeyPrefix = "lazymind:conversation_idle:processing:"
+
+	conversationIdleSkipSuperseded    = "superseded_by_new_message"
+	conversationIdleSkipNoUserMessage = "no_non_empty_user_message"
+)
+
+type ConversationIdleRecord struct {
+	ConversationID string
+	UserID         string
+	LastHistoryID  string
+	LastActivityAt time.Time
+	UserContent    string
+	AssistantText  string
+}
+
+type ConversationIdleFallbackResult struct {
+	Found     int
+	Triggered int
+	Skipped   int
+	Failed    int
+}
+
+type idleHistoryMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content,omitempty"`
+}
+
+type idleStateStore interface {
+	AppendHistory(ctx context.Context, key string, messages []idleHistoryMessage, maxMessages int, ttl time.Duration) error
+	ReadHistory(ctx context.Context, key string) ([]idleHistoryMessage, error)
+	SetTTLKey(ctx context.Context, key, value string, ttl time.Duration) error
+	AcquireProcessingLock(ctx context.Context, key string, ttl time.Duration) (bool, error)
+	CleanupIdleKeys(ctx context.Context, ttlKey, expectedTTLValue, historyKey string) (bool, error)
+}
+
+type stateIdleStore struct {
+	store state.Store
+}
+
+func newStateIdleStore(store state.Store) idleStateStore {
+	if store == nil {
+		return nil
+	}
+	return &stateIdleStore{store: store}
+}
+
+func (s *stateIdleStore) AppendHistory(ctx context.Context, key string, messages []idleHistoryMessage, maxMessages int, ttl time.Duration) error {
+	if s == nil || s.store == nil {
+		return errors.New("state store is nil")
+	}
+	if maxMessages <= 0 {
+		return nil
+	}
+	for _, msg := range messages {
+		body, err := json.Marshal(msg)
+		if err != nil {
+			return err
+		}
+		if err := s.store.RPush(ctx, key, body, ttl); err != nil {
+			return err
+		}
+	}
+	return s.store.LTrim(ctx, key, int64(-maxMessages), -1)
+}
+
+func (s *stateIdleStore) ReadHistory(ctx context.Context, key string) ([]idleHistoryMessage, error) {
+	if s == nil || s.store == nil {
+		return nil, errors.New("state store is nil")
+	}
+	raw, err := s.store.LRange(ctx, key, 0, -1)
+	if err != nil {
+		return nil, err
+	}
+	messages := make([]idleHistoryMessage, 0, len(raw))
+	for _, item := range raw {
+		var msg idleHistoryMessage
+		if err := json.Unmarshal([]byte(item), &msg); err != nil {
+			continue
+		}
+		msg.Role = strings.TrimSpace(msg.Role)
+		messages = append(messages, msg)
+	}
+	return messages, nil
+}
+
+func (s *stateIdleStore) SetTTLKey(ctx context.Context, key, value string, ttl time.Duration) error {
+	if s == nil || s.store == nil {
+		return errors.New("state store is nil")
+	}
+	return s.store.Set(ctx, key, []byte(value), ttl)
+}
+
+func (s *stateIdleStore) AcquireProcessingLock(ctx context.Context, key string, ttl time.Duration) (bool, error) {
+	if s == nil || s.store == nil {
+		return false, errors.New("state store is nil")
+	}
+	return s.store.SetNX(ctx, key, []byte("1"), ttl)
+}
+
+func (s *stateIdleStore) CleanupIdleKeys(ctx context.Context, ttlKey, expectedTTLValue, historyKey string) (bool, error) {
+	if s == nil || s.store == nil {
+		return false, errors.New("state store is nil")
+	}
+	value, err := s.store.Get(ctx, ttlKey)
+	missing := state.IsMissing(err)
+	if err != nil && !missing {
+		return false, err
+	}
+	if missing || string(value) == expectedTTLValue {
+		return true, s.store.Del(ctx, ttlKey, historyKey)
+	}
+	return false, nil
+}
+
+type IdleRecorder struct {
+	db    *gorm.DB
+	store idleStateStore
+	cfg   Config
+	clock clockFunc
+}
+
+func NewIdleRecorder(db *gorm.DB, store state.Store, cfg Config) *IdleRecorder {
+	return newIdleRecorderWithStore(db, newStateIdleStore(store), cfg)
+}
+
+func RecordConversationIdleMessage(ctx context.Context, db *gorm.DB, store state.Store, record ConversationIdleRecord) error {
+	return NewIdleRecorder(db, store, DefaultConfig()).RecordConversationMessage(ctx, record)
+}
+
+func newIdleRecorderWithStore(db *gorm.DB, store idleStateStore, cfg Config) *IdleRecorder {
+	cfg = normalizeConfig(cfg)
+	return &IdleRecorder{
+		db:    db,
+		store: store,
+		cfg:   cfg,
+		clock: time.Now,
+	}
+}
+
+func (r *IdleRecorder) RecordConversationMessage(ctx context.Context, record ConversationIdleRecord) error {
+	if r == nil || r.db == nil {
+		return errors.New("idle recorder db is nil")
+	}
+	if r.store == nil {
+		return errors.New("idle recorder state store is nil")
+	}
+	record.ConversationID = strings.TrimSpace(record.ConversationID)
+	record.UserID = strings.TrimSpace(record.UserID)
+	record.LastHistoryID = strings.TrimSpace(record.LastHistoryID)
+	if record.ConversationID == "" || record.UserID == "" || record.LastHistoryID == "" {
+		return errors.New("conversation_id, user_id, and last_history_id are required")
+	}
+	now := r.clock().UTC()
+	lastActivityAt := record.LastActivityAt.UTC()
+	if lastActivityAt.IsZero() {
+		lastActivityAt = now
+	}
+	eventID := idleEventID(record.ConversationID, record.LastHistoryID)
+	dueAt := lastActivityAt.Add(r.cfg.ConversationIdleSeconds)
+
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&orm.ConversationIdleEvent{}).
+			Where("session_id = ? AND status = ? AND event_id <> ?", record.ConversationID, orm.ConversationIdleEventStatusWaiting, eventID).
+			Updates(map[string]any{
+				"status":      orm.ConversationIdleEventStatusSkipped,
+				"skip_reason": conversationIdleSkipSuperseded,
+				"updated_at":  now,
+			}).Error; err != nil {
+			return err
+		}
+		event := orm.ConversationIdleEvent{
+			ID:             common.GenerateID(),
+			EventID:        eventID,
+			ConversationID: record.ConversationID,
+			UserID:         record.UserID,
+			LastHistoryID:  record.LastHistoryID,
+			LastActivityAt: lastActivityAt,
+			DueAt:          dueAt,
+			Status:         orm.ConversationIdleEventStatusWaiting,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+		return tx.Clauses(clauseOnConflictDoNothing()).Create(&event).Error
+	})
+	if err != nil {
+		return err
+	}
+
+	messages := []idleHistoryMessage{
+		{Role: "user", Content: record.UserContent},
+		{Role: "assistant", Content: record.AssistantText},
+	}
+	if err := r.store.SetTTLKey(ctx, conversationIdleTTLKey(record.ConversationID), eventID, r.cfg.ConversationIdleSeconds); err != nil {
+		return err
+	}
+	if err := r.store.AppendHistory(ctx, conversationIdleHistoryKey(record.ConversationID), messages, r.cfg.ConversationIdleHistoryMaxMessages, r.cfg.ConversationIdleHistoryTTL); err != nil {
+		return err
+	}
+	resourceUpdateInfo(logEventIdleEventRecorded).
+		Str("event_id", eventID).
+		Str("conversation_id", record.ConversationID).
+		Str("user_id", record.UserID).
+		Str("last_history_id", record.LastHistoryID).
+		Time("due_at", dueAt).
+		Msg(logEventIdleEventRecorded)
+	return nil
+}
+
+type IdleProcessor struct {
+	db       *gorm.DB
+	store    idleStateStore
+	cfg      Config
+	workerID string
+	clock    clockFunc
+}
+
+func NewIdleProcessor(db *gorm.DB, store state.Store, cfg Config, workerID string) *IdleProcessor {
+	return newIdleProcessorWithStore(db, newStateIdleStore(store), cfg, workerID)
+}
+
+func newIdleProcessorWithStore(db *gorm.DB, store idleStateStore, cfg Config, workerID string) *IdleProcessor {
+	cfg = normalizeConfig(cfg)
+	if strings.TrimSpace(workerID) == "" {
+		workerID = defaultWorkerID("resourceupdate-idle")
+	}
+	return &IdleProcessor{
+		db:       db,
+		store:    store,
+		cfg:      cfg,
+		workerID: workerID,
+		clock:    time.Now,
+	}
+}
+
+func (p *IdleProcessor) ProcessLatestWaitingConversation(ctx context.Context, conversationID string) error {
+	if p == nil || p.db == nil {
+		return errors.New("idle processor db is nil")
+	}
+	conversationID = strings.TrimSpace(conversationID)
+	if conversationID == "" {
+		return nil
+	}
+	var event orm.ConversationIdleEvent
+	err := p.db.WithContext(ctx).
+		Where("session_id = ? AND status = ?", conversationID, orm.ConversationIdleEventStatusWaiting).
+		Order("due_at DESC, created_at DESC").
+		Take(&event).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return p.ProcessEvent(ctx, event.EventID)
+}
+
+func (p *IdleProcessor) RunFallbackOnce(ctx context.Context) (ConversationIdleFallbackResult, error) {
+	var result ConversationIdleFallbackResult
+	if p == nil || p.db == nil {
+		return result, errors.New("idle processor db is nil")
+	}
+	now := p.clock().UTC()
+	var eventIDs []string
+	err := p.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return withUpdateSkipLocked(tx.Model(&orm.ConversationIdleEvent{})).
+			Where("status = ? AND due_at <= ?", orm.ConversationIdleEventStatusWaiting, now).
+			Order("due_at ASC").
+			Limit(p.cfg.ConversationIdleFallbackBatchSize).
+			Pluck("event_id", &eventIDs).Error
+	})
+	if err != nil {
+		return result, err
+	}
+	result.Found = len(eventIDs)
+	for _, eventID := range eventIDs {
+		before, err := p.loadEventStatus(ctx, eventID)
+		if err != nil {
+			return result, err
+		}
+		if err := p.ProcessEvent(ctx, eventID); err != nil {
+			return result, err
+		}
+		after, err := p.loadEventStatus(ctx, eventID)
+		if err != nil {
+			return result, err
+		}
+		if before == after {
+			continue
+		}
+		switch after {
+		case orm.ConversationIdleEventStatusTriggered:
+			result.Triggered++
+		case orm.ConversationIdleEventStatusSkipped:
+			result.Skipped++
+		case orm.ConversationIdleEventStatusFailed:
+			result.Failed++
+		}
+	}
+	return result, nil
+}
+
+func (p *IdleProcessor) ProcessEvent(ctx context.Context, eventID string) error {
+	if p == nil || p.db == nil {
+		return errors.New("idle processor db is nil")
+	}
+	if p.store == nil {
+		return errors.New("idle processor state store is nil")
+	}
+	eventID = strings.TrimSpace(eventID)
+	if eventID == "" {
+		return nil
+	}
+	locked, err := p.store.AcquireProcessingLock(ctx, conversationIdleProcessingKey(eventID), p.cfg.WorkerLockTTL)
+	if err != nil {
+		return err
+	}
+	if !locked {
+		resourceUpdateInfo(logEventIdleEventSkipped).
+			Str("event_id", eventID).
+			Str("reason", "processing_lock_busy").
+			Msg(logEventIdleEventSkipped)
+		return nil
+	}
+	// Read the immutable event identity and remote history before the short user transaction.
+	var candidate orm.ConversationIdleEvent
+	if err := p.db.WithContext(ctx).Where("event_id = ?", eventID).Take(&candidate).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		return err
+	}
+	history, historyErr := p.store.ReadHistory(ctx, conversationIdleHistoryKey(candidate.ConversationID))
+	now := p.clock().UTC()
+	cleanupConversationID := ""
+	err = maintenance.UserTransaction(ctx, p.db, candidate.UserID, func(tx *gorm.DB) error {
+		var event orm.ConversationIdleEvent
+		if err := withUpdateLock(tx).Where("event_id = ?", eventID).Take(&event).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				resourceUpdateInfo(logEventIdleEventSkipped).
+					Str("event_id", eventID).
+					Str("reason", "event_not_found").
+					Msg(logEventIdleEventSkipped)
+				return nil
+			}
+			return err
+		}
+		if event.Status != orm.ConversationIdleEventStatusWaiting {
+			resourceUpdateInfo(logEventIdleEventSkipped).
+				Str("event_id", event.EventID).
+				Str("conversation_id", event.ConversationID).
+				Str("user_id", event.UserID).
+				Str("status", event.Status).
+				Str("reason", "event_not_waiting").
+				Msg(logEventIdleEventSkipped)
+			return nil
+		}
+		if now.Before(event.DueAt) {
+			resourceUpdateInfo(logEventIdleEventSkipped).
+				Str("event_id", event.EventID).
+				Str("conversation_id", event.ConversationID).
+				Str("user_id", event.UserID).
+				Time("due_at", event.DueAt).
+				Str("reason", "event_not_due").
+				Msg(logEventIdleEventSkipped)
+			return nil
+		}
+		if err := tx.Model(&orm.ConversationIdleEvent{}).Where("id = ?", event.ID).Updates(map[string]any{
+			"status":     orm.ConversationIdleEventStatusProcessing,
+			"updated_at": now,
+		}).Error; err != nil {
+			return err
+		}
+
+		if historyErr != nil {
+			cleanupConversationID = event.ConversationID
+			return p.markEventFailed(tx, event.ID, now, "read_history_failed", historyErr.Error())
+		}
+		if !historyHasNonEmptyUserMessage(history) {
+			cleanupConversationID = event.ConversationID
+			return p.markEventSkipped(tx, event.ID, now, conversationIdleSkipNoUserMessage)
+		}
+		historyJSON, err := json.Marshal(history)
+		if err != nil {
+			cleanupConversationID = event.ConversationID
+			return p.markEventFailed(tx, event.ID, now, "marshal_history_failed", err.Error())
+		}
+
+		memoryTaskID, err := createIdleGenerateTask(ctx, tx, event, historyJSON, now)
+		if err != nil {
+			cleanupConversationID = event.ConversationID
+			return p.markEventFailed(tx, event.ID, now, "create_memory_task_failed", err.Error())
+		}
+		resourceUpdateInfo(logEventIdleEventTriggered).
+			Str("event_id", event.EventID).
+			Str("conversation_id", event.ConversationID).
+			Str("user_id", event.UserID).
+			Str("memory_task_id", memoryTaskID).
+			Int("history_message_count", len(history)).
+			Msg(logEventIdleEventTriggered)
+		triggeredAt := now
+		cleanupConversationID = event.ConversationID
+		return tx.Model(&orm.ConversationIdleEvent{}).Where("id = ?", event.ID).Updates(map[string]any{
+			"status":         orm.ConversationIdleEventStatusTriggered,
+			"error_code":     "",
+			"error_message":  "",
+			"memory_task_id": memoryTaskID,
+			"triggered_at":   &triggeredAt,
+			"updated_at":     now,
+		}).Error
+	})
+	if err == nil && cleanupConversationID != "" {
+		if cleanupErr := p.cleanupIdleStateKeys(ctx, cleanupConversationID, eventID); cleanupErr != nil {
+			resourceUpdateWarn(logEventIdleStateCleanupFailed, cleanupErr).
+				Str("event_id", eventID).
+				Str("conversation_id", cleanupConversationID).
+				Msg(logEventIdleStateCleanupFailed)
+		}
+	}
+	return err
+}
+
+func (p *IdleProcessor) cleanupIdleStateKeys(ctx context.Context, conversationID, eventID string) error {
+	if p == nil || p.store == nil {
+		return nil
+	}
+	conversationID = strings.TrimSpace(conversationID)
+	eventID = strings.TrimSpace(eventID)
+	if conversationID == "" || eventID == "" {
+		return nil
+	}
+	_, err := p.store.CleanupIdleKeys(
+		ctx,
+		conversationIdleTTLKey(conversationID),
+		eventID,
+		conversationIdleHistoryKey(conversationID),
+	)
+	return err
+}
+
+func (p *IdleProcessor) loadEventStatus(ctx context.Context, eventID string) (string, error) {
+	var event orm.ConversationIdleEvent
+	if err := p.db.WithContext(ctx).Select("status").Where("event_id = ?", eventID).Take(&event).Error; err != nil {
+		return "", err
+	}
+	return event.Status, nil
+}
+
+func (p *IdleProcessor) markEventSkipped(tx *gorm.DB, id string, now time.Time, reason string) error {
+	resourceUpdateInfo(logEventIdleEventSkipped).
+		Str("event_row_id", id).
+		Str("reason", reason).
+		Msg(logEventIdleEventSkipped)
+	return tx.Model(&orm.ConversationIdleEvent{}).Where("id = ?", id).Updates(map[string]any{
+		"status":      orm.ConversationIdleEventStatusSkipped,
+		"skip_reason": reason,
+		"updated_at":  now,
+	}).Error
+}
+
+func (p *IdleProcessor) markEventFailed(tx *gorm.DB, id string, now time.Time, code, message string) error {
+	resourceUpdateWarn(logEventIdleEventFailed, nil).
+		Str("event_row_id", id).
+		Str("error_code", code).
+		Str("error_message", message).
+		Msg(logEventIdleEventFailed)
+	return tx.Model(&orm.ConversationIdleEvent{}).Where("id = ?", id).Updates(map[string]any{
+		"status":        orm.ConversationIdleEventStatusFailed,
+		"error_code":    code,
+		"error_message": message,
+		"updated_at":    now,
+	}).Error
+}
+
+func createIdleGenerateTask(ctx context.Context, db *gorm.DB, event orm.ConversationIdleEvent, historyJSON json.RawMessage, now time.Time) (string, error) {
+	triggerID := fmt.Sprintf("%s:%s", strings.TrimSpace(event.EventID), "memory_review")
+	request := memoryReviewRequestJSON{
+		ConversationID:             strings.TrimSpace(event.ConversationID),
+		ConversationLastActiveAtMS: event.LastActivityAt.UnixMilli(),
+		History:                    historyJSON,
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		return "", err
+	}
+	task := orm.ResourceUpdateTask{
+		ID:           common.GenerateID(),
+		TaskType:     orm.ResourceUpdateTaskTypeGenerateReview,
+		ResourceType: orm.ResourceUpdateResourceTypeMemory,
+		UserID:       strings.TrimSpace(event.UserID),
+		ResourceID:   strings.TrimSpace(event.ConversationID),
+		TriggerType:  orm.ResourceUpdateTriggerTypeConversationIdle,
+		TriggerID:    triggerID,
+		Status:       orm.ResourceUpdateTaskStatusPending,
+		RequestJSON:  body,
+		NextRunAt:    now,
+		LaneKey:      MemoryMaintenanceLaneKey(event.UserID),
+		LanePriority: MemoryReviewLanePriority,
+		LaneOrderAt:  event.LastActivityAt.UTC(),
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	tx := db.WithContext(ctx).Clauses(clauseOnConflictDoNothing()).Create(&task)
+	if tx.Error != nil {
+		return "", tx.Error
+	}
+	if tx.RowsAffected == 1 {
+		return task.ID, nil
+	}
+	var existing orm.ResourceUpdateTask
+	if err := db.WithContext(ctx).
+		Select("id").
+		Where("task_type = ? AND resource_type = ? AND trigger_type = ? AND trigger_id = ?",
+			orm.ResourceUpdateTaskTypeGenerateReview, orm.ResourceUpdateResourceTypeMemory, orm.ResourceUpdateTriggerTypeConversationIdle, triggerID).
+		Take(&existing).Error; err != nil {
+		return "", err
+	}
+	return existing.ID, nil
+}
+
+func historyHasNonEmptyUserMessage(history []idleHistoryMessage) bool {
+	for _, msg := range history {
+		if strings.TrimSpace(msg.Role) == "user" && strings.TrimSpace(msg.Content) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func idleEventID(conversationID, historyID string) string {
+	return strings.TrimSpace(conversationID) + ":" + strings.TrimSpace(historyID)
+}
+
+func conversationIdleTTLKey(conversationID string) string {
+	return conversationIdleTTLKeyPrefix + strings.TrimSpace(conversationID)
+}
+
+func conversationIdleHistoryKey(conversationID string) string {
+	return conversationIdleHistoryKeyPrefix + strings.TrimSpace(conversationID)
+}
+
+func conversationIdleProcessingKey(eventID string) string {
+	return conversationIdleProcessingKeyPrefix + strings.TrimSpace(eventID)
+}
+
+func parseConversationIdleTTLKey(key string) (string, bool) {
+	if !strings.HasPrefix(key, conversationIdleTTLKeyPrefix) {
+		return "", false
+	}
+	conversationID := strings.TrimSpace(strings.TrimPrefix(key, conversationIdleTTLKeyPrefix))
+	return conversationID, conversationID != ""
+}
+
+func runIdleFallbackLoop(ctx context.Context, processor *IdleProcessor, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		if _, err := processor.RunFallbackOnce(ctx); err != nil {
+			resourceUpdateWarn(logEventIdleFallbackFailed, err).
+				Msg(logEventIdleFallbackFailed)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func runIdleExpiredKeyNotifyLoop(ctx context.Context, store state.Store, processor *IdleProcessor) {
+	notifier, ok := store.(state.ExpiredKeyNotifier)
+	if !ok || processor == nil {
+		return
+	}
+	notifier.SubscribeExpiredKeys(ctx, func(key string) error {
+		conversationID, ok := parseConversationIdleTTLKey(key)
+		if !ok {
+			return nil
+		}
+		if err := processor.ProcessLatestWaitingConversation(ctx, conversationID); err != nil {
+			resourceUpdateWarn(logEventIdleExpiredKeyNotifyFailed, err).
+				Str("conversation_id", conversationID).
+				Msg(logEventIdleExpiredKeyNotifyFailed)
+			return err
+		}
+		return nil
+	})
+}

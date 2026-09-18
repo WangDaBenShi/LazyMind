@@ -1,0 +1,385 @@
+import { useEffect, useMemo, useState } from "react";
+import { Alert, Button, Empty, Input, Space, Tag, message } from "antd";
+import { HistoryOutlined } from "@ant-design/icons";
+import { useParams } from "react-router-dom";
+import { DetailPageHeader } from "@/components/ui";
+import { getLocalizedErrorMessage } from "@/components/request";
+import ResourceVersionDrawer from "../../components/ResourceVersionDrawer";
+import SkillPackageEditor from "../../components/skillPackage/SkillPackageEditor";
+import RouteLoading from "../../components/RouteLoading";
+import { useMemoryManagementOutletContext } from "../../context";
+import {
+  buildSkillUpdatePayload,
+  getSkillAssetDetail,
+  patchSkillAsset,
+} from "../../skillApi";
+import {
+  SKILL_CHAR_COUNT_STYLE,
+  SKILL_DESCRIPTION_MAX_LENGTH,
+  SKILL_NAME_MAX_LENGTH,
+  countSkillCharacters,
+  skillCharCountConfig,
+  type StructuredAsset,
+} from "../../shared";
+
+export default function MemorySkillDetailPage() {
+  const { itemId = "" } = useParams();
+  const {
+    t,
+    skillAssets,
+    skillsInitialized,
+    navigateToMemoryList,
+    refreshSkillAssets,
+  } = useMemoryManagementOutletContext();
+  const [detail, setDetail] = useState<StructuredAsset | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [errorMessage, setErrorMessage] = useState("");
+  const [retryKey, setRetryKey] = useState(0);
+  const [isTitleEditing, setIsTitleEditing] = useState(false);
+  const [titleDraft, setTitleDraft] = useState("");
+  const [titleSaving, setTitleSaving] = useState(false);
+  const [isDescriptionEditing, setIsDescriptionEditing] = useState(false);
+  const [descriptionDraft, setDescriptionDraft] = useState("");
+  const [descriptionSaving, setDescriptionSaving] = useState(false);
+  const [versionDrawerOpen, setVersionDrawerOpen] = useState(false);
+  const [packageReloadKey, setPackageReloadKey] = useState(0);
+
+  const cachedSkill = useMemo(
+    () => skillAssets.find((item: StructuredAsset) => item.id === itemId) || null,
+    [itemId, skillAssets],
+  );
+  const skill = detail || cachedSkill;
+  const canEditSkillDetail = Boolean(skill) && !skill?.readonly;
+  const titleDraftLength = countSkillCharacters(titleDraft);
+  const descriptionDraftLength = countSkillCharacters(descriptionDraft);
+  const titleTooLong = titleDraftLength > SKILL_NAME_MAX_LENGTH;
+  const descriptionTooLong =
+    descriptionDraftLength > SKILL_DESCRIPTION_MAX_LENGTH;
+
+  const buildMetadataPatchPayload = (asset: StructuredAsset, overrides: Record<string, unknown> = {}) =>
+    buildSkillUpdatePayload({
+      name: asset.name,
+      description: asset.description,
+      category: asset.category,
+      tags: asset.tags,
+      autoEvo: asset.autoEvo,
+      isEnabled: asset.isEnabled,
+      ...overrides,
+    });
+
+  useEffect(() => {
+    if (!skill || isTitleEditing) {
+      return;
+    }
+    setTitleDraft(skill.name || "");
+  }, [isTitleEditing, skill]);
+
+  useEffect(() => {
+    if (!skill || isDescriptionEditing) {
+      return;
+    }
+    setDescriptionDraft(skill.description || "");
+  }, [isDescriptionEditing, skill]);
+
+  useEffect(() => {
+    let ignore = false;
+
+    if (!itemId) {
+      setDetail(null);
+      setErrorMessage("");
+      return () => {
+        ignore = true;
+      };
+    }
+
+    setDetail(cachedSkill);
+
+    if (!skillsInitialized && !cachedSkill) {
+      return () => {
+        ignore = true;
+      };
+    }
+
+    setLoading(true);
+    setErrorMessage("");
+    void (async () => {
+      try {
+        const nextDetail = await getSkillAssetDetail(itemId, { loadContent: false });
+        if (ignore) {
+          return;
+        }
+        setDetail(nextDetail);
+      } catch (error) {
+        if (ignore) {
+          return;
+        }
+        console.error("Load skill detail failed:", error);
+        setErrorMessage(getLocalizedErrorMessage(error));
+      } finally {
+        if (!ignore) {
+          setLoading(false);
+        }
+      }
+    })();
+
+    return () => {
+      ignore = true;
+    };
+  }, [cachedSkill, itemId, retryKey, skillsInitialized, t]);
+
+  const handleSkillUpdated = async () => {
+    if (!itemId) {
+      return;
+    }
+    const nextDetail = await getSkillAssetDetail(itemId, { loadContent: false });
+    if (nextDetail) {
+      setDetail(nextDetail);
+    }
+    await refreshSkillAssets();
+  };
+
+  const handleSkillRolledBack = async () => {
+    setPackageReloadKey((value) => value + 1);
+    await handleSkillUpdated();
+  };
+
+  if ((loading || !skillsInitialized) && !skill && !errorMessage) {
+    return <RouteLoading title={t("admin.memorySkillDetailTitle")} />;
+  }
+
+  const handleSaveTitleEdit = async () => {
+    if (!skill || !canEditSkillDetail || titleSaving) {
+      return;
+    }
+    const nextName = titleDraft.trim();
+    if (!nextName) {
+      message.warning(`${t("common.pleaseInput")}${t("admin.memoryName")}`);
+      return;
+    }
+    if (titleTooLong) {
+      message.warning(
+        t("admin.memorySkillNameMaxLength", {
+          count: SKILL_NAME_MAX_LENGTH,
+        }),
+      );
+      return;
+    }
+    if (nextName === skill.name) {
+      setIsTitleEditing(false);
+      return;
+    }
+
+    setTitleSaving(true);
+    try {
+      await patchSkillAsset(skill.id, buildMetadataPatchPayload(skill, { name: nextName }));
+      await handleSkillUpdated();
+      setIsTitleEditing(false);
+      message.success(t("common.saveSuccess"));
+    } catch (error) {
+      console.error("Save skill title failed:", error);
+      message.error(getLocalizedErrorMessage(error));
+    } finally {
+      setTitleSaving(false);
+    }
+  };
+
+  const handleSaveDescriptionEdit = async () => {
+    if (!skill || !canEditSkillDetail || descriptionSaving) {
+      return;
+    }
+    const nextDescription = descriptionDraft.trim();
+    if (descriptionTooLong) {
+      message.warning(
+        t("admin.memorySkillDescriptionMaxLength", {
+          count: SKILL_DESCRIPTION_MAX_LENGTH,
+        }),
+      );
+      return;
+    }
+    if (nextDescription === (skill.description || "").trim()) {
+      setIsDescriptionEditing(false);
+      return;
+    }
+
+    setDescriptionSaving(true);
+    try {
+      await patchSkillAsset(
+        skill.id,
+        buildMetadataPatchPayload(skill, { description: nextDescription }),
+      );
+      await handleSkillUpdated();
+      setIsDescriptionEditing(false);
+      message.success(t("common.saveSuccess"));
+    } catch (error) {
+      console.error("Save skill description failed:", error);
+      message.error(getLocalizedErrorMessage(error));
+    } finally {
+      setDescriptionSaving(false);
+    }
+  };
+
+  const skillTitleNode = skill ? (
+    isTitleEditing ? (
+      <div className="memory-skill-detail-title-edit memory-char-count">
+        <Input
+          size="small"
+          value={titleDraft}
+          status={titleTooLong ? "error" : undefined}
+          styles={{ count: SKILL_CHAR_COUNT_STYLE }}
+          count={skillCharCountConfig(SKILL_NAME_MAX_LENGTH)}
+          onChange={(event) => setTitleDraft(event.target.value)}
+          onPressEnter={() => void handleSaveTitleEdit()}
+        />
+        <Space size={6}>
+          <Button size="small" onClick={() => setIsTitleEditing(false)} disabled={titleSaving}>
+            {t("common.cancel")}
+          </Button>
+          <Button
+            size="small"
+            type="primary"
+            loading={titleSaving}
+            disabled={titleTooLong}
+            onClick={() => void handleSaveTitleEdit()}
+          >
+            {t("common.save")}
+          </Button>
+        </Space>
+      </div>
+    ) : canEditSkillDetail ? (
+      <button
+        type="button"
+        className="memory-skill-detail-title-trigger"
+        onClick={() => setIsTitleEditing(true)}
+      >
+        {skill.name}
+      </button>
+    ) : (
+      skill.name
+    )
+  ) : (
+    t("admin.memorySkillDetailTitle")
+  );
+
+  const hasSkillMeta =
+    Boolean(skill?.description?.trim()) ||
+    Boolean(skill?.category) ||
+    Boolean(skill?.draft?.hasUncommittedDraft) ||
+    Boolean(skill?.tags.length);
+
+  const skillMetaContent =
+    skill && (hasSkillMeta || canEditSkillDetail) ? (
+      <div className="memory-skill-detail-header">
+      <div className="memory-skill-detail-description-row">
+        {isDescriptionEditing ? (
+          <div className="memory-skill-detail-description-edit memory-char-count">
+            <Input.TextArea
+              value={descriptionDraft}
+              autoSize={{ minRows: 2, maxRows: 6 }}
+              status={descriptionTooLong ? "error" : undefined}
+              styles={{ count: SKILL_CHAR_COUNT_STYLE }}
+              count={skillCharCountConfig(SKILL_DESCRIPTION_MAX_LENGTH)}
+              onChange={(event) => setDescriptionDraft(event.target.value)}
+            />
+            <Space size={6}>
+              <Button size="small" onClick={() => setIsDescriptionEditing(false)} disabled={descriptionSaving}>
+                {t("common.cancel")}
+              </Button>
+              <Button
+                size="small"
+                type="primary"
+                loading={descriptionSaving}
+                disabled={descriptionTooLong}
+                onClick={() => void handleSaveDescriptionEdit()}
+              >
+                {t("common.save")}
+              </Button>
+            </Space>
+          </div>
+        ) : canEditSkillDetail ? (
+          <button
+            type="button"
+            className="memory-skill-detail-description-trigger"
+            onClick={() => setIsDescriptionEditing(true)}
+          >
+            <span>{skill.description || "-"}</span>
+          </button>
+        ) : (
+          <span className="memory-skill-detail-description-text">{skill.description || "-"}</span>
+        )}
+      </div>
+      <div className="memory-skill-detail-meta">
+        {skill.category ? (
+          <Tag className="memory-category-tag" bordered={false}>
+            {skill.category}
+          </Tag>
+        ) : null}
+        {skill.draft?.hasUncommittedDraft ? (
+          <Tag color="gold" bordered={false}>
+            {t("admin.memorySkillDraftPending")}
+          </Tag>
+        ) : null}
+        {skill.tags.map((item: string) => (
+          <Tag key={item}>{item}</Tag>
+        ))}
+      </div>
+      </div>
+    ) : null;
+
+  return (
+    <div className="memory-skill-detail-layout">
+      <DetailPageHeader
+        className="memory-skill-detail-page-header"
+        title={skillTitleNode}
+        description={skillMetaContent}
+        settingsMenu={
+          skill ? (
+            <Button icon={<HistoryOutlined />} onClick={() => setVersionDrawerOpen(true)}>
+              {t("admin.memoryVersionHistoryButton")}
+            </Button>
+          ) : null
+        }
+        onBack={() => navigateToMemoryList("skills")}
+      />
+
+      {errorMessage ? (
+        <Alert
+          type="error"
+          showIcon
+          message={errorMessage}
+          action={
+            <Button size="small" onClick={() => setRetryKey((value) => value + 1)}>
+              {t("common.retry")}
+            </Button>
+          }
+        />
+      ) : null}
+
+      {!skill && !loading ? (
+        <Empty
+          image={Empty.PRESENTED_IMAGE_SIMPLE}
+          description={t("admin.memoryDiffTargetMissing")}
+        />
+      ) : skill ? (
+        <div className="memory-skill-detail-card memory-skill-package-card">
+          <SkillPackageEditor
+            key={packageReloadKey}
+            skillId={skill.id}
+            canEdit={canEditSkillDetail}
+            autoUpdateEnabled={Boolean(skill.autoEvo)}
+            t={t}
+            onSkillUpdated={handleSkillUpdated}
+          />
+        </div>
+      ) : null}
+
+      <ResourceVersionDrawer
+        open={versionDrawerOpen}
+        resourceId={itemId}
+        resourceName={skill?.name || itemId}
+        t={t}
+        onClose={() => setVersionDrawerOpen(false)}
+        onRolledBack={handleSkillRolledBack}
+      />
+    </div>
+  );
+}

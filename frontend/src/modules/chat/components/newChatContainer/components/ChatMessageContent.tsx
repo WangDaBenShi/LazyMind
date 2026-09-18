@@ -1,0 +1,195 @@
+import { Flex, Spin, Tooltip } from "antd";
+import {
+  BulbOutlined,
+  CommentOutlined,
+  DownOutlined,
+  LoadingOutlined,
+  UpOutlined,
+} from "@ant-design/icons";
+import { ChatConversationsResponseFinishReasonEnum } from "@/api/generated/chatbot-client";
+import MarkdownViewer from "@/modules/chat/components/MarkdownViewer";
+import { getCitationSources } from "@/modules/chat/utils/sourceAdapter";
+import { RoleTypes } from "@/modules/chat/constants/common";
+import { formatThinkingForDisplay, summarizeSearchToolsFromText } from "@/modules/chat/utils/thinking";
+import { useTranslation } from "react-i18next";
+import ChatImages from "../../ChatImages";
+import ChatFiles from "../../ChatFiles";
+import { getCiteMessages } from "../utils/citeMessage";
+
+const ThinkIcon = new URL("../../../assets/images/think.png", import.meta.url)
+  .href;
+
+function formatThinkingDuration(value: number | string | undefined): string {
+  const seconds = Math.floor(Number(value));
+  if (!Number.isFinite(seconds) || seconds <= 0) return "";
+
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  if (minutes === 0) return `${seconds}s`;
+  return remainingSeconds > 0
+    ? `${minutes}m${remainingSeconds}s`
+    : `${minutes}m`;
+}
+
+const INTENT_FIELD_LABELS: Record<string, string> = {
+  goal: "chat.intentGoal",
+  deliverable: "chat.intentDeliverable",
+  execution_mode: "chat.intentExecutionMode",
+  constraints: "chat.intentConstraints",
+  corrections: "chat.intentCorrections",
+  emphasized_points: "chat.intentEmphasizedPoints",
+};
+
+interface ChatMessageContentProps {
+  item: any;
+  conversationId?: string;
+  onCiteMessage?: (text: string, historyId?: string) => void;
+  uniqueKey?: string;
+  isThinkingCollapsed: (key: string, defaultCollapsed?: boolean) => boolean;
+  onToggleThinkingCollapse: (key: string, currentCollapsed?: boolean) => void;
+}
+
+function ModelRetryStatus({
+  retry,
+}: {
+  retry: {
+    retry_index: number;
+    max_attempts: number;
+  };
+}) {
+  const { t } = useTranslation();
+
+  return (
+    <div className="chat-model-retry-status" role="status" aria-live="polite">
+      <LoadingOutlined spin />
+      {t("chat.modelRetrying", {
+        attempt: retry.retry_index + 1,
+        max: retry.max_attempts,
+      })}
+    </div>
+  );
+}
+
+export default function ChatMessageContent({
+  item,
+  conversationId,
+  onCiteMessage,
+  uniqueKey,
+  isThinkingCollapsed,
+  onToggleThinkingCollapse,
+}: ChatMessageContentProps) {
+  const sources = getCitationSources(item.sources);
+  const { t } = useTranslation();
+  const thinkingKey = uniqueKey || item.history_id || item.id || "default";
+  const citeMessageList =
+    item.role === RoleTypes.USER ? getCiteMessages(item) : [];
+  const isStreaming =
+    !item.run_status &&
+    item.finish_reason !==
+      ChatConversationsResponseFinishReasonEnum.FinishReasonStop;
+  const isCollapsed = isThinkingCollapsed(thinkingKey, !isStreaming);
+  const searchSummary = summarizeSearchToolsFromText(
+    item.raw_delta || item.reasoning_content,
+  );
+  const conversationIntent =
+    item.intent_updated?.scope === "conversation"
+      ? item.intent_updated.intent_context
+      : null;
+  const thinkingDuration = formatThinkingDuration(
+    item.thinking_duration_s || item.thinking_time_s,
+  );
+  const intentTooltip = conversationIntent ? (
+    <div className="chat-intent-tooltip">
+      {Object.entries(INTENT_FIELD_LABELS).map(([field, labelKey]) => {
+        const rawValue = conversationIntent[field];
+        const values = Array.isArray(rawValue) ? rawValue : [rawValue];
+        const display = values.filter(Boolean).map(String).join("；");
+        return display ? (
+          <div key={field}>
+            <strong>{t(labelKey)}：</strong>
+            {display}
+          </div>
+        ) : null;
+      })}
+    </div>
+  ) : null;
+
+  return (
+    <Flex vertical>
+      {item.model_retry ? <ModelRetryStatus retry={item.model_retry} /> : null}
+      {conversationIntent ? (
+        <Tooltip title={intentTooltip} placement="topLeft">
+          <span className="chat-intent-updated">
+            <BulbOutlined />
+            <span>{t("chat.intentUpdated")}</span>
+          </span>
+        </Tooltip>
+      ) : null}
+      {item.images && <ChatImages images={item.images} />}
+      {item.files && <ChatFiles files={item.files} />}
+      {citeMessageList.length > 0 ? (
+        <Tooltip
+          placement="topRight"
+          overlayClassName="chat-user-citation-tooltip"
+          title={
+            <div className="chat-user-citation-tooltip-content">
+              {citeMessageList.map((citeMessage, index) => (
+                <div
+                  className="chat-user-citation-tooltip-item"
+                  key={`${index}-${citeMessage}`}
+                >
+                  {citeMessage}
+                </div>
+              ))}
+            </div>
+          }
+        >
+          <span className="chat-user-citation-icon" aria-label={t("chat.cite")}>
+            <CommentOutlined />
+          </span>
+        </Tooltip>
+      ) : null}
+      {item.reasoning_content && (
+        <>
+          <div
+            className="chat-think-status"
+            onClick={() => onToggleThinkingCollapse(thinkingKey, isCollapsed)}
+          >
+            <img src={ThinkIcon} className="chat-think-icon" alt="" />
+            <span className="chat-think-title">
+              {item.delta ? t("chat.thinkingDone") : t("chat.thinking")}
+              {searchSummary ? ` · ${searchSummary}` : ""}
+              {thinkingDuration ? ` (${thinkingDuration})` : ""}
+            </span>
+            {isCollapsed ? (
+              <UpOutlined className="chat-arrow-icon" />
+            ) : (
+              <DownOutlined className="chat-arrow-icon" />
+            )}
+          </div>
+          <div className={isCollapsed ? "chat-collapse" : "chat-expand"}>
+            <div className="chat-think-text">
+              <MarkdownViewer sources={sources} IS_STREAMING={isStreaming}>
+                {formatThinkingForDisplay(item.reasoning_content)}
+              </MarkdownViewer>
+            </div>
+            {!item.delta && isStreaming && <Spin />}
+          </div>
+        </>
+      )}
+      <div className="chat-text">
+        <MarkdownViewer
+          sources={sources}
+          IS_STREAMING={isStreaming}
+          conversationId={item.fork_read_only ? undefined : conversationId}
+          historyId={item.history_id || item.id}
+          onCiteMessage={(text: string) =>
+            onCiteMessage?.(text, item.history_id || item.id)
+          }
+        >
+          {item.display_delta || item.delta}
+        </MarkdownViewer>
+      </div>
+    </Flex>
+  );
+}

@@ -1,0 +1,1407 @@
+# Model catalog — source of truth for default_model_providers and default_models.
+# Loaded at startup by modelprovider.SeedModelCatalog(); replaces the seed SQL INSERT statements.
+# Context windows live in model_context_windows.yaml, not in this file.
+#
+# Top-level keys must end with "_providers"; the prefix becomes the category:
+#   model_providers  → category: model
+#   ocr_providers    → category: ocr
+#   search_providers → category: search
+#   translation_providers → category: translation
+#
+# capabilities flags (comma-separated in DB):
+#   multi_group      — user may create multiple groups under one provider
+#   custom_base_url  — user may change base_url
+#   has_models       — group has a model list (seeded from default_models)
+#   api_key_required — api_key must not be empty
+#
+# model type values align with runtime_models.yaml role keys / lazyllm multimodal types:
+#   llm, evo_llm, vlm, embed_main, embed_image, reranker,
+#   tts, stt, text2image, image_editing, text2video
+#
+# base_url rules:
+#   - Provider-level base_url must end with '/'.
+#   - Model-level base_url is not supported; all models inherit the provider's base_url.
+#
+# verified-free automatic selection:
+#   free_auto_select_priority — positive integer; lower wins within the same runtime slot.
+#                               Set only for models verified as zero-cost, not trial-credit models.
+#   free_auto_select_base_urls — optional endpoint allow-list for endpoint-specific free models.
+#                                Omit when the preference applies to every seeded endpoint.
+
+translation_providers:
+  capabilities: [api_key_required]
+  suppliers:
+    - name: Tencent Translation
+      description:
+        zh-CN: |
+          腾讯云机器翻译，用于知识库文档预览中的划词翻译。腾讯云暂不提供适用于此场景的用户 OAuth 授权，需要配置 SecretId 和 SecretKey。
+
+          开通和配置：
+
+          1. 访问 https://console.cloud.tencent.com/tmt ，登录并开通机器翻译服务。
+
+          2. 访问 https://console.cloud.tencent.com/cam/capi ，新建或查看 API 密钥。建议为 LazyMind 创建独立的子用户密钥，并只授予机器翻译所需权限。
+
+          3. 将 SecretId 和 SecretKey 填入下方。凭据会加密保存在 LazyMind 后端，不会发送到文档预览页。
+        en-US: |
+          Tencent Cloud Machine Translation powers selection translation in knowledge-base document previews. Tencent Cloud does not offer an end-user OAuth flow for this use case, so a SecretId and SecretKey are required.
+
+          Setup:
+
+          1. Open https://console.cloud.tencent.com/tmt, sign in, and enable Machine Translation.
+
+          2. Open https://console.cloud.tencent.com/cam/capi and create or view an API credential. Prefer a dedicated CAM sub-user with only the permissions required for Machine Translation.
+
+          3. Enter the SecretId and SecretKey below. LazyMind encrypts them on the server and never sends them to the document preview page.
+      base_url: "https://tmt.tencentcloudapi.com/"
+
+model_providers:
+  capabilities: [multi_group, custom_base_url, has_models]
+  suppliers:
+    - name: Claude
+      description:
+        zh-CN: |
+          Anthropic 打造的顶尖 AI 基座，具备强大的自适应思考能力与原生视觉支持，在代码开发与复杂 Agent 任务上业界领先。
+
+          获取 API Key：
+          https://console.anthropic.com/settings/keys
+
+          申请教程：
+
+          1. 访问 Anthropic Console，使用海外邮箱或 Google 账号直接注册。
+
+          2. 登录后（需验证海外手机号并绑定外币信用卡结算），进入左侧菜单的 Settings → API Keys 页面。
+
+          3. 点击 Create Key，输入辨识名称后即可生成，请务必当场复制并妥善保存（关闭弹窗后无法再次查看完整 Key）。
+        en-US: |
+          Anthropic's flagship AI platform offers adaptive reasoning and native vision capabilities, with industry-leading performance for coding and complex agent tasks.
+
+          Get an API key:
+          https://console.anthropic.com/settings/keys
+
+          Setup:
+
+          1. Register for Anthropic Console with an email address or Google account.
+
+          2. Complete account verification and billing, then open Settings → API Keys.
+
+          3. Click Create Key, name the key, and copy it immediately because the full key is shown only once.
+      base_url: "https://api.anthropic.com/v1/"
+      models:
+        - name: claude-haiku-4-5
+          type: vlm
+        - name: claude-opus-4-7
+          type: vlm
+        - name: claude-sonnet-4-6
+          type: vlm
+
+    - name: DeepSeek
+      description:
+        zh-CN: |
+          国产顶尖大模型，推理模型性价比极高，支持深度推理与长链思考输出。
+
+          获取 API Key：
+          https://platform.deepseek.com/api_keys
+
+          申请教程：
+
+          1. 访问 DeepSeek 开放平台，使用手机号或邮箱完成注册。
+
+          2. 登录后进入左侧导航栏的 API Keys 页面，点击"创建 API Key"。
+
+          3. 为 Key 命名后点击创建，系统会生成一串密钥，请复制并妥善保存至你的代码配置中。
+        en-US: |
+          DeepSeek provides high-value reasoning models with support for deep reasoning and long chain-of-thought workloads.
+
+          Get an API key:
+          https://platform.deepseek.com/api_keys
+
+          Setup:
+
+          1. Register on the DeepSeek platform with a phone number or email address.
+
+          2. Open API Keys in the left navigation and click Create API Key.
+
+          3. Name the key, create it, and copy it to a secure location for use in your configuration.
+      base_url: "https://api.deepseek.com/"
+      models:
+        - name: deepseek-v4-flash
+          type: llm
+        - name: deepseek-v4-pro
+          type: llm
+
+    - name: Doubao
+      description:
+        zh-CN: |
+          字节跳动火山引擎出品，旗舰模型深度思考能力极强，全面覆盖复杂推理、代码开发及高精度文生图等多模态场景。
+
+          获取 API Key 指南：
+
+          访问 火山方舟
+
+          一站式大模型服务平台 https://www.volcengine.com/product/ark，点击 【立即体验】 并登录。
+
+          点击页面右上角的 【控制台】。
+
+          在左侧导航栏中找到并点击 【API-Key 管理】 即可进行配置与创建。
+        en-US: |
+          Doubao by ByteDance Volcano Engine covers complex reasoning, coding, and high-quality text-to-image workloads across multimodal scenarios.
+
+          Get an API key:
+
+          Visit Volcano Ark at https://www.volcengine.com/product/ark, click Try Now, and sign in.
+
+          Open Console in the upper-right corner.
+
+          Select API Key Management from the left navigation to create and configure a key.
+      base_url: "https://ark.cn-beijing.volces.com/api/v3/"
+      models:
+        - name: deepseek-r1-250528
+          type: llm
+        - name: deepseek-v3-1-terminus
+          type: llm
+        - name: deepseek-v3-2-251201
+          type: llm
+        - name: deepseek-v3-250324
+          type: llm
+        - name: doubao-1-5-lite-32k-250115
+          type: llm
+        - name: doubao-1-5-pro-32k-250115
+          type: llm
+        - name: doubao-1-5-pro-32k-character-250228
+          type: llm
+        - name: doubao-1-5-pro-32k-character-250715
+          type: llm
+        - name: doubao-1-5-vision-pro-32k-250115
+          type: vlm
+        - name: doubao-embedding-text-240715
+          type: embed
+        - name: doubao-embedding-vision-241215
+          type: cross_modal_embed
+        - name: doubao-seed-1-6-250615
+          type: llm
+        - name: doubao-seed-1-6-251015
+          type: llm
+        - name: doubao-seed-1-6-flash-250828
+          type: llm
+        - name: doubao-seed-1-6-vision-250815
+          type: vlm
+        - name: doubao-seed-1-8-251228
+          type: llm
+        - name: doubao-seed-2-0-code-preview-260215
+          type: llm
+        - name: doubao-seed-2-0-lite-260215
+          type: llm
+        - name: doubao-seed-2-0-mini-260215
+          type: llm
+        - name: doubao-seed-2-0-pro-260215
+          type: llm
+        - name: doubao-seed-code-preview-251028
+          type: llm
+        - name: doubao-seedream-5-0-pro-260628
+          type: image_editing
+        - name: doubao-seedream-5-0-260128
+          type: image_editing
+        - name: doubao-seedream-4-5-251128
+          type: image_editing
+        - name: doubao-seedream-4-0-250828
+          type: image_editing
+        - name: doubao-seedream-3-0-t2i-250415
+          type: text2image
+        - name: doubao-seedance-2-0
+          type: text2video
+        - name: doubao-seedance-2-0-fast
+          type: text2video
+        - name: doubao-seedance-2-0-mini
+          type: text2video
+        - name: doubao-seedance-1-5-pro-251215
+          type: text2video
+        - name: doubao-seedance-1-0-pro-250528
+          type: text2video
+        - name: doubao-seedance-1-0-pro-fast-251015
+          type: text2video
+        - name: glm-4-7-251222
+          type: llm
+
+    - name: GLM
+      description:
+        zh-CN: |
+          清华出身的国产大模型，Coding 能力已对齐顶尖闭源模型，深度适配 Agent 工作流、工具调用与超长上下文解析。
+
+          获取 API Key：
+          https://open.bigmodel.cn/usercenter/apikeys
+
+          申请教程：
+
+          1. 访问智谱 AI 开放平台，使用手机号或微信扫码注册并实名。
+
+          2. 登录后进入右上角的"控制台"，在左侧菜单选择"API Keys"。
+
+          3. 点击"添加新的 API Key"，设置便于区分的名称，生成后复制完整的 Key 即可使用。
+        en-US: |
+          GLM offers strong coding, agent workflow, tool-calling, and long-context capabilities across its model family.
+
+          Get an API key:
+          https://open.bigmodel.cn/usercenter/apikeys
+
+          Setup:
+
+          1. Register and complete verification on the Zhipu AI platform.
+
+          2. Open Console and select API Keys from the left menu.
+
+          3. Click Add API Key, assign a recognizable name, and copy the generated key.
+      base_url: "https://open.bigmodel.cn/api/paas/v4/"
+      # Verified-free model source: https://docs.bigmodel.cn/cn/guide/start/model-overview
+      models:
+        - name: AutoGLM-Phone
+          type: vlm
+        - name: CharGLM-4
+          type: llm
+        - name: CodeGeeX-4
+          type: llm
+        - name: CogView-3-Flash
+          type: text2image
+          free_auto_select_priority: 1
+        - name: CogView-4
+          type: text2image
+        - name: Embedding-2
+          type: embed
+        - name: Embedding-3
+          type: embed
+        - name: GLM-4-Flash-250414
+          type: llm
+          free_auto_select_priority: 3
+        - name: GLM-4-FlashX-250414
+          type: llm
+        - name: GLM-4-Long
+          type: llm
+        - name: GLM-4-Voice
+          type: tts
+        - name: GLM-4.1V-Thinking-Flash
+          type: vlm
+          free_auto_select_priority: 2
+        - name: GLM-4.1V-Thinking-FlashX
+          type: vlm
+        - name: GLM-4.5-Air
+          type: llm
+        - name: GLM-4.5-AirX
+          type: llm
+        - name: GLM-4.5-Flash
+          type: llm
+          free_auto_select_priority: 2
+        - name: GLM-4.6
+          type: llm
+        - name: GLM-4.6V
+          type: vlm
+        - name: GLM-4.6V-Flash
+          type: vlm
+          free_auto_select_priority: 1
+        - name: GLM-4.7
+          type: llm
+        - name: GLM-4.7-Flash
+          type: llm
+          free_auto_select_priority: 1
+        - name: GLM-4.7-FlashX
+          type: llm
+        - name: GLM-4V-Flash
+          type: vlm
+          free_auto_select_priority: 3
+        - name: GLM-5
+          type: llm
+        - name: GLM-5-Turbo
+          type: llm
+        - name: GLM-5.1
+          type: llm
+        - name: GLM-5V-Turbo
+          type: vlm
+        - name: GLM-ASR-2512
+          type: stt
+        - name: GLM-Image
+          type: text2image
+        - name: GLM-TTS
+          type: tts
+        - name: GLM-TTS-Clone
+          type: tts
+        - name: Rerank
+          type: rerank
+
+    - name: Kimi
+      description:
+        zh-CN: |
+          Moonshot AI 出品，支持超长上下文推理，Agentic Coding 与长周期执行能力出众，中英文处理极佳。
+
+          获取 API Key：
+          https://platform.moonshot.cn/console/api-keys
+
+          申请教程：
+
+          1. 访问 Kimi 开放平台（Moonshot 开发者中心），使用手机号验证注册。
+
+          2. 登录后在左侧导航栏选择"API Key 管理"页面。
+
+          3. 点击"新建 API Key"，输入名称后点击生成，请当场复制这段密钥并安全保存。
+        en-US: |
+          Kimi by Moonshot AI supports ultra-long-context reasoning, agentic coding, long-running tasks, and strong Chinese and English processing.
+
+          Get an API key:
+          https://platform.moonshot.cn/console/api-keys
+
+          Setup:
+
+          1. Register on the Moonshot developer platform and complete phone verification.
+
+          2. Select API Key Management from the left navigation.
+
+          3. Click New API Key, enter a name, and securely copy the generated key.
+      base_url: "https://api.moonshot.cn/"
+      models:
+        - name: kimi-k2-0711-preview
+          type: llm
+        - name: kimi-k2-0905-preview
+          type: llm
+        - name: kimi-k2-thinking
+          type: llm
+        - name: kimi-k2-thinking-turbo
+          type: llm
+        - name: kimi-k2-turbo-preview
+          type: llm
+        - name: kimi-k2.5
+          type: vlm
+        - name: kimi-k2.6
+          type: vlm
+        - name: moonshot-v1-128k
+          type: llm
+        - name: moonshot-v1-128k-vision-preview
+          type: vlm
+        - name: moonshot-v1-32k
+          type: llm
+        - name: moonshot-v1-32k-vision-preview
+          type: vlm
+        - name: moonshot-v1-8k
+          type: llm
+        - name: moonshot-v1-8k-vision-preview
+          type: vlm
+
+    - name: Minimax
+      description:
+        zh-CN: |
+          MiniMax 自研的通用大模型，开启模型自我迭代，在文本对话、超拟人语音合成及视频生成领域稳居第一梯队。
+
+          获取 API Key：
+          https://platform.minimaxi.com/
+
+          申请教程：
+
+          1. 访问 MiniMax 开放平台主页，点击右上角登录/注册开发者账号。
+
+          2. 登录后进入后台工作台，在左侧导航栏找到 "账户管理"，点击展开后选择 "接口密钥"（或者"订阅管理"下的 Token Plan）。
+
+          3. 点击"创建新的 API Key"，设置名称并确认后，复制生成的 API Key 用于接口调用（请注意按量付费 Key 和 Token Plan Key 不互通）。
+        en-US: |
+          MiniMax provides general-purpose models for text conversations, natural speech synthesis, image generation, and other multimodal workloads.
+
+          Get an API key:
+          https://platform.minimaxi.com/
+
+          Setup:
+
+          1. Sign in to or register for a developer account on the MiniMax platform.
+
+          2. Open Account Management → API Keys, or Token Plan under Subscription Management.
+
+          3. Create and name a key, then copy it for API calls. Pay-as-you-go and Token Plan keys are not interchangeable.
+      base_url: "https://api.minimaxi.com/v1/"
+      models:
+        - name: M2-her
+          type: llm
+        - name: MiniMax-M2.5
+          type: llm
+        - name: MiniMax-M2.5-highspeed
+          type: llm
+        - name: MiniMax-M2.7
+          type: llm
+        - name: MiniMax-M2.7-highspeed
+          type: llm
+        - name: Speech-02-HD
+          type: tts
+        - name: Speech-02-Turbo
+          type: tts
+        - name: Speech-2.6-HD
+          type: tts
+        - name: Speech-2.6-Turbo
+          type: tts
+        - name: Speech-2.8-HD
+          type: tts
+        - name: Speech-2.8-Turbo
+          type: tts
+        - name: image-01
+          type: image_editing
+        - name: image-01-live
+          type: image_editing
+
+    - name: OpenAI
+      description:
+        zh-CN: |
+          AI 行业绝对标杆，引领智能前沿，在复杂编码、专业工作流与子代理生态上最为完善。
+
+          获取 API Key：
+          https://platform.openai.com/api-keys
+
+          申请教程：
+
+          1. 访问 OpenAI Platform，使用邮箱或 Google 账号注册（需具备海外网络环境及海外手机号验证）。
+
+          2. 在左侧 Dashboard 菜单中选择"API keys"选项卡（需先在 Billing 中绑定海外信用卡并充值）。
+
+          3. 点击"Create new secret key"，为 Key 命名并配置权限，点击生成后立刻复制（该密钥仅显示一次）。
+        en-US: |
+          OpenAI provides leading models for complex coding, professional workflows, multimodal applications, and agent ecosystems.
+
+          Get an API key:
+          https://platform.openai.com/api-keys
+
+          Setup:
+
+          1. Register on OpenAI Platform with an email address or Google account.
+
+          2. Configure billing, then open API keys from the Dashboard.
+
+          3. Click Create new secret key, configure its name and permissions, and copy it immediately because it is displayed only once.
+      base_url: "https://api.openai.com/v1/"
+      models:
+        - name: gpt-4.1
+          type: vlm
+        - name: gpt-4.1-mini
+          type: vlm
+        - name: gpt-4o-mini
+          type: vlm
+        - name: gpt-4o-mini-transcribe
+          type: stt
+        - name: gpt-4o-transcribe
+          type: stt
+        - name: gpt-5
+          type: vlm
+        - name: gpt-5-mini
+          type: vlm
+        - name: gpt-5-nano
+          type: vlm
+        - name: gpt-5-pro
+          type: vlm
+        - name: gpt-5.1
+          type: vlm
+        - name: gpt-5.2
+          type: vlm
+        - name: gpt-5.2-pro
+          type: vlm
+        - name: gpt-5.4
+          type: vlm
+        - name: gpt-5.4-mini
+          type: vlm
+        - name: gpt-5.4-nano
+          type: vlm
+        - name: gpt-5.4-pro
+          type: vlm
+        - name: gpt-5.5
+          type: vlm
+        - name: gpt-5.5-pro
+          type: vlm
+        - name: gpt-image-1.5
+          type: image_editing
+        - name: gpt-image-2
+          type: image_editing
+        - name: o3
+          type: vlm
+        - name: rerank-multilingual-v3.0
+          type: rerank
+        - name: text-embedding-3-large
+          type: embed
+        - name: text-embedding-3-small
+          type: embed
+        - name: text-embedding-ada-002
+          type: embed
+        - name: tts-1
+          type: tts
+        - name: tts-1-hd
+          type: tts
+        - name: whisper-1
+          type: stt
+
+    - name: OpenRouter
+      description:
+        zh-CN: |
+          OpenRouter 通过统一的 OpenAI 兼容接口接入多家模型供应商，支持使用同一个 API Key 切换不同厂商和路由模型。
+
+          获取 API Key：
+          https://openrouter.ai/settings/keys
+
+          模型名称使用 OpenRouter 的完整模型 ID。openrouter/free 只路由到免费模型并支持按请求筛选视觉能力；openrouter/auto 可能选择收费模型。也可以在连接分组中添加 OpenRouter 模型目录里的其他模型。
+
+          内置清单覆盖 OpenAI、Anthropic、Google、DeepSeek、通义千问、智谱 GLM、Kimi、Grok、MiniMax 和 NVIDIA 等常用模型，并包含多款支持工具调用的免费模型，以及图片、视频、语音合成和语音识别模型。
+        en-US: |
+          OpenRouter provides one OpenAI-compatible API for models from multiple providers, allowing model and router selection with a single API key.
+
+          Get an API key:
+          https://openrouter.ai/settings/keys
+
+          Use the complete OpenRouter model ID. openrouter/free routes only to free models and filters for vision support when needed; openrouter/auto may select paid models. Other models from the OpenRouter catalog can be added to the connection group.
+
+          The built-in catalog covers popular models from OpenAI, Anthropic, Google, DeepSeek, Qwen, Z.AI GLM, Kimi, Grok, MiniMax, and NVIDIA, including several free models with tool-calling support plus image, video, text-to-speech, and speech-to-text models.
+      base_url: "https://openrouter.ai/api/v1/"
+      models:
+        - name: z-ai/glm-5.3-flash
+          type: llm
+          free_auto_select_priority: 1
+        - name: z-ai/glm-5.3
+          type: llm
+        - name: deepseek/deepseek-v4-pro
+          type: llm
+        - name: nvidia/nemotron-3.5-lightning:free
+          type: llm
+        - name: z-ai/glm-5.2:free
+          type: llm
+        - name: openrouter/free
+          type: vlm
+          free_auto_select_priority: 1
+        - name: openrouter/auto
+          type: vlm
+        - name: openai/gpt-5.6-sol
+          type: vlm
+        - name: anthropic/claude-sonnet-5
+          type: vlm
+        - name: google/gemini-3.7-flash
+          type: vlm
+        - name: x-ai/grok-4.6
+          type: vlm
+        - name: qwen/qwen3.8-max
+          type: vlm
+        - name: qwen/qwen3.8-flash
+          type: vlm
+        - name: moonshotai/kimi-k3
+          type: vlm
+        - name: minimax/minimax-m3
+          type: vlm
+        - name: minimax/minimax-m3:free
+          type: vlm
+        - name: deepseek/deepseek-v4-flash-vision-exp
+          type: vlm
+        - name: thinkingmachines/inkling:free
+          type: vlm
+        - name: liquid/lfm-2.5-embedding-350m:free
+          type: embed
+          free_auto_select_priority: 1
+        - name: bytedance-seed/seedream-4.5
+          type: text2image
+        - name: bytedance-seed/seedream-5-0-lite
+          type: text2image
+        - name: bytedance-seed/seedream-5-0-pro
+          type: text2image
+        - name: x-ai/grok-imagine-image-2.0
+          type: text2image
+        - name: qwen/qwen-image-3-pro
+          type: text2image
+        - name: openai/gpt-image-2
+          type: text2image
+        - name: alibaba/wan-3.0
+          type: text2video
+        - name: bytedance/seedance-2.0-mini
+          type: text2video
+        - name: bytedance/seedance-2.5
+          type: text2video
+        - name: black-forest-labs/flux-3-video
+          type: text2video
+        - name: runway/gen-4.5
+          type: text2video
+        - name: deepgram/flux-tts:free
+          type: tts
+        - name: fish-audio/s2.1-pro
+          type: tts
+        - name: microsoft/mai-voice-2-flash
+          type: tts
+        - name: qwen/qwen-audio-3.0-tts-flash
+          type: tts
+        - name: mistralai/voxtral-mini-tts-2603
+          type: tts
+        - name: openai/whisper-large-v3
+          type: stt
+        - name: openai/whisper-large-v3-turbo
+          type: stt
+        - name: mistralai/voxtral-small-24b-2507-stt
+          type: stt
+        - name: qwen/qwen3-asr-1.7b
+          type: stt
+        - name: deepgram/nova-3
+          type: stt
+
+    - name: Qwen
+      description:
+        zh-CN: |
+          阿里云开源与闭源双轨并行的王牌模型，全家桶覆盖文本、视觉、语音、图像编辑及视频生成，国内生态最为丰富，API 调用极其便捷。
+
+          获取 API Key：
+          https://bailian.console.aliyun.com/?apiKey=1#/api-key
+
+          申请教程：
+
+          1. 访问阿里云百炼控制台，使用阿里云账号（支持支付宝/钉钉扫码）登录并开通百炼服务。
+
+          2. 在控制台右上角点击头像，进入"API-KEY"管理页面。
+
+          3. 点击"创建 API-KEY"，系统会立即生成一串鉴权密钥，点击复制即可在应用中使用。
+        en-US: |
+          Qwen by Alibaba Cloud provides open and commercial models spanning text, vision, speech, embeddings, image editing, and video generation.
+
+          Get an API key:
+          https://bailian.console.aliyun.com/?apiKey=1#/api-key
+
+          Setup:
+
+          1. Sign in to Alibaba Cloud Bailian and activate the service.
+
+          2. Open API-KEY Management from the account menu in the upper-right corner.
+
+          3. Click Create API-KEY and copy the generated credential for use in your application.
+      base_url: "https://dashscope.aliyuncs.com/"
+      models:
+        - name: Fun-ASR
+          type: stt
+        - name: Gummy
+          type: stt
+        - name: SenseVoice
+          type: stt
+        - name: cosyvoice-v1
+          type: tts
+        - name: cosyvoice-v2
+          type: tts
+        - name: gte-rerank-v2
+          type: rerank
+        - name: multimodal-embedding-v1
+          type: cross_modal_embed
+        - name: paraformer-v2
+          type: stt
+        - name: qvq-72b-preview
+          type: vlm
+        - name: qvq-max
+          type: vlm
+        - name: qvq-plus
+          type: vlm
+        - name: qwen-audio-turbo
+          type: stt
+        - name: qwen-flash
+          type: llm
+        - name: qwen-flash-2025-07-28
+          type: llm
+        - name: qwen-long
+          type: llm
+        - name: qwen-max
+          type: llm
+        - name: qwen-plus
+          type: llm
+        - name: qwen-plus-2025-12-01
+          type: llm
+        - name: qwen-tts
+          type: tts
+        - name: qwen-turbo
+          type: llm
+        - name: qwen-vl-max
+          type: vlm
+        - name: qwen-vl-ocr
+          type: vlm
+        - name: qwen-vl-plus
+          type: vlm
+        - name: qwen2.5-0.5b-instruct
+          type: llm
+        - name: qwen2.5-1.5b-instruct
+          type: llm
+        - name: qwen2.5-14b-instruct
+          type: llm
+        - name: qwen2.5-14b-instruct-1m
+          type: llm
+        - name: qwen2.5-32b-instruct
+          type: llm
+        - name: qwen2.5-3b-instruct
+          type: llm
+        - name: qwen2.5-72b-instruct
+          type: llm
+        - name: qwen2.5-7b-instruct
+          type: llm
+        - name: qwen2.5-7b-instruct-1m
+          type: llm
+        - name: qwen2.5-vl-embedding
+          type: cross_modal_embed
+        - name: qwen3-0.6b
+          type: llm
+        - name: qwen3-1.7b
+          type: llm
+        - name: qwen3-14b
+          type: llm
+        - name: qwen3-235b-a22b
+          type: llm
+        - name: qwen3-235b-a22b-instruct-2507
+          type: llm
+        - name: qwen3-235b-a22b-thinking-2507
+          type: llm
+        - name: qwen3-30b-a3b
+          type: llm
+        - name: qwen3-30b-a3b-instruct-2507
+          type: llm
+        - name: qwen3-30b-a3b-thinking-2507
+          type: llm
+        - name: qwen3-32b
+          type: llm
+        - name: qwen3-4b
+          type: llm
+        - name: qwen3-8b
+          type: llm
+        - name: qwen3-asr-flash
+          type: stt
+        - name: qwen3-next-80b-a3b-instruct
+          type: llm
+        - name: qwen3-next-80b-a3b-thinking
+          type: llm
+        - name: qwen3-rerank
+          type: rerank
+        - name: qwen3-vl-embedding
+          type: cross_modal_embed
+        - name: qwen3-vl-flash
+          type: vlm
+        - name: qwen3-vl-flash-us
+          type: vlm
+        - name: qwen3-vl-plus
+          type: vlm
+        - name: qwen3-vl-rerank
+          type: rerank
+        - name: qwen3.5-122b-a10b
+          type: vlm
+        - name: qwen3.5-27b
+          type: vlm
+        - name: qwen3.5-35b-a3b
+          type: vlm
+        - name: qwen3.5-397b-a17b
+          type: vlm
+        - name: qwen3.5-4b
+          type: vlm
+        - name: qwen3.5-9b
+          type: vlm
+        - name: qwen3.5-flash
+          type: vlm
+        - name: qwen3.5-plus
+          type: vlm
+        - name: qwen3.6-27b
+          type: vlm
+        - name: qwen3.6-35b-a3b
+          type: vlm
+        - name: qwen3.6-flash
+          type: vlm
+        - name: qwen3.6-max-preview
+          type: llm
+        - name: qwen3.6-plus
+          type: vlm
+        - name: qwq-32b
+          type: llm
+        - name: qwq-32b-preview
+          type: llm
+        - name: qwq-plus
+          type: llm
+        - name: sambert
+          type: tts
+        - name: sensevoice-small
+          type: stt
+        - name: text-embedding-async-v1
+          type: embed
+        - name: text-embedding-async-v2
+          type: embed
+        - name: text-embedding-v1
+          type: embed
+        - name: text-embedding-v2
+          type: embed
+        - name: text-embedding-v3
+          type: embed
+        - name: text-embedding-v4
+          type: embed
+        - name: tongyi-embedding-vision-flash
+          type: cross_modal_embed
+        - name: tongyi-embedding-vision-flash-2026-03-06
+          type: cross_modal_embed
+        - name: tongyi-embedding-vision-plus
+          type: cross_modal_embed
+        - name: tongyi-embedding-vision-plus-2026-03-06
+          type: cross_modal_embed
+        - name: wan2.6-t2i
+          type: text2image
+        - name: wan3.0-video
+          type: text2video
+        - name: wan3.0-video-prime
+          type: text2video
+        - name: wan2.6-t2v
+          type: text2video
+        - name: wan2.6-i2v
+          type: text2video
+        - name: wan2.6-i2v-flash
+          type: text2video
+        - name: wanx2.1-t2i-pro
+          type: text2image
+        - name: wanx2.1-t2i-turbo
+          type: text2image
+        - name: qwen-image-2.0-pro
+          type: image_editing
+        - name: qwen-image-2.0-pro-2026-04-22
+          type: image_editing
+        - name: qwen-image-2.0-pro-2026-03-03
+          type: image_editing
+        - name: qwen-image-2.0
+          type: image_editing
+        - name: qwen-image-2.0-2026-03-03
+          type: image_editing
+        - name: qwen-image-max
+          type: text2image
+        - name: qwen-image-max-2025-12-30
+          type: text2image
+        - name: qwen-image-plus
+          type: text2image
+        - name: qwen-image-plus-2026-01-09
+          type: text2image
+        - name: qwen-image
+          type: text2image
+        - name: z-image-turbo
+          type: text2image
+        - name: wan2.5-t2i-preview
+          type: text2image
+        - name: wan2.2-t2i-plus
+          type: text2image
+        - name: wan2.2-t2i-flash
+          type: text2image
+        - name: wanx2.1-t2i-plus
+          type: text2image
+        - name: wanx2.0-t2i-turbo
+          type: text2image
+        - name: wanx-v1
+          type: text2image
+        - name: qwen-image-edit-max
+          type: image_editing
+        - name: qwen-image-edit-max-2026-01-16
+          type: image_editing
+        - name: qwen-image-edit-plus
+          type: image_editing
+        - name: qwen-image-edit-plus-2025-12-15
+          type: image_editing
+        - name: qwen-image-edit-plus-2025-10-30
+          type: image_editing
+        - name: qwen-image-edit
+          type: image_editing
+        - name: wan2.7-image-pro
+          type: image_editing
+        - name: wan2.7-image
+          type: image_editing
+        - name: wan2.6-image
+          type: image_editing
+        - name: wan2.5-i2i-preview
+          type: image_editing
+        - name: wanx2.1-imageedit
+          type: image_editing
+        - name: wanx-sketch-to-image-lite
+          type: image_editing
+        - name: wanx-style-repaint-v1
+          type: image_editing
+        - name: wanx-background-generation-v2
+          type: image_editing
+        - name: image-out-painting
+          type: image_editing
+
+    - name: SenseNova
+      description:
+        zh-CN: |
+          商汤科技打造的国产重磅基座，深度推理与多模态理解能力出色，综合性能强悍。
+
+          官网（注册 & 获取 API Key）：
+          - 经典模式官网：https://console.sensecore.cn/cn-sh-01/aistudio/management/api-key
+          - Token Plan模式官网：https://platform.sensenova.cn/
+
+          配置时提供两个 Base URL 可选：
+          - 经典模式：https://api.sensenova.cn/compatible-mode/v1/
+          - Token Plan 模式：https://token.sensenova.cn/v1/chat/completions/
+
+          申请教程1（经典）：
+
+          1. 访问商汤大模型开放平台（https://console.sensecore.cn/），注册并完成企业或个人开发者认证。
+
+          2. 登录控制台，在左侧导航栏找到"API-Key管理"。
+
+          3. 点击"创建API-Key"，自定义名称后即可生成，复制该 API Key 即可进行模型调用。
+
+          申请教程2（Token Plan）：
+
+          1. 访问商汤日日新官网（https://platform.sensenova.cn/），手机号完成注册。
+
+          2. 登录控制台，在左侧导航栏找到"API-Keys"。
+
+          3. 点击"创建 API Key"，输入名称后生成，复制该 API Key 即可进行模型调用。
+        en-US: |
+          SenseNova by SenseTime provides strong deep-reasoning and multimodal-understanding capabilities.
+
+          Register and get an API key:
+          - Classic mode: https://console.sensecore.cn/cn-sh-01/aistudio/management/api-key
+          - Token Plan mode: https://platform.sensenova.cn/
+
+          Available Base URLs:
+          - Classic mode: https://api.sensenova.cn/compatible-mode/v1/
+          - Token Plan mode: https://token.sensenova.cn/v1/chat/completions/
+
+          For classic mode, register and complete developer verification, open API Key Management, and create a named key.
+
+          For Token Plan mode, register at the SenseNova platform, open API Keys, and create a named key.
+
+      base_url: "https://api.sensenova.cn/compatible-mode/v1/"
+      models:
+        - name: SenseChat-5
+          type: llm
+        - name: DeepSeek-R1
+          type: llm
+        - name: DeepSeek-R1-Distill-Qwen-14B
+          type: llm
+        - name: DeepSeek-R1-Distill-Qwen-32B
+          type: llm
+        - name: DeepSeek-V3
+          type: llm
+        - name: Llama3-70B
+          type: llm
+        - name: Llama3-8B
+          type: llm
+        - name: Qwen2-72B
+          type: llm
+        - name: Qwen2-7B
+          type: llm
+        - name: Qwen3-235B
+          type: llm
+        - name: Qwen3-32B
+          type: llm
+        - name: SenseChat
+          type: llm
+        - name: SenseChat-128K
+          type: llm
+        - name: SenseChat-32K
+          type: llm
+        - name: SenseChat-5-Cantonese
+          type: llm
+        - name: SenseChat-Character
+          type: llm
+        - name: SenseChat-Character-Pro
+          type: llm
+        - name: SenseChat-Turbo
+          type: llm
+        - name: SenseChat-Vision
+          type: vlm
+        - name: SenseNova-V6-5-Pro
+          type: vlm
+        - name: SenseNova-V6-5-Turbo
+          type: vlm
+        - name: SenseNova-V6-Pro
+          type: vlm
+        - name: SenseNova-V6-Reasoner
+          type: vlm
+        - name: SenseNova-V6-Turbo
+          type: vlm
+        - name: nova-embedding-stable
+          type: embed
+        - name: deepseek-v4-flash
+          type: llm
+        - name: glm-5.2
+          type: llm
+        # Token Plan is free during public beta: https://platform.sensenova.cn/
+        - name: sensenova-6.7-flash-lite
+          type: llm
+          free_auto_select_priority: 1
+          free_auto_select_base_urls: ["https://token.sensenova.cn/v1/chat/completions/"]
+        - name: sensenova-u1-fast
+          type: text2image
+          free_auto_select_priority: 1
+          free_auto_select_base_urls: ["https://token.sensenova.cn/v1/chat/completions/"]
+        - name: sensenova-u1.5-lite
+          type: image_editing
+          free_auto_select_priority: 2
+          free_auto_select_base_urls: ["https://token.sensenova.cn/v1/chat/completions/"]
+
+    - name: SiliconFlow
+      description:
+        zh-CN: |
+          极致高效的模型 API 聚合加速平台，提供一站式、高并发调用服务，价格极其优惠。
+
+          获取 API Key：
+          https://cloud.siliconflow.cn/account/ak
+
+          申请教程：
+
+          1. 访问 SiliconFlow 云平台，使用手机号、微信或邮箱注册账号。
+
+          2. 登录控制台，在左侧菜单栏中点击"API 密钥"选项。
+
+          3. 点击"新建 API 密钥"，输入自定义名称描述，生成后一键复制，即可轻松接入各大开源旗舰模型。
+        en-US: |
+          SiliconFlow is a high-throughput model API platform that provides unified access to a broad range of open-source models.
+
+          Get an API key:
+          https://cloud.siliconflow.cn/account/ak
+
+          Setup:
+
+          1. Register on SiliconFlow Cloud with a phone number, WeChat, or email address.
+
+          2. Open API Keys from the console's left menu.
+
+          3. Click New API Key, enter a recognizable name, and copy the generated key.
+      base_url: "https://api.siliconflow.cn/v1/"
+      # Verified-free model source: https://siliconflow.cn/pricing
+      models:
+        - name: Wan-AI/Wan2.2-T2V-A14B
+          type: text2video
+        - name: Wan-AI/Wan2.2-I2V-A14B
+          type: text2video
+        - name: deepseek-ai/DeepSeek-V4-Flash
+          type: llm
+          free_auto_select_priority: 1
+        - name: THUDM/GLM-Z1-9B-0414
+          type: llm
+        - name: Pro/moonshotai/Kimi-K2.6
+          type: vlm
+        - name: Pro/zai-org/GLM-5.1
+          type: llm
+        - name: MiniMaxAI/MiniMax-M2.5
+          type: llm
+        - name: Pro/MiniMaxAI/MiniMax-M2.5
+          type: llm
+        - name: Pro/zai-org/GLM-5
+          type: llm
+        - name: Pro/deepseek-ai/DeepSeek-V3.2
+          type: llm
+        - name: Pro/moonshotai/Kimi-K2.5
+          type: vlm
+        - name: Pro/zai-org/GLM-4.7
+          type: llm
+        - name: deepseek-ai/DeepSeek-V3.2
+          type: llm
+        - name: Pro/deepseek-ai/DeepSeek-V3.1-Terminus
+          type: llm
+        - name: deepseek-ai/DeepSeek-V3.1-Terminus
+          type: llm
+        - name: Qwen/Qwen3.6-35B-A3B
+          type: vlm
+        - name: Qwen/Qwen3.6-27B
+          type: vlm
+        - name: Qwen/Qwen3.5-397B-A17B
+          type: vlm
+        - name: Qwen/Qwen3.5-122B-A10B
+          type: vlm
+        - name: Qwen/Qwen3.5-35B-A3B
+          type: vlm
+        - name: Qwen/Qwen3.5-27B
+          type: vlm
+        - name: Qwen/Qwen3.5-9B
+          type: vlm
+        - name: Qwen/Qwen3.5-4B
+          type: vlm
+          free_auto_select_priority: 1
+        - name: deepseek-ai/DeepSeek-R1
+          type: llm
+        - name: Pro/deepseek-ai/DeepSeek-R1
+          type: llm
+        - name: deepseek-ai/DeepSeek-V3
+          type: llm
+        - name: Pro/deepseek-ai/DeepSeek-V3
+          type: llm
+        - name: stepfun-ai/Step-3.5-Flash
+          type: llm
+        - name: zai-org/GLM-4.6V
+          type: vlm
+        - name: moonshotai/Kimi-K2-Thinking
+          type: llm
+        - name: Pro/moonshotai/Kimi-K2-Thinking
+          type: llm
+        - name: zai-org/GLM-4.6
+          type: llm
+        - name: Qwen/Qwen3-VL-32B-Instruct
+          type: vlm
+        - name: Qwen/Qwen3-VL-32B-Thinking
+          type: vlm
+        - name: Qwen/Qwen3-VL-8B-Instruct
+          type: vlm
+        - name: Qwen/Qwen3-VL-8B-Thinking
+          type: vlm
+        - name: Qwen/Qwen3-VL-30B-A3B-Instruct
+          type: vlm
+        - name: Qwen/Qwen3-VL-30B-A3B-Thinking
+          type: vlm
+        - name: moonshotai/Kimi-K2-Instruct-0905
+          type: llm
+        - name: Pro/moonshotai/Kimi-K2-Instruct-0905
+          type: llm
+        - name: inclusionAI/Ling-flash-2.0
+          type: llm
+        - name: Qwen/Qwen3-Coder-30B-A3B-Instruct
+          type: llm
+        - name: Qwen/Qwen3-30B-A3B-Thinking-2507
+          type: llm
+        - name: Qwen/Qwen3-30B-A3B-Instruct-2507
+          type: llm
+        - name: Qwen/Qwen3-235B-A22B-Instruct-2507
+          type: llm
+        - name: THUDM/GLM-4.1V-9B-Thinking
+          type: vlm
+          free_auto_select_priority: 2
+        - name: tencent/Hunyuan-A13B-Instruct
+          type: llm
+        - name: deepseek-ai/DeepSeek-R1-0528-Qwen3-8B
+          type: llm
+          free_auto_select_priority: 3
+        - name: Qwen/Qwen3-32B
+          type: llm
+        - name: Qwen/Qwen3-14B
+          type: llm
+        - name: Qwen/Qwen3-8B
+          type: llm
+          free_auto_select_priority: 2
+        - name: ByteDance-Seed/Seed-OSS-36B-Instruct
+          type: llm
+        - name: zai-org/GLM-4.5V
+          type: vlm
+        - name: zai-org/GLM-4.5-Air
+          type: llm
+        - name: Qwen/Qwen2.5-72B-Instruct-128K
+          type: llm
+        - name: Qwen/Qwen2.5-72B-Instruct
+          type: llm
+        - name: Qwen/Qwen2.5-32B-Instruct
+          type: llm
+        - name: Qwen/Qwen2.5-14B-Instruct
+          type: llm
+        - name: Qwen/Qwen2.5-7B-Instruct
+          type: llm
+          free_auto_select_priority: 4
+        - name: Pro/Qwen/Qwen2.5-7B-Instruct
+          type: llm
+        - name: Qwen/Qwen3-VL-Embedding-8B
+          type: cross_modal_embed
+        - name: Qwen/Qwen3-Embedding-8B
+          type: embed
+        - name: Qwen/Qwen3-Embedding-4B
+          type: embed
+        - name: Qwen/Qwen3-Embedding-0.6B
+          type: embed
+        - name: BAAI/bge-m3
+          type: embed
+          free_auto_select_priority: 1
+        - name: BAAI/bge-large-zh-v1.5
+          type: embed
+          free_auto_select_priority: 2
+        - name: BAAI/bge-large-en-v1.5
+          type: embed
+        - name: netease-youdao/bce-embedding-base_v1
+          type: embed
+        - name: Pro/BAAI/bge-m3
+          type: embed
+        - name: Qwen/Qwen3-VL-Reranker-8B
+          type: rerank
+        - name: Qwen/Qwen3-Reranker-8B
+          type: rerank
+        - name: Qwen/Qwen3-Reranker-4B
+          type: rerank
+        - name: Qwen/Qwen3-Reranker-0.6B
+          type: rerank
+        - name: BAAI/bge-reranker-v2-m3
+          type: rerank
+        - name: netease-youdao/bce-reranker-base_v1
+          type: rerank
+        - name: Pro/BAAI/bge-reranker-v2-m3
+          type: rerank
+        - name: Qwen/Qwen-Image-Edit-2509
+          type: image_editing
+        - name: Qwen/Qwen-Image-Edit
+          type: image_editing
+        - name: Qwen/Qwen-Image
+          type: text2image
+        - name: Kwai-Kolors/Kolors
+          type: image_editing
+          free_auto_select_priority: 1
+        - name: fnlp/MOSS-TTSD-v0.5
+          type: tts
+        - name: FunAudioLLM/CosyVoice2-0.5B
+          type: tts
+        - name: FunAudioLLM/SenseVoiceSmall
+          type: stt
+        - name: TeleAI/TeleSpeechASR
+          type: stt
+
+ocr_providers:
+  capabilities: [custom_base_url]
+  suppliers:
+    - name: MinerU
+      description:
+        zh-CN: |
+          MinerU 是面向科研与企业的高精度文档解析服务，支持 PDF、Word、PPT 等多种格式，可精准提取文字、表格、公式与图片。
+
+          获取 API Key：
+          https://mineru.net/apiManage/token
+
+          申请教程：
+
+          1. 访问 MinerU 官网并注册账号。
+
+          2. 登录后进入控制台 → API 管理页面，点击"创建 Token"。
+
+          3. 复制生成的 Token 并妥善保存。
+        en-US: |
+          MinerU is a high-accuracy document parsing service for research and enterprise use. It extracts text, tables, formulas, and images from PDF, Word, PPT, and other formats.
+
+          Get an API key:
+          https://mineru.net/apiManage/token
+
+          Setup:
+
+          1. Register on the MinerU website.
+
+          2. Open Console → API Management and click Create Token.
+
+          3. Copy and securely store the generated token.
+      base_url: "https://mineru.net/api/v4/"
+    - name: PaddleOCR
+      description:
+        zh-CN: |
+          百度飞桨开源 OCR 引擎，支持中英文及多语言识别，可私有化部署，适合对数据安全有要求的场景。
+
+          获取 API Key：
+          https://aistudio.baidu.com/paddleocr
+
+          申请教程：
+
+          1. 访问 PaddleOCR 官网并注册账号。
+
+          2. 登录后进入控制台 → API 管理页面，点击"创建 Token"。
+
+          3. 复制生成的 Token 并妥善保存。
+        en-US: |
+          PaddleOCR is Baidu PaddlePaddle's open-source OCR engine. It supports Chinese, English, and multilingual recognition, including private deployments for data-sensitive workloads.
+
+          Get an API key:
+          https://aistudio.baidu.com/paddleocr
+
+          Setup:
+
+          1. Register on the PaddleOCR website.
+
+          2. Open Console → API Management and click Create Token.
+
+          3. Copy and securely store the generated token.
+      base_url: "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
+
+search_providers:
+  capabilities: []
+  suppliers:
+    - name: Google Custom Search
+      description:
+        zh-CN: |
+          Google Custom Search JSON API 基于 Programmable Search Engine 提供网页搜索能力，适合需要接入 Google 官方搜索结果的 Agent 工具。
+
+          获取 API Key：
+          https://developers.google.com/custom-search/v1/introduction
+
+          获取 Search Engine ID：
+          https://programmablesearchengine.google.com/
+
+          申请教程：
+
+          1. 在 Google Cloud Console 启用 Custom Search JSON API 并创建 API Key。
+
+          2. 在 Programmable Search Engine 控制台创建搜索引擎，复制 Search Engine ID。
+
+          3. 在云服务配置页分别填写 API Key 和 Search Engine ID。
+        en-US: |
+          Google Custom Search JSON API uses Programmable Search Engine to provide official Google web search results for agent tools.
+
+          Get an API key:
+          https://developers.google.com/custom-search/v1/introduction
+
+          Get a Search Engine ID:
+          https://programmablesearchengine.google.com/
+
+          Setup:
+
+          1. Enable Custom Search JSON API in Google Cloud Console and create an API key.
+
+          2. Create a Programmable Search Engine and copy its Search Engine ID.
+
+          3. Enter both values on the cloud service configuration page.
+      base_url: "https://customsearch.googleapis.com/customsearch/v1"
+    - name: Bocha
+      description:
+        zh-CN: |
+          博查搜索 API 面向 AI 应用提供实时网页搜索能力，可返回结构化搜索结果，适合中文互联网信息检索。
+
+          获取 API Key：
+          https://open.bochaai.com/
+
+          申请教程：
+
+          1. 访问博查开放平台并注册账号。
+
+          2. 登录控制台后创建或复制 API Key。
+        en-US: |
+          Bocha Search API provides real-time, structured web search results for AI applications, with strong coverage of Chinese-language web content.
+
+          Get an API key:
+          https://open.bochaai.com/
+
+          Setup:
+
+          1. Register on the Bocha open platform.
+
+          2. Sign in to the console and create or copy an API key.
+      base_url: "https://api.bochaai.com"
+    - name: Tavily
+      description:
+        zh-CN: |
+          专为 AI Agent 设计的搜索引擎，返回结构化摘要，减少噪音，适合 RAG 与 Agent 工作流。
+
+          获取 API Key：
+          https://app.tavily.com/home
+
+          申请教程：
+
+          1. 访问 Tavily 官网并注册账号。
+
+          2. 登录后在 Dashboard 页面即可看到 API Key，点击复制。
+        en-US: |
+          Tavily is a search engine designed for AI agents. It returns structured summaries with reduced noise for RAG and agent workflows.
+
+          Get an API key:
+          https://app.tavily.com/home
+
+          Setup:
+
+          1. Register on the Tavily website.
+
+          2. Sign in and copy the API key displayed on the Dashboard.
+      base_url: "https://api.tavily.com/"
+    - name: Bing
+      description:
+        zh-CN: |
+          微软必应搜索 API，覆盖全球网页、新闻、图片等多类型内容，适合需要实时互联网信息的场景。
+
+          获取 API Key：
+          https://portal.azure.com/#create/Microsoft.BingSearch
+
+          申请教程：
+
+          1. 登录 Azure 门户，搜索"Bing Search"并创建资源。
+
+          2. 创建完成后进入资源页面，在"密钥和终结点"中复制 Key1 或 Key2。
+        en-US: |
+          Microsoft Bing Search API covers global web, news, image, and other real-time internet content.
+
+          Get an API key:
+          https://portal.azure.com/#create/Microsoft.BingSearch
+
+          Setup:
+
+          1. Sign in to Azure Portal, search for Bing Search, and create a resource.
+
+          2. Open Keys and Endpoint on the resource page and copy Key1 or Key2.
+      base_url: "https://api.bing.microsoft.com/"

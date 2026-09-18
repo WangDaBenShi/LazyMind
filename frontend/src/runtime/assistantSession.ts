@@ -1,0 +1,146 @@
+export const LOCAL_ASSISTANT_BRIDGE = "http://127.0.0.1:19091/v1";
+const CLIENT_PLATFORM_HEADER = "X-LazyMind-Client-Platform";
+export const ASSISTANT_BRIDGE_PLATFORM_MISMATCH = "platform_mismatch";
+
+export class AssistantBridgeRequestError extends Error {
+  constructor(
+    message: string,
+    public readonly code = "",
+    public readonly clientPlatform = "",
+    public readonly bridgePlatform = "",
+  ) {
+    super(message);
+    this.name = "AssistantBridgeRequestError";
+  }
+}
+
+export function isAssistantBridgePlatformMismatch(error: unknown): boolean {
+  return error instanceof AssistantBridgeRequestError && error.code === ASSISTANT_BRIDGE_PLATFORM_MISMATCH;
+}
+
+export function browserClientPlatform(): "windows" | "darwin" | "linux" | "" {
+  if (typeof navigator === "undefined") return "";
+  const userAgentData = (navigator as Navigator & {
+    userAgentData?: { platform?: string };
+  }).userAgentData;
+  const value = `${userAgentData?.platform || navigator.platform || ""} ${navigator.userAgent || ""}`;
+  if (/windows|win32|win64/i.test(value)) return "windows";
+  if (/macintosh|macintel|mac os/i.test(value)) return "darwin";
+  if (/linux/i.test(value)) return "linux";
+  return "";
+}
+
+interface SessionUser {
+  token: string;
+  refreshToken?: string;
+  username?: string;
+  role?: string;
+  tenantId?: string;
+  tenant_id?: string;
+}
+
+export interface LocalAssistantSession {
+  server_url: string;
+  username?: string;
+  access_token: string;
+  refresh_token: string;
+  role?: string;
+  tenant_id?: string;
+}
+
+interface DesktopSessionBridge {
+  assistantSessionSet?: (session: LocalAssistantSession) => Promise<unknown> | unknown;
+  assistantSessionClear?: () => Promise<unknown> | unknown;
+}
+
+function getDesktopSessionBridge(): DesktopSessionBridge | undefined {
+  if (typeof window === "undefined") return undefined;
+  return (window as Window & { lazymindDesktop?: DesktopSessionBridge }).lazymindDesktop;
+}
+
+export async function assistantBridgeFetch(
+  path: string,
+  init: RequestInit | undefined,
+  timeoutMs: number,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const headers = new Headers(init?.headers);
+    const platform = browserClientPlatform();
+    if (platform) headers.set(CLIENT_PLATFORM_HEADER, platform);
+    return await fetch(`${LOCAL_ASSISTANT_BRIDGE}${path}`, {
+      ...init,
+      headers,
+      signal: controller.signal,
+    });
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+export async function assistantBridgeJSON<T>(
+  path: string,
+  init: RequestInit | undefined,
+  timeoutMs: number,
+): Promise<T> {
+  const response = await assistantBridgeFetch(path, init, timeoutMs);
+  const payload = await response.json().catch(() => ({})) as T & {
+    code?: string;
+    error?: string;
+    client_platform?: string;
+    bridge_platform?: string;
+  };
+  if (!response.ok) {
+    throw new AssistantBridgeRequestError(
+      payload.error || `Assistant Bridge returned HTTP ${response.status}`,
+      payload.code,
+      payload.client_platform,
+      payload.bridge_platform,
+    );
+  }
+  return payload;
+}
+
+export async function syncLocalAssistantSession(
+  user: SessionUser | null,
+  serverURL: string,
+  timeoutMs: number,
+): Promise<void> {
+  if (!user?.token || !user.refreshToken) {
+    await clearLocalAssistantSession(timeoutMs);
+    return;
+  }
+  const session: LocalAssistantSession = {
+    server_url: serverURL,
+    username: user.username,
+    access_token: user.token,
+    refresh_token: user.refreshToken,
+    role: user.role,
+    tenant_id: user.tenantId || user.tenant_id,
+  };
+  const desktopBridge = getDesktopSessionBridge();
+  if (desktopBridge?.assistantSessionSet) {
+    await desktopBridge.assistantSessionSet(session);
+    return;
+  }
+  await assistantBridgeJSON(
+    "/session",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(session),
+    },
+    timeoutMs,
+  );
+}
+
+export async function clearLocalAssistantSession(timeoutMs = 15_000): Promise<void> {
+  if (typeof window === "undefined") return;
+  const desktopBridge = getDesktopSessionBridge();
+  if (desktopBridge?.assistantSessionClear) {
+    await desktopBridge.assistantSessionClear();
+    return;
+  }
+  await assistantBridgeJSON("/session", { method: "DELETE" }, timeoutMs);
+}

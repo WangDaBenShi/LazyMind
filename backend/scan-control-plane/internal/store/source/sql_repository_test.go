@@ -1,0 +1,1201 @@
+package source
+
+import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	_ "github.com/glebarez/go-sqlite"
+	"gorm.io/gorm/clause"
+)
+
+func TestListObjectsScansJoinedProjectionInOneRowsScan(t *testing.T) {
+	now := time.Date(2026, 5, 31, 16, 0, 0, 0, time.UTC)
+	db := openStoreFakeDB(t, []storeFakeQuery{
+		{
+			columns: storeFakeColumns(42),
+			rows:    [][]driver.Value{objectWithStateRowValues(now, false)},
+		},
+	})
+	repo := NewSQLRepository(db)
+
+	items, nextCursor, hasMore, err := repo.ListObjects(context.Background(), ObjectListRequest{
+		SourceID:         "source-1",
+		BindingID:        "binding-1",
+		TreeKey:          "tree-root",
+		IncludeDocuments: true,
+		PageSize:         10,
+	})
+	if err != nil {
+		t.Fatalf("list objects: %v", err)
+	}
+	if nextCursor != "" || hasMore || len(items) != 1 {
+		t.Fatalf("unexpected list result: nextCursor=%q hasMore=%v items=%d", nextCursor, hasMore, len(items))
+	}
+	item := items[0]
+	if item.Object.ObjectKey != "doc-1" || item.State != nil {
+		t.Fatalf("expected object with nil state, got %+v", item)
+	}
+}
+
+func TestListDocumentsScansJoinedProjectionInOneRowsScan(t *testing.T) {
+	now := time.Date(2026, 5, 31, 16, 0, 0, 0, time.UTC)
+	db := openStoreFakeDB(t, []storeFakeQuery{
+		{columns: []string{"count"}, rows: [][]driver.Value{{int64(1)}}},
+		{
+			columns: storeFakeColumns(57),
+			rows:    [][]driver.Value{documentWithStateRowValues(now, false)},
+		},
+	})
+	repo := NewSQLRepository(db)
+
+	items, total, err := repo.ListDocuments(context.Background(), SourceDocumentListRequest{SourceID: "source-1", Page: 1, PageSize: 10})
+	if err != nil {
+		t.Fatalf("list documents: %v", err)
+	}
+	if total != 1 || len(items) != 1 {
+		t.Fatalf("unexpected list result: total=%d items=%d", total, len(items))
+	}
+	item := items[0]
+	if item.Object.ObjectKey != "doc-1" || item.State.ObjectKey != "doc-1" || item.Document != nil {
+		t.Fatalf("expected object/state with nil document, got %+v", item)
+	}
+}
+
+func TestApplyCheckpointFinishDoesNotAdvanceCursorOnFailure(t *testing.T) {
+	t.Parallel()
+
+	finishedAt := time.Date(2026, 5, 28, 10, 0, 0, 0, time.UTC)
+	checkpoint := SyncCheckpoint{
+		Cursor:     "cursor-before",
+		RetryCount: 2,
+		LastError:  JSON{},
+	}
+
+	applyCheckpointFinish(&checkpoint, SyncRunFinish{
+		Status:       SyncRunStatusFailed,
+		Cursor:       "cursor-after-failure",
+		ErrorCode:    "FETCH_FAILED",
+		ErrorMessage: "temporary connector error",
+		FinishedAt:   finishedAt,
+	})
+
+	if checkpoint.Cursor != "cursor-before" {
+		t.Fatalf("failed run advanced cursor: %+v", checkpoint)
+	}
+	if checkpoint.RetryCount != 3 || checkpoint.LastError["code"] != "FETCH_FAILED" || checkpoint.LockOwner != "" || checkpoint.LockUntil != nil {
+		t.Fatalf("failure checkpoint state not recorded: %+v", checkpoint)
+	}
+}
+
+func TestDecodeJSONPreservesNumberTokens(t *testing.T) {
+	t.Parallel()
+
+	value := decodeJSON([]byte(`{"max_object_size_bytes":209715200,"nested":{"delay":10},"items":[1,"two"]}`))
+
+	assertStoreJSONNumber(t, value["max_object_size_bytes"], "209715200")
+	nested, ok := value["nested"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected nested object, got %#v", value["nested"])
+	}
+	assertStoreJSONNumber(t, nested["delay"], "10")
+	items, ok := value["items"].([]any)
+	if !ok || len(items) != 2 {
+		t.Fatalf("expected array, got %#v", value["items"])
+	}
+	assertStoreJSONNumber(t, items[0], "1")
+}
+
+func TestMustJSONReturnsPostgresJSONTextParam(t *testing.T) {
+	t.Parallel()
+
+	param := mustJSON(JSON{
+		"include_patterns":        []any{"**/*.md", "**/*.docx"},
+		"max_object_size_bytes":   json.Number("209715200"),
+		"reconcile_after_sync":    true,
+		"reconcile_delay_minutes": json.Number("10"),
+	})
+	text, ok := param.(string)
+	if !ok {
+		t.Fatalf("jsonb param must be JSON text, got %T", param)
+	}
+
+	var decoded map[string]any
+	decoder := json.NewDecoder(strings.NewReader(text))
+	decoder.UseNumber()
+	if err := decoder.Decode(&decoded); err != nil {
+		t.Fatalf("jsonb param is not valid JSON: %v text=%q", err, text)
+	}
+	assertStoreJSONNumber(t, decoded["max_object_size_bytes"], "209715200")
+	if decoded["reconcile_after_sync"] != true {
+		t.Fatalf("boolean JSON value was not preserved: %#v", decoded["reconcile_after_sync"])
+	}
+	items, ok := decoded["include_patterns"].([]any)
+	if !ok || len(items) != 2 || items[0] != "**/*.md" {
+		t.Fatalf("array JSON value was not preserved: %#v", decoded["include_patterns"])
+	}
+}
+
+func TestJSONValueReturnsValidJSONTextForStructuredProviderOptions(t *testing.T) {
+	t.Parallel()
+
+	value, err := JSON{"include_patterns": []any{"**/*.md"}, "max_object_size_bytes": json.Number("209715200"), "reconcile_after_sync": true}.Value()
+	if err != nil {
+		t.Fatalf("json value: %v", err)
+	}
+	assertValidJSONTextParam(t, value, "provider_options")
+}
+
+func TestSQLiteAutoMigrateCreatesUpsertConstraints(t *testing.T) {
+	t.Parallel()
+
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(t.TempDir(), "scan.db"))+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+
+	repo := NewSQLRepositoryWithDriver("sqlite", db)
+	if err := repo.AutoMigrate(); err != nil {
+		t.Fatalf("auto migrate sqlite: %v", err)
+	}
+
+	for table, index := range map[string][]string{
+		"source_bindings":               {"uk_source_binding_current_target", "source_id", "connector_type", "target_type", "target_fingerprint"},
+		"documents":                     {"uk_documents_object", "source_id", "binding_id", "object_key"},
+		"parse_tasks":                   {"uk_parse_task_idempotency", "idempotency_key"},
+		"source_sync_runs":              {"uk_source_sync_runs_scheduled_fire", "binding_id", "binding_generation", "scheduled_fire_at"},
+		"data_source_create_operations": {"uk_create_operation", "caller_id", "request_id"},
+	} {
+		assertSQLiteUniqueIndex(t, db, table, index[0], index[1:])
+	}
+	assertSQLiteUniqueIndex(t, db, "parse_tasks", "uk_parse_task_active", []string{
+		"source_id", "binding_id", "object_key", "target_version_id", "task_action",
+	})
+}
+
+func TestSQLiteAutoMigrateUpgradesLegacyAgentCommandQueue(t *testing.T) {
+	t.Parallel()
+
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(t.TempDir(), "scan.db"))+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+
+	repo := NewSQLRepositoryWithDriver("sqlite", db)
+	type legacyAgentCommand struct {
+		CommandID    string `gorm:"column:command_id;primaryKey"`
+		AgentID      string `gorm:"column:agent_id"`
+		CommandType  string `gorm:"column:command_type"`
+		Payload      JSON   `gorm:"column:payload_json;type:jsonb"`
+		Status       string `gorm:"column:status"`
+		AttemptCount int64  `gorm:"column:attempt_count"`
+		NextRetryAt  *time.Time
+		AckedAt      *time.Time
+		LastError    JSON `gorm:"column:last_error;type:jsonb"`
+		Result       JSON `gorm:"column:result_json;type:jsonb"`
+		CreatedAt    time.Time
+		DispatchedAt *time.Time
+	}
+	if err := repo.orm.Table("agent_commands").AutoMigrate(&legacyAgentCommand{}); err != nil {
+		t.Fatalf("prepare legacy sqlite schema: %v", err)
+	}
+	legacy := legacyAgentCommand{
+		CommandID:   "legacy-command",
+		AgentID:     "agent-1",
+		CommandType: "start_source",
+		Payload:     JSON{},
+		Status:      "PENDING",
+		CreatedAt:   time.Date(2026, 8, 3, 15, 0, 0, 0, time.UTC),
+	}
+	if err := repo.orm.Table("agent_commands").Create(&legacy).Error; err != nil {
+		t.Fatalf("seed legacy sqlite command: %v", err)
+	}
+	if err := repo.AutoMigrate(); err != nil {
+		t.Fatalf("upgrade legacy sqlite schema: %v", err)
+	}
+
+	var generation int64
+	if err := db.QueryRow("SELECT queue_generation FROM agent_commands WHERE command_id = ?", "legacy-command").Scan(&generation); err != nil {
+		t.Fatalf("read migrated legacy command: %v", err)
+	}
+	if generation != 1 {
+		t.Fatalf("legacy command queue generation = %d, want 1", generation)
+	}
+
+	var indexCount int
+	if err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?", "idx_agent_commands_current_pending").Scan(&indexCount); err != nil {
+		t.Fatalf("read migrated command index: %v", err)
+	}
+	if indexCount != 1 {
+		t.Fatalf("migrated command index count = %d, want 1", indexCount)
+	}
+}
+
+func TestAgentCommandQueueGenerationBypassesLegacyBacklogAndCleansIt(t *testing.T) {
+	t.Parallel()
+
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(t.TempDir(), "scan.db"))+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+	repo := NewSQLRepositoryWithDriver("sqlite", db)
+	if err := repo.AutoMigrate(); err != nil {
+		t.Fatalf("auto migrate sqlite: %v", err)
+	}
+	now := time.Date(2026, 8, 3, 15, 0, 0, 0, time.UTC)
+	if err := repo.orm.Create(&ormAgent{AgentID: "agent-1", Status: "ONLINE", LastHeartbeatAt: now, UpdatedAt: now}).Error; err != nil {
+		t.Fatalf("seed agent: %v", err)
+	}
+	legacy := ormAgentCommand{CommandID: "1", AgentID: "agent-1", QueueGeneration: 1, CommandType: "start_source", Payload: JSON{}, Status: "PENDING", CreatedAt: now.Add(-time.Hour)}
+	if err := repo.orm.Create(&legacy).Error; err != nil {
+		t.Fatalf("seed legacy command: %v", err)
+	}
+	legacyExtension := ormAgentCommand{CommandID: "2", AgentID: "agent-1", QueueGeneration: 1, CommandType: "extension_command", Payload: JSON{}, Status: "PENDING", CreatedAt: now.Add(-time.Hour)}
+	if err := repo.orm.Create(&legacyExtension).Error; err != nil {
+		t.Fatalf("seed legacy extension command: %v", err)
+	}
+	current := AgentCommand{CommandID: "9007199254740993", AgentID: "agent-1", QueueGeneration: AgentCommandQueueGeneration, CommandType: "start_source", Payload: JSON{}, Status: "PENDING", CreatedAt: now}
+	if err := repo.CreateAgentCommand(context.Background(), current); err != nil {
+		t.Fatalf("create current command: %v", err)
+	}
+	if err := repo.CreateAgentCommand(context.Background(), current); err != nil {
+		t.Fatalf("duplicate deterministic command should be idempotent: %v", err)
+	}
+
+	commands, err := repo.ListPendingAgentCommands(context.Background(), "agent-1", now, 10)
+	if err != nil {
+		t.Fatalf("list pending commands: %v", err)
+	}
+	if len(commands) != 2 || commands[0].CommandID != legacyExtension.CommandID || commands[1].CommandID != current.CommandID || commands[1].QueueGeneration != AgentCommandQueueGeneration {
+		t.Fatalf("current queue should bypass legacy backlog: %+v", commands)
+	}
+	if err := repo.AckAgentCommand(context.Background(), AgentCommandAck{AgentID: "agent-1", CommandID: current.CommandID, Success: true, AckedAt: now}); err != nil {
+		t.Fatalf("ack current command: %v", err)
+	}
+	current.CreatedAt = now.Add(time.Minute)
+	if err := repo.CreateAgentCommand(context.Background(), current); err != nil {
+		t.Fatalf("requeue deterministic command after agent restart: %v", err)
+	}
+	restarted, err := repo.ListPendingAgentCommands(context.Background(), "agent-1", current.CreatedAt, 10)
+	if err != nil || len(restarted) != 1 || restarted[0].CommandID != current.CommandID {
+		t.Fatalf("agent restart should requeue an already acked watcher command: commands=%+v err=%v", restarted, err)
+	}
+	retried, err := repo.ListPendingAgentCommands(context.Background(), "agent-1", current.CreatedAt.Add(agentCommandLeaseTTL), 10)
+	if err != nil || len(retried) != 1 || retried[0].CommandID != current.CommandID {
+		t.Fatalf("expired lifecycle command lease should be retried: commands=%+v err=%v", retried, err)
+	}
+	var retriedRow ormAgentCommand
+	if err := repo.orm.Where("command_id = ?", current.CommandID).First(&retriedRow).Error; err != nil || retriedRow.AttemptCount != 2 {
+		t.Fatalf("lease retry should persist the new attempt count: row=%+v err=%v", retriedRow, err)
+	}
+	deleted, err := repo.MaintainAgentCommands(context.Background(), now, 10)
+	if err != nil {
+		t.Fatalf("maintain commands: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("expected one legacy command deleted, got %d", deleted)
+	}
+	var remaining int64
+	if err := repo.orm.Model(&ormAgentCommand{}).Count(&remaining).Error; err != nil || remaining != 2 {
+		t.Fatalf("maintenance should preserve current command: remaining=%d err=%v", remaining, err)
+	}
+}
+
+func TestRecoverLocalWatchersQueuesCurrentCommandAndMetadataReconcile(t *testing.T) {
+	t.Parallel()
+
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(t.TempDir(), "scan.db"))+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+	repo := NewSQLRepositoryWithDriver("sqlite", db)
+	if err := repo.AutoMigrate(); err != nil {
+		t.Fatalf("auto migrate sqlite: %v", err)
+	}
+	now := time.Date(2026, 8, 3, 15, 0, 0, 0, time.UTC)
+	if err := repo.orm.Create(&ormAgent{AgentID: "agent-1", TenantID: "tenant-1", Status: "ONLINE", LastHeartbeatAt: now, UpdatedAt: now}).Error; err != nil {
+		t.Fatalf("seed agent: %v", err)
+	}
+	if err := repo.orm.Create(&ormSource{SourceID: "source-1", TenantID: "tenant-1", CreatedBy: "user-1", Name: "Docs", DatasetID: "dataset-1", Status: "ACTIVE", ConfigVersion: 1, CreatedAt: now, UpdatedAt: now}).Error; err != nil {
+		t.Fatalf("seed source: %v", err)
+	}
+	binding := ormBinding{BindingID: "binding-1", SourceID: "source-1", ConnectorType: "local_fs", TargetType: "local_path", TargetRef: "/workspace/docs", TargetFingerprint: "/workspace/docs", TreeKey: "root", BindingGeneration: 1, AgentID: "agent-1", SyncMode: "manual", Status: "ACTIVE", CreatedAt: now, UpdatedAt: now}
+	if err := repo.orm.Create(&binding).Error; err != nil {
+		t.Fatalf("seed binding: %v", err)
+	}
+	if err := repo.orm.Create(&ormSyncCheckpoint{SourceID: "source-1", BindingID: "binding-1", BindingGeneration: 1, LastError: JSON{}, CreatedAt: now, UpdatedAt: now}).Error; err != nil {
+		t.Fatalf("seed checkpoint: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		recovered, err := repo.RecoverLocalWatchers(context.Background(), now)
+		if err != nil || recovered != 1 {
+			t.Fatalf("recover local watchers pass=%d recovered=%d err=%v", i+1, recovered, err)
+		}
+	}
+	commands, err := repo.ListPendingAgentCommands(context.Background(), "agent-1", now, 10)
+	if err != nil || len(commands) != 1 {
+		t.Fatalf("recovery should queue one idempotent current command: commands=%+v err=%v", commands, err)
+	}
+	if commands[0].Payload["tenant_id"] != "tenant-1" || commands[0].Payload["root_path"] != "/workspace/docs" {
+		t.Fatalf("recovery command lost binding metadata: %+v", commands[0].Payload)
+	}
+	var runCount int64
+	if err := repo.orm.Model(&ormSyncRun{}).Where("binding_id = ? AND trigger_type = ?", "binding-1", "reconcile").Count(&runCount).Error; err != nil || runCount != 1 {
+		t.Fatalf("recovery should queue one idempotent metadata reconcile: count=%d err=%v", runCount, err)
+	}
+}
+
+func TestSQLiteCreateOperationUpsertUsesCallerRequestConstraint(t *testing.T) {
+	t.Parallel()
+
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(t.TempDir(), "scan.db"))+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+
+	repo := NewSQLRepositoryWithDriver("sqlite", db)
+	if err := repo.AutoMigrate(); err != nil {
+		t.Fatalf("auto migrate sqlite: %v", err)
+	}
+
+	now := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
+	base := CreateOperation{
+		OperationID:        "op-1",
+		CallerID:           "user-1",
+		RequestID:          "request-1",
+		RequestHash:        "hash-1",
+		Status:             "PENDING",
+		CompensationStatus: "NONE",
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}
+	if err := ormUpsertOperation(repo.orm, base); err != nil {
+		t.Fatalf("insert create operation: %v", err)
+	}
+	base.OperationID = "op-2"
+	base.SourceID = "source-1"
+	base.DatasetID = "dataset-1"
+	base.Status = "SUCCEEDED"
+	base.UpdatedAt = now.Add(time.Minute)
+	if err := ormUpsertOperation(repo.orm, base); err != nil {
+		t.Fatalf("upsert create operation: %v", err)
+	}
+
+	var count int
+	if err := db.QueryRow("SELECT COUNT(*) FROM data_source_create_operations WHERE caller_id = ? AND request_id = ?", "user-1", "request-1").Scan(&count); err != nil {
+		t.Fatalf("count create operations: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected one create operation after upsert, got %d", count)
+	}
+	var sourceID string
+	if err := db.QueryRow("SELECT source_id FROM data_source_create_operations WHERE caller_id = ? AND request_id = ?", "user-1", "request-1").Scan(&sourceID); err != nil {
+		t.Fatalf("read create operation: %v", err)
+	}
+	if sourceID != "source-1" {
+		t.Fatalf("upsert did not update source_id: %q", sourceID)
+	}
+}
+
+func TestDeleteBindingStagesOnlySyncedDocumentsForCleanup(t *testing.T) {
+	t.Parallel()
+
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(t.TempDir(), "scan.db"))+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+	repo := NewSQLRepositoryWithDriver("sqlite", db)
+	if err := repo.AutoMigrate(); err != nil {
+		t.Fatalf("auto migrate sqlite: %v", err)
+	}
+
+	now := time.Date(2026, 7, 20, 8, 0, 0, 0, time.UTC)
+	nextSyncAt := now.Add(time.Hour)
+	if err := repo.orm.Create(&ormSource{SourceID: "source-1", TenantID: "tenant-1", CreatedBy: "user-1", Name: "Docs", DatasetID: "dataset-1", Status: "ACTIVE", ConfigVersion: 1, CreatedAt: now, UpdatedAt: now}).Error; err != nil {
+		t.Fatalf("seed source: %v", err)
+	}
+	if err := repo.orm.Create(&ormBinding{BindingID: "binding-1", SourceID: "source-1", ConnectorType: "local_fs", TargetType: "local_path", TargetRef: "/docs", TargetFingerprint: "/docs", TreeKey: "root", BindingGeneration: 1, CoreParentDocumentID: "folder-1", SyncMode: "scheduled", NextSyncAt: &nextSyncAt, Status: "ACTIVE", CreatedAt: now, UpdatedAt: now}).Error; err != nil {
+		t.Fatalf("seed binding: %v", err)
+	}
+	if err := repo.orm.Create(&ormSyncCheckpoint{SourceID: "source-1", BindingID: "binding-1", BindingGeneration: 1, NextSyncAt: &nextSyncAt, LockOwner: "worker-1", LockUntil: timePtr(now.Add(time.Minute)), CreatedAt: now, UpdatedAt: now}).Error; err != nil {
+		t.Fatalf("seed checkpoint: %v", err)
+	}
+	for _, key := range []string{"synced", "unsynced"} {
+		if err := repo.orm.Create(&ormSourceObject{SourceID: "source-1", BindingID: "binding-1", ObjectKey: key, DisplayName: key, SearchName: key, ObjectType: "file", IsDocument: true, SourceVersion: "v1", CreatedAt: now, UpdatedAt: now}).Error; err != nil {
+			t.Fatalf("seed object %s: %v", key, err)
+		}
+	}
+	states := []ormDocumentState{
+		{SourceID: "source-1", BindingID: "binding-1", BindingGeneration: 1, ObjectKey: "synced", SourceVersion: "v1", BaselineVersion: "v1", SourceState: "UNCHANGED", SyncState: "IDLE", DocumentListVisible: true, Selectable: true, ParseQueueState: "QUEUED", DocumentID: "document-synced", ActiveTaskID: "task-synced", CreatedAt: now, UpdatedAt: now},
+		{SourceID: "source-1", BindingID: "binding-1", BindingGeneration: 1, ObjectKey: "unsynced", SourceVersion: "v1", SourceState: "NEW", SyncState: "IDLE", PendingAction: "CREATE", DocumentListVisible: true, Selectable: true, ParseQueueState: "QUEUED", DocumentID: "document-unsynced", ActiveTaskID: "task-unsynced", CreatedAt: now, UpdatedAt: now},
+	}
+	if err := repo.orm.Create(&states).Error; err != nil {
+		t.Fatalf("seed states: %v", err)
+	}
+	documents := []ormDocument{
+		{DocumentID: "document-synced", TenantID: "tenant-1", SourceID: "source-1", BindingID: "binding-1", ObjectKey: "synced", CoreDocumentID: "core-doc-1", CurrentVersionID: "v1", ParseStatus: "SUCCEEDED", CreatedAt: now, UpdatedAt: now},
+		{DocumentID: "document-unsynced", TenantID: "tenant-1", SourceID: "source-1", BindingID: "binding-1", ObjectKey: "unsynced", ParseStatus: "PENDING", CreatedAt: now, UpdatedAt: now},
+	}
+	if err := repo.orm.Create(&documents).Error; err != nil {
+		t.Fatalf("seed documents: %v", err)
+	}
+	for _, taskID := range []string{"task-synced", "task-unsynced"} {
+		objectKey := strings.TrimPrefix(taskID, "task-")
+		if err := repo.orm.Create(&ormParseTask{TaskID: taskID, TenantID: "tenant-1", SourceID: "source-1", BindingID: "binding-1", BindingGeneration: 1, ObjectKey: objectKey, DocumentID: "document-" + objectKey, TaskAction: "CREATE", TargetVersionID: "v1", IdempotencyKey: taskID, Status: "PENDING", NextRunAt: now, CreatedAt: now, UpdatedAt: now}).Error; err != nil {
+			t.Fatalf("seed task %s: %v", taskID, err)
+		}
+	}
+
+	result, err := repo.DeleteBinding(context.Background(), "source-1", "binding-1", now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("delete binding: %v", err)
+	}
+	if result.Binding.Status != "DELETING" || result.Cleanup.CancelledParseTaskCount != 2 || result.Cleanup.ClearedObjectCount != 0 || result.Cleanup.ClearedStateCount != 0 || result.Cleanup.TombstonedDocumentCount != 0 {
+		t.Fatalf("unexpected staged cleanup result: %+v", result)
+	}
+	synced, err := repo.GetDocumentState(context.Background(), "source-1", "binding-1", "synced")
+	if err != nil {
+		t.Fatalf("get synced state: %v", err)
+	}
+	if synced.SourceState != "OUT_OF_SCOPE" || synced.PendingAction != "DELETE" || !synced.DocumentListVisible || !synced.Selectable || synced.ActiveTaskID != "" || synced.ParseQueueState != "NONE" {
+		t.Fatalf("synced document was not staged for cleanup: %+v", synced)
+	}
+	unsynced, err := repo.GetDocumentState(context.Background(), "source-1", "binding-1", "unsynced")
+	if err != nil {
+		t.Fatalf("get unsynced state: %v", err)
+	}
+	if unsynced.PendingAction != "" || unsynced.DocumentListVisible || unsynced.Selectable || unsynced.DocumentID != "" || unsynced.ActiveTaskID != "" {
+		t.Fatalf("unsynced document should be hidden without a core delete: %+v", unsynced)
+	}
+	if _, err := repo.GetObject(context.Background(), "source-1", "binding-1", "synced"); err != nil {
+		t.Fatalf("cleanup planning snapshot was removed: %v", err)
+	}
+	document, err := repo.GetDocument(context.Background(), "source-1", "binding-1", "synced")
+	if err != nil || document.ParseStatus != "SUCCEEDED" {
+		t.Fatalf("document was tombstoned before cleanup sync: document=%+v err=%v", document, err)
+	}
+	checkpoint, err := repo.GetSyncCheckpoint(context.Background(), "binding-1")
+	if err != nil || checkpoint.NextSyncAt == nil || !checkpoint.NextSyncAt.Equal(nextSyncAt) || checkpoint.LockOwner != "" || checkpoint.LockUntil != nil {
+		t.Fatalf("scheduled cleanup checkpoint was not preserved/unlocked: checkpoint=%+v err=%v", checkpoint, err)
+	}
+	due, err := repo.ListDueSyncCheckpoints(context.Background(), nextSyncAt.Add(time.Second), 10)
+	if err != nil || len(due) != 1 || due[0].BindingID != "binding-1" {
+		t.Fatalf("deleting scheduled binding was not eligible for cleanup sync: due=%+v err=%v", due, err)
+	}
+	run := SyncRun{RunID: "cleanup-run-1", SourceID: "source-1", BindingID: "binding-1", BindingGeneration: 1, TriggerType: "scheduled", ScopeType: "cleanup", Status: SyncRunStatusPending, StartedAt: now.Add(time.Minute)}
+	if _, created, err := repo.EnqueueSyncRun(context.Background(), run); err != nil || !created {
+		t.Fatalf("enqueue cleanup run: created=%v err=%v", created, err)
+	}
+	claimed, ok, err := repo.ClaimDueSyncRun(context.Background(), "cleanup-worker", now.Add(2*time.Minute), time.Minute)
+	if err != nil || !ok || claimed.RunID != run.RunID {
+		t.Fatalf("claim deleting binding cleanup run: claimed=%+v ok=%v err=%v", claimed, ok, err)
+	}
+	if _, ok, err := repo.FinishSyncRun(context.Background(), run.RunID, "cleanup-worker", SyncRunFinish{Status: SyncRunStatusSucceeded, Coverage: JSON{"complete": true, "covered_target_root": true, "scope_type": "cleanup"}, FinishedAt: now.Add(3 * time.Minute)}); err != nil || !ok {
+		t.Fatalf("finish cleanup run: ok=%v err=%v", ok, err)
+	}
+	ready, err := repo.ListReadyBindingCleanups(context.Background(), 10)
+	if err != nil || len(ready) != 0 {
+		t.Fatalf("binding must not finalize while a delete is pending: ready=%+v err=%v", ready, err)
+	}
+	synced.PendingAction = ""
+	synced.DocumentListVisible = false
+	synced.Selectable = false
+	if err := repo.SaveDocumentState(context.Background(), synced); err != nil {
+		t.Fatalf("complete cleanup state: %v", err)
+	}
+	ready, err = repo.ListReadyBindingCleanups(context.Background(), 10)
+	if err != nil || len(ready) != 1 || ready[0].BindingID != "binding-1" {
+		t.Fatalf("completed cleanup binding was not ready: ready=%+v err=%v", ready, err)
+	}
+	if err := repo.FinalizeBindingCleanup(context.Background(), "source-1", "binding-1", now.Add(2*time.Minute)); err != nil {
+		t.Fatalf("finalize binding cleanup: %v", err)
+	}
+	if _, err := repo.GetBinding(context.Background(), "source-1", "binding-1"); ErrorCodeOf(err) != ErrCodeBindingNotFound {
+		t.Fatalf("finalized binding was not removed: %v", err)
+	}
+	if _, err := repo.GetObject(context.Background(), "source-1", "binding-1", "synced"); ErrorCodeOf(err) != ErrCodeNotFound {
+		t.Fatalf("finalized object snapshot was not removed: %v", err)
+	}
+	document, err = repo.GetDocument(context.Background(), "source-1", "binding-1", "synced")
+	if err != nil || document.ParseStatus != "SUPERSEDED" {
+		t.Fatalf("finalized document was not tombstoned: document=%+v err=%v", document, err)
+	}
+	if err := repo.orm.Create(&ormBinding{BindingID: "binding-only-save", SourceID: "source-1", ConnectorType: "local_fs", TargetType: "local_path", TargetRef: "/only-save", TargetFingerprint: "/only-save", TreeKey: "only-save-root", BindingGeneration: 1, CoreParentDocumentID: "folder-only-save", SyncMode: "manual", Status: "ACTIVE", CreatedAt: now, UpdatedAt: now}).Error; err != nil {
+		t.Fatalf("seed only-save binding: %v", err)
+	}
+	if _, err := repo.DeleteBinding(context.Background(), "source-1", "binding-only-save", now.Add(4*time.Minute)); err != nil {
+		t.Fatalf("delete only-save binding: %v", err)
+	}
+	ready, err = repo.ListReadyBindingCleanups(context.Background(), 10)
+	if err != nil || len(ready) != 0 {
+		t.Fatalf("only-save removal must wait for an explicit cleanup sync: ready=%+v err=%v", ready, err)
+	}
+}
+
+func TestSQLiteRepairDedupesLegacyRowsBeforeCreatingIndexes(t *testing.T) {
+	t.Parallel()
+
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(t.TempDir(), "scan.db"))+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+
+	repo := NewSQLRepositoryWithDriver("sqlite", db)
+	if err := repo.orm.AutoMigrate(
+		&ormSource{},
+		&ormBinding{},
+		&ormDocument{},
+		&ormParseTask{},
+		&ormSyncRun{},
+		&ormCreateOperation{},
+	); err != nil {
+		t.Fatalf("legacy auto migrate sqlite: %v", err)
+	}
+	insertSQLiteRepairDuplicates(t, db)
+
+	if err := repo.repairSQLiteSchema(); err != nil {
+		t.Fatalf("repair sqlite schema: %v", err)
+	}
+
+	assertSQLiteUniqueIndex(t, db, "source_bindings", "uk_source_binding_current_target", []string{"source_id", "connector_type", "target_type", "target_fingerprint"})
+	assertSQLiteUniqueIndex(t, db, "documents", "uk_documents_object", []string{"source_id", "binding_id", "object_key"})
+	assertSQLiteUniqueIndex(t, db, "parse_tasks", "uk_parse_task_idempotency", []string{"idempotency_key"})
+	assertSQLiteUniqueIndex(t, db, "parse_tasks", "uk_parse_task_active", []string{"source_id", "binding_id", "object_key", "target_version_id", "task_action"})
+	assertSQLiteUniqueIndex(t, db, "source_sync_runs", "uk_source_sync_runs_scheduled_fire", []string{"binding_id", "binding_generation", "scheduled_fire_at"})
+	assertSQLiteUniqueIndex(t, db, "data_source_create_operations", "uk_create_operation", []string{"caller_id", "request_id"})
+
+	assertSQLiteCount(t, db, "active duplicate bindings", "SELECT COUNT(*) FROM source_bindings WHERE source_id = 'source-1' AND connector_type = 'local_fs' AND target_type = 'local_path' AND target_fingerprint = 'target-1' AND status <> 'DELETING'", 1)
+	assertSQLiteCount(t, db, "duplicate documents", "SELECT COUNT(*) FROM documents WHERE source_id = 'source-1' AND binding_id = 'binding-keep' AND object_key = 'doc-key'", 1)
+	assertSQLiteCount(t, db, "duplicate idempotency tasks", "SELECT COUNT(*) FROM parse_tasks WHERE idempotency_key = 'idempotency-dup'", 1)
+	assertSQLiteCount(t, db, "duplicate active tasks", "SELECT COUNT(*) FROM parse_tasks WHERE source_id = 'source-1' AND binding_id = 'binding-keep' AND object_key = 'doc-key' AND target_version_id = 'version-active' AND task_action = 'parse' AND status IN ('PENDING', 'RUNNING', 'SUBMITTED')", 1)
+	assertSQLiteCount(t, db, "duplicate scheduled runs", "SELECT COUNT(*) FROM source_sync_runs WHERE binding_id = 'binding-keep' AND binding_generation = 1 AND scheduled_fire_at = '2026-07-07 12:00:00+00:00' AND trigger_type = 'scheduled' AND status IN ('PENDING', 'RUNNING')", 1)
+	assertSQLiteCount(t, db, "duplicate create operations", "SELECT COUNT(*) FROM data_source_create_operations WHERE caller_id = 'user-1' AND request_id = 'request-1'", 1)
+
+	var taskDocumentID string
+	if err := db.QueryRow("SELECT document_id FROM parse_tasks WHERE task_id = 'task-doc-ref'").Scan(&taskDocumentID); err != nil {
+		t.Fatalf("read repaired task document id: %v", err)
+	}
+	if taskDocumentID != "document-2" {
+		t.Fatalf("parse task document reference was not moved to kept document: %q", taskDocumentID)
+	}
+}
+
+func TestListSourcesScansProjectedSourceFields(t *testing.T) {
+	now := time.Date(2026, 5, 31, 15, 0, 0, 0, time.UTC)
+	db := openStoreFakeDB(t, []storeFakeQuery{
+		{columns: []string{"count"}, rows: [][]driver.Value{{int64(1)}}},
+		{
+			columns: []string{
+				"source_id", "tenant_id", "created_by", "name", "dataset_id", "status",
+				"source_options_json", "include_extensions_json", "exclude_extensions_json",
+				"config_version", "deleted_at", "created_at", "updated_at", "last_success_at", "binding_count",
+			},
+			rows: [][]driver.Value{{
+				"source-1", "tenant-1", "user-1", "本地数据源", "dataset-1", "ACTIVE",
+				[]byte(`{"source_type":"local_fs"}`), []byte(`{"items":[".md"]}`), []byte(`{"items":["~$*"]}`),
+				int64(7), nil, now, now.Add(time.Minute), now.Add(-time.Hour), int64(2),
+			}},
+		},
+	})
+	repo := NewSQLRepository(db)
+
+	records, total, err := repo.ListSources(context.Background(), SourceListRequest{TenantID: "tenant-1", Page: 1, PageSize: 10})
+	if err != nil {
+		t.Fatalf("list sources: %v", err)
+	}
+	if total != 1 || len(records) != 1 {
+		t.Fatalf("unexpected list result: total=%d records=%d", total, len(records))
+	}
+	record := records[0]
+	if record.Source.SourceID != "source-1" || record.Source.Name != "本地数据源" || record.Source.Status != "ACTIVE" {
+		t.Fatalf("source projection was not scanned: %+v", record.Source)
+	}
+	if record.Source.CreatedAt != now || record.Source.UpdatedAt != now.Add(time.Minute) {
+		t.Fatalf("source timestamps were not scanned: %+v", record.Source)
+	}
+	if record.BindingCount != 2 {
+		t.Fatalf("binding count not scanned: got=%d", record.BindingCount)
+	}
+	if record.LastSuccessAt == nil || !record.LastSuccessAt.Equal(now.Add(-time.Hour)) {
+		t.Fatalf("PostgreSQL last success time was not scanned: %v", record.LastSuccessAt)
+	}
+	if record.Source.SourceOptions["source_type"] != "local_fs" {
+		t.Fatalf("source JSON options were not scanned: %#v", record.Source.SourceOptions)
+	}
+}
+
+func TestListSourcesScansSQLiteAggregatedLastSuccessAt(t *testing.T) {
+	t.Parallel()
+
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(t.TempDir(), "scan.db"))+"?_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+
+	repo := NewSQLRepositoryWithDriver("sqlite", db)
+	if err := repo.AutoMigrate(); err != nil {
+		t.Fatalf("auto migrate sqlite: %v", err)
+	}
+	now := time.Date(2026, 8, 27, 3, 34, 9, 672288000, time.UTC)
+	if err := ormInsertSource(repo.orm, Source{
+		SourceID:          "source-1",
+		TenantID:          "tenant-1",
+		CreatedBy:         "user-1",
+		Name:              "飞书数据源",
+		DatasetID:         "dataset-1",
+		Status:            "ACTIVE",
+		SourceOptions:     JSON{"source_type": "feishu"},
+		IncludeExtensions: JSON{},
+		ExcludeExtensions: JSON{},
+		ConfigVersion:     1,
+		CreatedAt:         now.Add(-time.Hour),
+		UpdatedAt:         now,
+	}); err != nil {
+		t.Fatalf("insert sqlite source: %v", err)
+	}
+	if err := ormUpsertCheckpoint(repo.orm, SyncCheckpoint{
+		SourceID:          "source-1",
+		BindingID:         "binding-1",
+		BindingGeneration: 1,
+		LastSuccessAt:     &now,
+		LastError:         JSON{},
+		CreatedAt:         now,
+		UpdatedAt:         now,
+	}); err != nil {
+		t.Fatalf("insert sqlite checkpoint: %v", err)
+	}
+
+	records, total, err := repo.ListSources(context.Background(), SourceListRequest{
+		TenantID: "tenant-1",
+		Page:     1,
+		PageSize: 10,
+	})
+	if err != nil {
+		t.Fatalf("list sqlite sources: %v", err)
+	}
+	if total != 1 || len(records) != 1 {
+		t.Fatalf("unexpected sqlite list result: total=%d records=%d", total, len(records))
+	}
+	if records[0].LastSuccessAt == nil || !records[0].LastSuccessAt.Equal(now) {
+		t.Fatalf("SQLite last success time was not scanned: %v", records[0].LastSuccessAt)
+	}
+}
+
+func TestListBindingsBySourceIDsScansAuthConnections(t *testing.T) {
+	now := time.Date(2026, 5, 31, 15, 0, 0, 0, time.UTC)
+	db := openStoreFakeDB(t, []storeFakeQuery{
+		{
+			columns: []string{
+				"binding_id", "source_id", "binding_type", "connector_type", "target_type", "target_ref",
+				"target_fingerprint", "agent_id", "auth_connection_id", "provider_options_json", "tree_key",
+				"binding_generation", "core_parent_document_id", "core_parent_document_name", "sync_mode",
+				"schedule_policy_json", "next_sync_at", "include_extensions_json", "exclude_extensions_json",
+				"status", "last_error", "deleted_at", "created_at", "updated_at",
+			},
+			rows: [][]driver.Value{{
+				"binding-1", "source-1", "connector_target", "feishu", "wiki_node", "wiki:space:node",
+				"fingerprint-1", nil, "auth-1", []byte(`{"user_id":"user-1"}`), "tree-1",
+				int64(1), "folder-1", "Docs", "manual",
+				nil, nil, []byte(`{"items":[".md"]}`), []byte(`{"items":[]}`),
+				"ACTIVE", []byte(`{}`), nil, now, now,
+			}},
+		},
+	})
+	repo := NewSQLRepository(db)
+
+	bindings, err := repo.ListBindingsBySourceIDs(context.Background(), []string{"source-1", "source-2", "source-1", ""})
+	if err != nil {
+		t.Fatalf("list bindings by source ids: %v", err)
+	}
+	if len(bindings) != 1 {
+		t.Fatalf("unexpected binding count: %d", len(bindings))
+	}
+	binding := bindings[0]
+	if binding.SourceID != "source-1" || binding.BindingID != "binding-1" || binding.AuthConnectionID != "auth-1" {
+		t.Fatalf("binding projection was not scanned: %+v", binding)
+	}
+	if binding.ProviderOptions["user_id"] != "user-1" {
+		t.Fatalf("provider options were not scanned: %#v", binding.ProviderOptions)
+	}
+}
+
+func TestGetSourceSummaryComputesDocumentCounts(t *testing.T) {
+	db := openStoreFakeDB(t, []storeFakeQuery{
+		{columns: []string{"source_id"}, rows: [][]driver.Value{{"source-1"}}},
+		{columns: []string{"source_id", "binding_id"}, rows: [][]driver.Value{{"source-1", "binding-1"}}},
+		{columns: []string{"count"}, rows: [][]driver.Value{{int64(5)}}},
+		{columns: []string{"count"}, rows: [][]driver.Value{{int64(3)}}},
+		{columns: []string{"count"}, rows: [][]driver.Value{{int64(2)}}},
+		{
+			columns: []string{"storage_bytes"},
+			rows:    [][]driver.Value{{int64(42)}},
+			wantSQL: []string{
+				"FROM source_document_states AS s",
+				"JOIN source_object_index o",
+				"s.document_list_visible = true",
+				"SUM(o.size_bytes)",
+			},
+		},
+		{columns: []string{"count"}, rows: [][]driver.Value{{int64(7)}}},
+		{columns: []string{"source_state", "count"}, rows: [][]driver.Value{}},
+		{columns: []string{"status", "count"}, rows: [][]driver.Value{}},
+		{columns: []string{"binding_id"}, rows: [][]driver.Value{}},
+	})
+	repo := NewSQLRepository(db)
+
+	summary, err := repo.GetSourceSummary(context.Background(), SourceSummaryRequest{SourceID: "source-1", BindingID: "binding-1"})
+	if err != nil {
+		t.Fatalf("get source summary: %v", err)
+	}
+	if summary.TotalObjects != 5 || summary.DocumentObjects != 3 || summary.ContainerObjects != 2 {
+		t.Fatalf("summary counts were not scanned: %+v", summary)
+	}
+	if summary.StorageBytes != 42 {
+		t.Fatalf("storage bytes were not aggregated: got=%d", summary.StorageBytes)
+	}
+	if summary.ParsedDocumentCount != 7 {
+		t.Fatalf("parsed document count was not aggregated: got=%d", summary.ParsedDocumentCount)
+	}
+}
+
+func TestValidateSourceObjectIndexRowEnforcesParentDepthContract(t *testing.T) {
+	t.Parallel()
+
+	valid := SourceObject{
+		SourceID:    "source-1",
+		BindingID:   "binding-1",
+		TreeKey:     "root",
+		ObjectKey:   "root",
+		DisplayName: "Root",
+		SearchName:  "root",
+		ObjectType:  "folder",
+		Depth:       0,
+	}
+	if err := validateSourceObjectIndexRow(valid); err != nil {
+		t.Fatalf("valid root rejected: %v", err)
+	}
+	child := valid
+	child.ObjectKey = "doc-1"
+	child.ParentKey = "root"
+	child.Depth = 1
+	if err := validateSourceObjectIndexRow(child); err != nil {
+		t.Fatalf("valid child rejected: %v", err)
+	}
+	badRoot := valid
+	badRoot.Depth = 1
+	if err := validateSourceObjectIndexRow(badRoot); ErrorCodeOf(err) != ErrCodeInternal {
+		t.Fatalf("expected invalid root depth error, got %v", err)
+	}
+	badChild := child
+	badChild.Depth = 0
+	if err := validateSourceObjectIndexRow(badChild); ErrorCodeOf(err) != ErrCodeInternal {
+		t.Fatalf("expected invalid child depth error, got %v", err)
+	}
+}
+
+func TestSourceObjectUpsertAssignmentsPreserveExistingSizeOnZero(t *testing.T) {
+	t.Parallel()
+
+	assignments := sourceObjectUpsertAssignments()
+	for _, assignment := range assignments {
+		if assignment.Column.Name != "size_bytes" {
+			continue
+		}
+		expr, ok := assignment.Value.(clause.Expr)
+		if !ok {
+			t.Fatalf("size_bytes update should use expression, got %#v", assignment.Value)
+		}
+		if !strings.Contains(expr.SQL, "excluded.size_bytes > 0") ||
+			!strings.Contains(expr.SQL, "provider_meta_json->>'kind' IN") ||
+			!strings.Contains(expr.SQL, "wiki_node") ||
+			!strings.Contains(expr.SQL, "drive_file") ||
+			!strings.Contains(expr.SQL, "source_object_index.size_bytes") {
+			t.Fatalf("size_bytes update should keep existing feishu export size when incoming size is zero: %q", expr.SQL)
+		}
+		return
+	}
+	t.Fatalf("size_bytes assignment was not configured")
+}
+
+type storeFakeQuery struct {
+	columns []string
+	rows    [][]driver.Value
+	wantSQL []string
+}
+
+type storeFakeDriver struct{}
+
+type storeFakeConn struct {
+	dsn string
+}
+
+type storeFakeRows struct {
+	columns []string
+	rows    [][]driver.Value
+	index   int
+}
+
+var (
+	storeFakeDriverOnce sync.Once
+	storeFakeMu         sync.Mutex
+	storeFakeQueries    = map[string][]storeFakeQuery{}
+)
+
+func openStoreFakeDB(t *testing.T, queries []storeFakeQuery) *sql.DB {
+	t.Helper()
+	storeFakeDriverOnce.Do(func() {
+		sql.Register("scan_store_fake", storeFakeDriver{})
+	})
+	dsn := fmt.Sprintf("%s-%d", t.Name(), time.Now().UnixNano())
+	storeFakeMu.Lock()
+	storeFakeQueries[dsn] = queries
+	storeFakeMu.Unlock()
+	db, err := sql.Open("scan_store_fake", dsn)
+	if err != nil {
+		t.Fatalf("open fake db: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+		storeFakeMu.Lock()
+		delete(storeFakeQueries, dsn)
+		storeFakeMu.Unlock()
+	})
+	return db
+}
+
+func (storeFakeDriver) Open(name string) (driver.Conn, error) {
+	return storeFakeConn{dsn: name}, nil
+}
+
+func (storeFakeConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("prepare is not supported by storeFakeConn")
+}
+
+func (storeFakeConn) Close() error {
+	return nil
+}
+
+func (storeFakeConn) Begin() (driver.Tx, error) {
+	return nil, errors.New("transactions are not supported by storeFakeConn")
+}
+
+func (c storeFakeConn) QueryContext(_ context.Context, sql string, _ []driver.NamedValue) (driver.Rows, error) {
+	storeFakeMu.Lock()
+	defer storeFakeMu.Unlock()
+	queries := storeFakeQueries[c.dsn]
+	if len(queries) == 0 {
+		return nil, errors.New("unexpected query")
+	}
+	query := queries[0]
+	storeFakeQueries[c.dsn] = queries[1:]
+	for _, want := range query.wantSQL {
+		if !strings.Contains(sql, want) {
+			return nil, fmt.Errorf("query %q missing %q", sql, want)
+		}
+	}
+	return &storeFakeRows{columns: query.columns, rows: query.rows}, nil
+}
+
+func (r *storeFakeRows) Columns() []string {
+	return r.columns
+}
+
+func (r *storeFakeRows) Close() error {
+	return nil
+}
+
+func (r *storeFakeRows) Next(dest []driver.Value) error {
+	if r.index >= len(r.rows) {
+		return io.EOF
+	}
+	copy(dest, r.rows[r.index])
+	r.index++
+	return nil
+}
+
+func assertStoreJSONNumber(t *testing.T, value any, want string) {
+	t.Helper()
+	number, ok := value.(json.Number)
+	if !ok {
+		t.Fatalf("expected json.Number %q, got %#v", want, value)
+	}
+	if number.String() != want {
+		t.Fatalf("unexpected number: got=%s want=%s", number.String(), want)
+	}
+}
+
+func assertValidJSONTextParam(t *testing.T, value any, name string) {
+	t.Helper()
+	text, ok := value.(string)
+	if !ok {
+		t.Fatalf("%s JSON param must be string, got %T", name, value)
+	}
+	var decoded map[string]any
+	decoder := json.NewDecoder(strings.NewReader(text))
+	decoder.UseNumber()
+	if err := decoder.Decode(&decoded); err != nil {
+		t.Fatalf("%s JSON param is invalid: %v text=%q", name, err, text)
+	}
+}
+
+func assertSQLiteUniqueIndex(t *testing.T, db *sql.DB, table, indexName string, wantColumns []string) {
+	t.Helper()
+
+	rows, err := db.Query("PRAGMA index_list(" + table + ")")
+	if err != nil {
+		t.Fatalf("list sqlite indexes for %s: %v", table, err)
+	}
+	defer rows.Close()
+
+	found := false
+	for rows.Next() {
+		var seq int
+		var name string
+		var unique int
+		var origin string
+		var partial int
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			t.Fatalf("scan sqlite index for %s: %v", table, err)
+		}
+		if name == indexName {
+			if unique != 1 {
+				t.Fatalf("sqlite index %s on %s is not unique", indexName, table)
+			}
+			found = true
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("scan sqlite indexes for %s: %v", table, err)
+	}
+	if !found {
+		t.Fatalf("sqlite index %s on %s not found", indexName, table)
+	}
+
+	columnRows, err := db.Query("PRAGMA index_info(" + indexName + ")")
+	if err != nil {
+		t.Fatalf("read sqlite index info for %s: %v", indexName, err)
+	}
+	defer columnRows.Close()
+
+	var gotColumns []string
+	for columnRows.Next() {
+		var seqno int
+		var cid int
+		var name string
+		if err := columnRows.Scan(&seqno, &cid, &name); err != nil {
+			t.Fatalf("scan sqlite index info for %s: %v", indexName, err)
+		}
+		gotColumns = append(gotColumns, name)
+	}
+	if err := columnRows.Err(); err != nil {
+		t.Fatalf("scan sqlite index columns for %s: %v", indexName, err)
+	}
+	if fmt.Sprint(gotColumns) != fmt.Sprint(wantColumns) {
+		t.Fatalf("sqlite index %s columns = %v, want %v", indexName, gotColumns, wantColumns)
+	}
+}
+
+func assertSQLiteCount(t *testing.T, db *sql.DB, name, query string, want int) {
+	t.Helper()
+	var got int
+	if err := db.QueryRow(query).Scan(&got); err != nil {
+		t.Fatalf("count %s: %v", name, err)
+	}
+	if got != want {
+		t.Fatalf("count %s = %d, want %d", name, got, want)
+	}
+}
+
+func insertSQLiteRepairDuplicates(t *testing.T, db *sql.DB) {
+	t.Helper()
+	statements := []string{
+		`INSERT INTO sources (source_id, tenant_id, created_by, name, dataset_id, status, source_options_json, include_extensions_json, exclude_extensions_json, config_version, deleted_at, created_at, updated_at)
+		 VALUES ('source-1', 'tenant-1', 'user-1', 'Docs', 'dataset-1', 'ACTIVE', '{}', '{}', '{}', 1, NULL, '2026-07-07 11:00:00+00:00', '2026-07-07 11:00:00+00:00')`,
+		`INSERT INTO source_bindings (binding_id, source_id, binding_type, connector_type, target_type, target_ref, target_fingerprint, agent_id, auth_connection_id, provider_options_json, tree_key, binding_generation, core_parent_document_id, core_parent_document_name, sync_mode, schedule_policy_json, next_sync_at, include_extensions_json, exclude_extensions_json, status, last_error, deleted_at, created_at, updated_at)
+		 VALUES ('binding-old', 'source-1', 'connector_target', 'local_fs', 'local_path', '/docs', 'target-1', NULL, NULL, '{}', 'tree-root', 1, 'folder-old', 'Docs Old', 'manual', '{}', NULL, '{}', '{}', 'ACTIVE', '{}', NULL, '2026-07-07 11:00:00+00:00', '2026-07-07 11:00:00+00:00')`,
+		`INSERT INTO source_bindings (binding_id, source_id, binding_type, connector_type, target_type, target_ref, target_fingerprint, agent_id, auth_connection_id, provider_options_json, tree_key, binding_generation, core_parent_document_id, core_parent_document_name, sync_mode, schedule_policy_json, next_sync_at, include_extensions_json, exclude_extensions_json, status, last_error, deleted_at, created_at, updated_at)
+		 VALUES ('binding-keep', 'source-1', 'connector_target', 'local_fs', 'local_path', '/docs', 'target-1', NULL, NULL, '{}', 'tree-root', 1, 'folder-keep', 'Docs Keep', 'manual', '{}', NULL, '{}', '{}', 'ACTIVE', '{}', NULL, '2026-07-07 11:01:00+00:00', '2026-07-07 11:01:00+00:00')`,
+		`INSERT INTO documents (document_id, tenant_id, source_id, binding_id, object_key, core_document_id, current_version_id, desired_version_id, source_version, display_name, mime_type, file_extension, parse_status, created_at, updated_at)
+		 VALUES ('document-1', 'tenant-1', 'source-1', 'binding-keep', 'doc-key', 'core-1', 'current-1', 'desired-1', 'source-v1', 'Doc', 'text/plain', '.txt', 'PENDING', '2026-07-07 11:00:00+00:00', '2026-07-07 11:00:00+00:00')`,
+		`INSERT INTO documents (document_id, tenant_id, source_id, binding_id, object_key, core_document_id, current_version_id, desired_version_id, source_version, display_name, mime_type, file_extension, parse_status, created_at, updated_at)
+		 VALUES ('document-2', 'tenant-1', 'source-1', 'binding-keep', 'doc-key', 'core-2', 'current-2', 'desired-2', 'source-v2', 'Doc', 'text/plain', '.txt', 'PENDING', '2026-07-07 11:01:00+00:00', '2026-07-07 11:01:00+00:00')`,
+		`INSERT INTO parse_tasks (task_id, tenant_id, source_id, binding_id, binding_generation, object_key, document_id, task_action, target_version_id, source_version, core_parent_document_id, idempotency_key, status, core_task_id, core_document_id, lease_owner, lease_until, retry_count, next_run_at, last_error, created_at, updated_at)
+		 VALUES ('task-doc-ref', 'tenant-1', 'source-1', 'binding-keep', 1, 'doc-key', 'document-1', 'parse', 'version-doc-ref', 'source-v1', 'folder-keep', 'idempotency-doc-ref', 'FAILED', NULL, NULL, NULL, NULL, 0, '2026-07-07 12:00:00+00:00', '{}', '2026-07-07 11:02:00+00:00', '2026-07-07 11:02:00+00:00')`,
+		`INSERT INTO parse_tasks (task_id, tenant_id, source_id, binding_id, binding_generation, object_key, document_id, task_action, target_version_id, source_version, core_parent_document_id, idempotency_key, status, core_task_id, core_document_id, lease_owner, lease_until, retry_count, next_run_at, last_error, created_at, updated_at)
+		 VALUES ('task-idem-old', 'tenant-1', 'source-1', 'binding-keep', 1, 'doc-key', 'document-2', 'parse', 'version-idem-old', 'source-v1', 'folder-keep', 'idempotency-dup', 'FAILED', NULL, NULL, NULL, NULL, 0, '2026-07-07 12:00:00+00:00', '{}', '2026-07-07 11:03:00+00:00', '2026-07-07 11:03:00+00:00')`,
+		`INSERT INTO parse_tasks (task_id, tenant_id, source_id, binding_id, binding_generation, object_key, document_id, task_action, target_version_id, source_version, core_parent_document_id, idempotency_key, status, core_task_id, core_document_id, lease_owner, lease_until, retry_count, next_run_at, last_error, created_at, updated_at)
+		 VALUES ('task-idem-keep', 'tenant-1', 'source-1', 'binding-keep', 1, 'doc-key', 'document-2', 'parse', 'version-idem-keep', 'source-v1', 'folder-keep', 'idempotency-dup', 'FAILED', NULL, NULL, NULL, NULL, 0, '2026-07-07 12:00:00+00:00', '{}', '2026-07-07 11:04:00+00:00', '2026-07-07 11:04:00+00:00')`,
+		`INSERT INTO parse_tasks (task_id, tenant_id, source_id, binding_id, binding_generation, object_key, document_id, task_action, target_version_id, source_version, core_parent_document_id, idempotency_key, status, core_task_id, core_document_id, lease_owner, lease_until, retry_count, next_run_at, last_error, created_at, updated_at)
+		 VALUES ('task-active-old', 'tenant-1', 'source-1', 'binding-keep', 1, 'doc-key', 'document-2', 'parse', 'version-active', 'source-v1', 'folder-keep', 'idempotency-active-old', 'PENDING', NULL, NULL, NULL, NULL, 0, '2026-07-07 12:00:00+00:00', '{}', '2026-07-07 11:05:00+00:00', '2026-07-07 11:05:00+00:00')`,
+		`INSERT INTO parse_tasks (task_id, tenant_id, source_id, binding_id, binding_generation, object_key, document_id, task_action, target_version_id, source_version, core_parent_document_id, idempotency_key, status, core_task_id, core_document_id, lease_owner, lease_until, retry_count, next_run_at, last_error, created_at, updated_at)
+		 VALUES ('task-active-keep', 'tenant-1', 'source-1', 'binding-keep', 1, 'doc-key', 'document-2', 'parse', 'version-active', 'source-v1', 'folder-keep', 'idempotency-active-keep', 'RUNNING', NULL, NULL, NULL, NULL, 0, '2026-07-07 12:00:00+00:00', '{}', '2026-07-07 11:06:00+00:00', '2026-07-07 11:06:00+00:00')`,
+		`INSERT INTO source_sync_runs (run_id, source_id, binding_id, binding_generation, trigger_type, scheduled_fire_at, scope_type, scope_ref_json, coverage_json, status, seen_count, new_count, modified_count, deleted_count, unchanged_count, error_code, error_message, started_at, finished_at)
+		 VALUES ('run-old', 'source-1', 'binding-keep', 1, 'scheduled', '2026-07-07 12:00:00+00:00', 'full', '{}', '{}', 'PENDING', 0, 0, 0, 0, 0, NULL, NULL, '2026-07-07 11:00:00+00:00', NULL)`,
+		`INSERT INTO source_sync_runs (run_id, source_id, binding_id, binding_generation, trigger_type, scheduled_fire_at, scope_type, scope_ref_json, coverage_json, status, seen_count, new_count, modified_count, deleted_count, unchanged_count, error_code, error_message, started_at, finished_at)
+		 VALUES ('run-keep', 'source-1', 'binding-keep', 1, 'scheduled', '2026-07-07 12:00:00+00:00', 'full', '{}', '{}', 'RUNNING', 0, 0, 0, 0, 0, NULL, NULL, '2026-07-07 11:01:00+00:00', NULL)`,
+		`INSERT INTO data_source_create_operations (operation_id, caller_id, request_id, request_hash, source_id, dataset_id, created_core_parent_document_ids_json, created_binding_ids_json, warning_json, status, compensation_status, compensation_error, created_at, updated_at)
+		 VALUES ('op-old', 'user-1', 'request-1', 'hash-1', NULL, NULL, '{}', '{}', '{}', 'PENDING', 'NONE', '{}', '2026-07-07 11:00:00+00:00', '2026-07-07 11:00:00+00:00')`,
+		`INSERT INTO data_source_create_operations (operation_id, caller_id, request_id, request_hash, source_id, dataset_id, created_core_parent_document_ids_json, created_binding_ids_json, warning_json, status, compensation_status, compensation_error, created_at, updated_at)
+		 VALUES ('op-keep', 'user-1', 'request-1', 'hash-1', 'source-1', 'dataset-1', '{}', '{}', '{}', 'SUCCEEDED', 'NONE', '{}', '2026-07-07 11:01:00+00:00', '2026-07-07 11:01:00+00:00')`,
+	}
+	for _, statement := range statements {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("insert sqlite repair fixture: %v\n%s", err, statement)
+		}
+	}
+}
+
+func fillObjectScan(dest []any, now time.Time) {
+	*(dest[0].(*string)) = "source-1"
+	*(dest[1].(*string)) = "binding-1"
+	*(dest[2].(*string)) = "tree-root"
+	*(dest[3].(*string)) = "doc-1"
+	*(dest[4].(*sql.NullString)) = sql.NullString{}
+	*(dest[5].(*string)) = "Doc 1"
+	*(dest[6].(*string)) = "doc 1"
+	*(dest[7].(*string)) = "file"
+	*(dest[8].(*bool)) = true
+	*(dest[9].(*bool)) = false
+	*(dest[10].(*bool)) = false
+	*(dest[11].(*sql.NullString)) = sql.NullString{String: "v1", Valid: true}
+	*(dest[12].(*sql.NullInt64)) = sql.NullInt64{Int64: 3, Valid: true}
+	*(dest[13].(*sql.NullString)) = sql.NullString{String: "text/markdown", Valid: true}
+	*(dest[14].(*sql.NullString)) = sql.NullString{String: ".md", Valid: true}
+	*(dest[15].(*sql.NullTime)) = sql.NullTime{Time: now, Valid: true}
+	*(dest[16].(*sql.NullTime)) = sql.NullTime{}
+	*(dest[17].(*int64)) = 0
+	*(dest[18].(*[]byte)) = []byte(`{"id":"doc-1"}`)
+	*(dest[19].(*sql.NullString)) = sql.NullString{String: "run-1", Valid: true}
+	*(dest[20].(*time.Time)) = now
+	*(dest[21].(*time.Time)) = now
+}
+
+func fillDocumentStateScan(dest []any, now time.Time) {
+	*(dest[0].(*sql.NullString)) = sql.NullString{String: "source-1", Valid: true}
+	*(dest[1].(*sql.NullString)) = sql.NullString{String: "binding-1", Valid: true}
+	*(dest[2].(*sql.NullInt64)) = sql.NullInt64{Int64: 1, Valid: true}
+	*(dest[3].(*sql.NullString)) = sql.NullString{String: "doc-1", Valid: true}
+	*(dest[4].(*sql.NullString)) = sql.NullString{String: "v1", Valid: true}
+	*(dest[5].(*sql.NullString)) = sql.NullString{String: "baseline-1", Valid: true}
+	*(dest[6].(*sql.NullTime)) = sql.NullTime{}
+	*(dest[7].(*sql.NullString)) = sql.NullString{String: "NEW", Valid: true}
+	*(dest[8].(*sql.NullString)) = sql.NullString{String: "IDLE", Valid: true}
+	*(dest[9].(*sql.NullString)) = sql.NullString{String: "CREATE", Valid: true}
+	*(dest[10].(*sql.NullBool)) = sql.NullBool{Bool: true, Valid: true}
+	*(dest[11].(*sql.NullBool)) = sql.NullBool{Bool: true, Valid: true}
+	*(dest[12].(*sql.NullString)) = sql.NullString{String: "NONE", Valid: true}
+	*(dest[13].(*sql.NullString)) = sql.NullString{}
+	*(dest[14].(*sql.NullString)) = sql.NullString{}
+	*(dest[15].(*sql.NullTime)) = sql.NullTime{Time: now, Valid: true}
+	*(dest[16].(*sql.NullTime)) = sql.NullTime{}
+	*(dest[17].(*[]byte)) = nil
+	*(dest[18].(*sql.NullTime)) = sql.NullTime{Time: now, Valid: true}
+	*(dest[19].(*sql.NullTime)) = sql.NullTime{Time: now, Valid: true}
+}
+
+func fillNullDocumentStateScan(dest []any) {
+	*(dest[0].(*sql.NullString)) = sql.NullString{}
+	*(dest[1].(*sql.NullString)) = sql.NullString{}
+	*(dest[2].(*sql.NullInt64)) = sql.NullInt64{}
+	*(dest[3].(*sql.NullString)) = sql.NullString{}
+	*(dest[4].(*sql.NullString)) = sql.NullString{}
+	*(dest[5].(*sql.NullString)) = sql.NullString{}
+	*(dest[6].(*sql.NullTime)) = sql.NullTime{}
+	*(dest[7].(*sql.NullString)) = sql.NullString{}
+	*(dest[8].(*sql.NullString)) = sql.NullString{}
+	*(dest[9].(*sql.NullString)) = sql.NullString{}
+	*(dest[10].(*sql.NullBool)) = sql.NullBool{}
+	*(dest[11].(*sql.NullBool)) = sql.NullBool{}
+	*(dest[12].(*sql.NullString)) = sql.NullString{}
+	*(dest[13].(*sql.NullString)) = sql.NullString{}
+	*(dest[14].(*sql.NullString)) = sql.NullString{}
+	*(dest[15].(*sql.NullTime)) = sql.NullTime{}
+	*(dest[16].(*sql.NullTime)) = sql.NullTime{}
+	*(dest[17].(*[]byte)) = nil
+	*(dest[18].(*sql.NullTime)) = sql.NullTime{}
+	*(dest[19].(*sql.NullTime)) = sql.NullTime{}
+}
+
+func fillNullDocumentScan(dest []any) {
+	*(dest[0].(*sql.NullString)) = sql.NullString{}
+	*(dest[1].(*sql.NullString)) = sql.NullString{}
+	*(dest[2].(*sql.NullString)) = sql.NullString{}
+	*(dest[3].(*sql.NullString)) = sql.NullString{}
+	*(dest[4].(*sql.NullString)) = sql.NullString{}
+	*(dest[5].(*sql.NullString)) = sql.NullString{}
+	*(dest[6].(*sql.NullString)) = sql.NullString{}
+	*(dest[7].(*sql.NullString)) = sql.NullString{}
+	*(dest[8].(*sql.NullString)) = sql.NullString{}
+	*(dest[9].(*sql.NullString)) = sql.NullString{}
+	*(dest[10].(*sql.NullString)) = sql.NullString{}
+	*(dest[11].(*sql.NullString)) = sql.NullString{}
+	*(dest[12].(*sql.NullString)) = sql.NullString{}
+	*(dest[13].(*sql.NullTime)) = sql.NullTime{}
+	*(dest[14].(*sql.NullTime)) = sql.NullTime{}
+}
+
+func storeFakeColumns(count int) []string {
+	columns := make([]string, count)
+	for i := range columns {
+		columns[i] = fmt.Sprintf("column_%d", i)
+	}
+	return columns
+}
+
+func objectWithStateRowValues(now time.Time, includeState bool) []driver.Value {
+	values := []driver.Value{
+		"source-1", "binding-1", "tree-root", "doc-1", nil,
+		"Doc 1", "doc 1", "file", true, false,
+		false, "v1", int64(3), "text/markdown", ".md",
+		now, nil, int64(0), []byte(`{"id":"doc-1"}`), "run-1",
+		now, now,
+	}
+	if includeState {
+		return append(values,
+			"source-1", "binding-1", int64(1), "doc-1", "v1",
+			"baseline-1", nil, "NEW", "IDLE", "CREATE",
+			true, true, "NONE", nil, nil,
+			now, nil, nil, now, now,
+		)
+	}
+	return append(values,
+		nil, nil, nil, nil, nil,
+		nil, nil, nil, nil, nil,
+		nil, nil, nil, nil, nil,
+		nil, nil, nil, nil, nil,
+	)
+}
+
+func documentWithStateRowValues(now time.Time, includeDocument bool) []driver.Value {
+	values := append([]driver.Value(nil), objectWithStateRowValues(now, true)...)
+	if includeDocument {
+		return append(values,
+			"document-1", "tenant-1", "source-1", "binding-1", "doc-1",
+			"core-document-1", "current-version-1", "desired-version-1", "v1", "Doc 1",
+			"text/markdown", ".md", "PENDING", now, now,
+		)
+	}
+	return append(values,
+		nil, nil, nil, nil, nil,
+		nil, nil, nil, nil, nil,
+		nil, nil, nil, nil, nil,
+	)
+}

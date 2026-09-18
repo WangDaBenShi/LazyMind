@@ -1,0 +1,314 @@
+package access
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/lazymind/scan_control_plane/internal/sourceengine/connector"
+	"github.com/lazymind/scan_control_plane/internal/sourceengine/connector/localfs"
+	store "github.com/lazymind/scan_control_plane/internal/store/source"
+)
+
+func TestDefaultCheckerCanUseAgentAllowsSameTenantOnlineAgent(t *testing.T) {
+	t.Parallel()
+
+	checker := NewDefaultChecker(&checkerStore{
+		agent: store.Agent{AgentID: "agent-1", TenantID: "tenant-1", Status: "ONLINE"},
+	})
+
+	if err := checker.CanUseAgent(context.Background(), Actor{UserID: "user-1", TenantID: "tenant-1"}, "agent-1"); err != nil {
+		t.Fatalf("expected online same-tenant agent to be allowed, got %v", err)
+	}
+}
+
+func TestDefaultCheckerCanUseAgentAllowsEmptyTenantAgent(t *testing.T) {
+	t.Parallel()
+
+	checker := NewDefaultChecker(&checkerStore{
+		agent: store.Agent{AgentID: "agent-1", Status: "ONLINE"},
+	})
+
+	if err := checker.CanUseAgent(context.Background(), Actor{UserID: "user-1"}, "agent-1"); err != nil {
+		t.Fatalf("expected online empty-tenant agent to be allowed, got %v", err)
+	}
+}
+
+func TestDefaultCheckerCanUseAgentRejectsCrossTenantOrUnavailableAgent(t *testing.T) {
+	t.Parallel()
+
+	actor := Actor{UserID: "user-1", TenantID: "tenant-1"}
+	crossTenant := NewDefaultChecker(&checkerStore{
+		agent: store.Agent{AgentID: "agent-1", TenantID: "tenant-2", Status: "ONLINE"},
+	})
+	if err := crossTenant.CanUseAgent(context.Background(), actor, "agent-1"); ErrorCodeOf(err) != ErrCodeForbidden {
+		t.Fatalf("expected cross-tenant agent forbidden, got %v", err)
+	}
+
+	offline := NewDefaultChecker(&checkerStore{
+		agent: store.Agent{AgentID: "agent-1", TenantID: "tenant-1", Status: "OFFLINE"},
+	})
+	if err := offline.CanUseAgent(context.Background(), actor, "agent-1"); ErrorCodeOf(err) != ErrCodeForbidden {
+		t.Fatalf("expected offline agent forbidden, got %v", err)
+	}
+}
+
+func TestDefaultCheckerCanUseAuthConnectionUsesVerifier(t *testing.T) {
+	t.Parallel()
+
+	verifier := &authVerifierStub{}
+	checker := NewDefaultChecker(&checkerStore{}, WithAuthConnectionVerifier(verifier))
+
+	if err := checker.CanUseAuthConnection(context.Background(), Actor{UserID: "user-1", TenantID: "tenant-1"}, "auth-1"); err != nil {
+		t.Fatalf("expected verifier success to allow auth connection, got %v", err)
+	}
+	if verifier.actor.UserID != "user-1" || verifier.actor.TenantID != "tenant-1" || verifier.authConnectionID != "auth-1" {
+		t.Fatalf("verifier did not receive caller and auth connection: %+v auth=%q", verifier.actor, verifier.authConnectionID)
+	}
+
+	denied := connector.NewError("AUTH_CONNECTION_INVALID", "invalid")
+	checker = NewDefaultChecker(&checkerStore{}, WithAuthConnectionVerifier(&authVerifierStub{err: denied}))
+	if err := checker.CanUseAuthConnection(context.Background(), Actor{UserID: "user-1", TenantID: "tenant-1"}, "auth-1"); err == nil {
+		t.Fatalf("expected verifier error to deny auth connection")
+	}
+}
+
+func TestDefaultCheckerSourceActionsUsePermissionVerifier(t *testing.T) {
+	t.Parallel()
+
+	actor := Actor{UserID: "collab-1", TenantID: "tenant-1"}
+	source := store.Source{SourceID: "source-1", TenantID: "tenant-1", CreatedBy: "owner-1"}
+	verifier := &sourcePermissionVerifierStub{
+		allowed: map[SourceAction]bool{
+			SourceActionRead:  true,
+			SourceActionWrite: true,
+		},
+	}
+	checker := NewDefaultChecker(&checkerStore{source: source}, WithSourcePermissionVerifier(verifier))
+
+	if err := checker.CanReadSource(context.Background(), actor, "source-1"); err != nil {
+		t.Fatalf("expected read collaborator to be allowed, got %v", err)
+	}
+	if err := checker.CanWriteSource(context.Background(), actor, "source-1"); err != nil {
+		t.Fatalf("expected write collaborator to be allowed, got %v", err)
+	}
+	if err := checker.CanDeleteSource(context.Background(), actor, "source-1"); ErrorCodeOf(err) != ErrCodeForbidden {
+		t.Fatalf("expected delete without permission to be forbidden, got %v", err)
+	}
+	if got := verifier.actions; len(got) != 3 || got[0] != SourceActionRead || got[1] != SourceActionWrite || got[2] != SourceActionDelete {
+		t.Fatalf("source actions were not checked separately: %+v", got)
+	}
+}
+
+func TestDefaultCheckerDefaultOwnerPolicyAllowsEmptyTenantSource(t *testing.T) {
+	t.Parallel()
+
+	checker := NewDefaultChecker(&checkerStore{
+		source: store.Source{SourceID: "source-1", CreatedBy: "owner-1"},
+	})
+
+	if err := checker.CanWriteSource(context.Background(), Actor{UserID: "owner-1"}, "source-1"); err != nil {
+		t.Fatalf("expected owner to access empty-tenant source, got %v", err)
+	}
+}
+
+func TestDefaultCheckerDefaultOwnerPolicyRejectsNonOwner(t *testing.T) {
+	t.Parallel()
+
+	checker := NewDefaultChecker(&checkerStore{
+		source: store.Source{SourceID: "source-1", TenantID: "tenant-1", CreatedBy: "owner-1"},
+	})
+	err := checker.CanReadSource(context.Background(), Actor{UserID: "user-2", TenantID: "tenant-1"}, "source-1")
+	if ErrorCodeOf(err) != ErrCodeForbidden {
+		t.Fatalf("expected non-owner forbidden by fallback owner policy, got %v", err)
+	}
+}
+
+func TestDefaultCheckerDoesNotCheckRealtimeAdminForNonLocalSource(t *testing.T) {
+	t.Parallel()
+
+	admin := &adminVerifierStub{}
+	checker := NewDefaultChecker(&checkerStore{
+		source: store.Source{SourceID: "source-1", TenantID: "tenant-1", CreatedBy: "owner-1", SourceOptions: store.JSON{"source_type": "feishu"}},
+	}, WithAdminVerifier(admin))
+
+	if err := checker.CanReadSource(context.Background(), Actor{UserID: "owner-1", TenantID: "tenant-1"}, "source-1"); err != nil {
+		t.Fatalf("expected non-local owner to be allowed, got %v", err)
+	}
+	if admin.calls != 0 {
+		t.Fatalf("non-local source should not call realtime admin verifier, got %d calls", admin.calls)
+	}
+}
+
+func TestDefaultCheckerBlocksLocalSourceForRealtimeNonAdmin(t *testing.T) {
+	t.Parallel()
+
+	checker := NewDefaultChecker(&checkerStore{
+		source: store.Source{SourceID: "source-1", TenantID: "tenant-1", CreatedBy: "owner-1", SourceOptions: store.JSON{"source_type": "local"}},
+	}, WithAdminVerifier(&adminVerifierStub{}))
+	actor := Actor{UserID: "owner-1", TenantID: "tenant-1"}
+
+	if err := checker.CanReadSource(context.Background(), actor, "source-1"); ErrorCodeOf(err) != ErrCodeForbidden {
+		t.Fatalf("expected local source read to be forbidden for realtime non-admin, got %v", err)
+	}
+	ids, err := checker.ListReadableSourceIDs(context.Background(), actor)
+	if err != nil {
+		t.Fatalf("list readable source ids: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("local source should be filtered for realtime non-admin, got %+v", ids)
+	}
+}
+
+func TestDefaultCheckerAllowsLocalSourceForRealtimeAdmin(t *testing.T) {
+	t.Parallel()
+
+	checker := NewDefaultChecker(&checkerStore{
+		source: store.Source{SourceID: "source-1", TenantID: "tenant-1", CreatedBy: "owner-1", SourceOptions: store.JSON{"source_type": "local_fs"}},
+	}, WithAdminVerifier(&adminVerifierStub{admin: true}))
+
+	if err := checker.CanWriteSource(context.Background(), Actor{UserID: "owner-1", TenantID: "tenant-1"}, "source-1"); err != nil {
+		t.Fatalf("expected realtime admin owner to access local source, got %v", err)
+	}
+}
+
+func TestDefaultCheckerBlocksSourceWithLocalBindingForRealtimeNonAdmin(t *testing.T) {
+	t.Parallel()
+
+	checker := NewDefaultChecker(&checkerStore{
+		source:   store.Source{SourceID: "source-1", TenantID: "tenant-1", CreatedBy: "owner-1"},
+		bindings: []store.Binding{{BindingID: "binding-1", SourceID: "source-1", ConnectorType: string(localfs.ConnectorType), TargetType: string(localfs.TargetTypeLocalPath), Status: "ACTIVE"}},
+	}, WithAdminVerifier(&adminVerifierStub{}))
+
+	if err := checker.CanWriteSource(context.Background(), Actor{UserID: "owner-1", TenantID: "tenant-1"}, "source-1"); ErrorCodeOf(err) != ErrCodeForbidden {
+		t.Fatalf("expected source with local binding to be forbidden for realtime non-admin, got %v", err)
+	}
+}
+
+func TestDefaultCheckerBlocksLocalBindingTargetWithoutSourceForRealtimeNonAdmin(t *testing.T) {
+	t.Parallel()
+
+	checker := NewDefaultChecker(&checkerStore{}, WithAdminVerifier(&adminVerifierStub{}))
+	err := checker.CanAccessBindingTarget(context.Background(), Actor{UserID: "user-1", TenantID: "tenant-1"}, BindingTargetRequest{
+		ConnectorType: localfs.ConnectorType,
+		TargetType:    localfs.TargetTypeLocalPath,
+	})
+	if ErrorCodeOf(err) != ErrCodeForbidden {
+		t.Fatalf("expected local binding target to be forbidden for realtime non-admin, got %v", err)
+	}
+}
+
+func TestDefaultCheckerLocalGuardTreatsVerifierErrorAsNonAdmin(t *testing.T) {
+	t.Parallel()
+
+	checker := NewDefaultChecker(&checkerStore{}, WithAdminVerifier(&adminVerifierStub{err: errors.New("auth unavailable")}))
+	if !checker.ShouldBlockLocalSourceAccess(context.Background(), Actor{UserID: "user-1"}, LocalSourceAccessRequest{
+		BindingTargets: []BindingTargetRequest{{TargetType: localfs.TargetTypeLocalPath}},
+	}) {
+		t.Fatalf("expected local access to be blocked when realtime admin verifier fails")
+	}
+	if checker.ShouldBlockLocalSourceAccess(context.Background(), Actor{UserID: "user-1"}, LocalSourceAccessRequest{
+		BindingTargets: []BindingTargetRequest{{ConnectorType: "feishu", TargetType: "wiki_node"}},
+	}) {
+		t.Fatalf("expected non-local access not to be blocked even if verifier would fail")
+	}
+}
+
+type checkerStore struct {
+	source   store.Source
+	binding  store.Binding
+	bindings []store.Binding
+	task     store.ParseTaskWithRefs
+	agent    store.Agent
+}
+
+func (s *checkerStore) GetSource(context.Context, string) (store.Source, error) {
+	if s.source.SourceID == "" {
+		return store.Source{}, store.NewStoreError(store.ErrCodeSourceNotFound, "source not found")
+	}
+	return s.source, nil
+}
+
+func (s *checkerStore) GetBinding(context.Context, string, string) (store.Binding, error) {
+	if s.binding.BindingID == "" {
+		return store.Binding{}, store.NewStoreError(store.ErrCodeBindingNotFound, "binding not found")
+	}
+	return s.binding, nil
+}
+
+func (s *checkerStore) ListBindings(context.Context, string) ([]store.Binding, error) {
+	if s.bindings != nil {
+		return s.bindings, nil
+	}
+	if s.binding.BindingID != "" {
+		return []store.Binding{s.binding}, nil
+	}
+	return nil, nil
+}
+
+func (s *checkerStore) GetParseTask(context.Context, string) (store.ParseTaskWithRefs, error) {
+	if s.task.Task.TaskID == "" {
+		return store.ParseTaskWithRefs{}, store.NewStoreError(store.ErrCodeTaskNotFound, "task not found")
+	}
+	return s.task, nil
+}
+
+func (s *checkerStore) ListSourceAccess(context.Context, string) ([]store.Source, error) {
+	if s.source.SourceID == "" {
+		return nil, nil
+	}
+	return []store.Source{s.source}, nil
+}
+
+func (s *checkerStore) GetAgent(context.Context, string) (store.Agent, error) {
+	if s.agent.AgentID == "" {
+		return store.Agent{}, store.NewStoreError(store.ErrCodeAgentNotFound, "agent not found")
+	}
+	if s.agent.UpdatedAt.IsZero() {
+		s.agent.UpdatedAt = time.Now()
+	}
+	return s.agent, nil
+}
+
+type authVerifierStub struct {
+	actor            Actor
+	authConnectionID string
+	err              error
+}
+
+func (v *authVerifierStub) VerifyAuthConnection(_ context.Context, actor Actor, authConnectionID string) error {
+	v.actor = actor
+	v.authConnectionID = authConnectionID
+	return v.err
+}
+
+type adminVerifierStub struct {
+	admin bool
+	err   error
+	calls int
+	actor Actor
+}
+
+func (v *adminVerifierStub) IsAdmin(_ context.Context, actor Actor) (bool, error) {
+	v.calls++
+	v.actor = actor
+	return v.admin, v.err
+}
+
+type sourcePermissionVerifierStub struct {
+	allowed map[SourceAction]bool
+	actions []SourceAction
+}
+
+func (v *sourcePermissionVerifierStub) CanCreateSource(context.Context, Actor) error {
+	return nil
+}
+
+func (v *sourcePermissionVerifierStub) CanAccessSource(_ context.Context, _ Actor, _ store.Source, action SourceAction) error {
+	v.actions = append(v.actions, action)
+	if v.allowed[action] {
+		return nil
+	}
+	return forbidden("access denied")
+}

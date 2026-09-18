@@ -1,0 +1,719 @@
+import { useConversationUnreadStore } from "@/modules/chat/store/conversationUnread";
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import type { WheelEvent as ReactWheelEvent } from "react";
+import { useTranslation } from "react-i18next";
+import i18n from "@/i18n";
+import { Drawer, message } from "antd";
+import { ChatConversationsResponseFinishReasonEnum } from "@/api/generated/chatbot-client";
+import { useChatMessageStore } from "@/modules/chat/store/chatMessage";
+import { RoleTypes } from "@/modules/chat/constants/common";
+import ChatInput, {
+  ChatInputImperativeProps,
+  SKILL_DEPOSIT_MIN_TOOL_CALL_TURNS,
+  SKILL_DEPOSIT_MIN_USER_TURNS,
+  type SkillDepositStats,
+} from "../ChatInput";
+import "./index.scss";
+import MessageList from "./components/MessageList";
+import { ChatSourcePanel } from "../AssistantMessage";
+import ChatMessageContent from "./components/ChatMessageContent";
+import ScrollToBottomButton from "./components/ScrollToBottomButton";
+import ConversationTrail from "./components/ConversationTrail";
+import StreamRecoveryBanner from "./components/StreamRecoveryBanner";
+import CapabilityConfigCard from "../CapabilityConfigCard";
+import { useChatConversation } from "./hooks/useChatConversation";
+import { useCiteMessagesInput } from "./hooks/useCiteMessagesInput";
+import { useThinkingCollapse } from "./hooks/useThinkingCollapse";
+import { useUserMessageEdit } from "./hooks/useUserMessageEdit";
+import type { ChatContainerProps, ChatImperativeProps } from "./types";
+import { useConversationTrail } from "./hooks/useConversationTrail";
+import { ChatServiceApi } from "@/modules/chat/utils/request";
+import { mergeConversationTrailIntoMessageList } from "@/modules/chat/utils/message";
+import type { ChatSource } from "@/modules/chat/utils/sourceAdapter";
+import { foldSessionPerformanceStats } from "@/modules/chat/utils/performanceStats";
+import {
+  DEVELOPER_ACTIVE_EVENT,
+  isDeveloperModeActive,
+} from "@/utils/developerMode";
+import {
+  fetchUserUiPreferences,
+  USER_UI_PREFERENCES_CHANGED_EVENT,
+} from "@/modules/user/uiPreferencesApi";
+import {
+  isPerformanceStatsEnabled,
+  PERFORMANCE_STATS_EVENT,
+} from "@/utils/performanceStatsPreference";
+
+export type { ChatImperativeProps, ChatMessage } from "./types";
+
+const SKILL_DEPOSIT_REMINDER_KEY_PREFIX = "skill-deposit-reminded:";
+const SKILL_DEPOSIT_PROMPT_PREFIXES = ["zh-CN", "en-US"].map((language) =>
+  String(
+    i18n.getResource(language, "translation", "chat.skillDepositPrompt") ?? "",
+  ).split("\n")[0],
+);
+
+function getSkillDepositStats(messageList: any[]): SkillDepositStats {
+  return messageList.reduce<SkillDepositStats>(
+    (stats, item) => {
+      if (item?.role === RoleTypes.USER && !item?.is_resumed) {
+        const hasText = Boolean((item.delta || item.display_delta || "").trim());
+        const hasInputs = Array.isArray(item.inputs) && item.inputs.length > 0;
+        if (hasText || hasInputs) {
+          stats.userTurns += 1;
+        }
+      }
+      if (item?.role === RoleTypes.ASSISTANT) {
+        const toolCallTurns = Number(item.tool_call_turns ?? 0);
+        if (Number.isFinite(toolCallTurns) && toolCallTurns > 0) {
+          stats.toolCallTurns += toolCallTurns;
+        }
+      }
+      return stats;
+    },
+    { userTurns: 0, toolCallTurns: 0 },
+  );
+}
+
+function isSkillDepositPromptMessage(item: any, currentPrompt: string) {
+  if (!item || item.role !== RoleTypes.USER) {
+    return false;
+  }
+
+  const text = String(
+    item.display_delta ||
+      item.delta ||
+      item.inputs?.find((input: any) => input?.input_type === "text")?.text ||
+      "",
+  ).trim();
+  const prompt = currentPrompt.trim();
+  return (
+    Boolean(text) &&
+    (text === prompt ||
+      SKILL_DEPOSIT_PROMPT_PREFIXES.some((prefix) => text.startsWith(prefix)))
+  );
+}
+
+function canScrollVertically(element: HTMLElement, deltaY: number) {
+  const style = window.getComputedStyle(element);
+  if (style.overflowY !== "auto" && style.overflowY !== "scroll") {
+    return false;
+  }
+
+  const maxScrollTop = element.scrollHeight - element.clientHeight;
+  if (maxScrollTop <= 1) {
+    return false;
+  }
+
+  return deltaY < 0 ? element.scrollTop > 0 : element.scrollTop < maxScrollTop;
+}
+
+const ChatContainerComponent = forwardRef<ChatImperativeProps, ChatContainerProps>(
+  (props, ref) => {
+    const { t } = useTranslation();
+    const {
+      canChat = true,
+      initialCard,
+      sessionId = "",
+      onOpenSSE,
+      onOpenResumeSSE,
+      onConversationIdChange,
+      setShowHistoryList,
+      showHistoryList,
+      showHistoryButton = true,
+      setIsChatContent,
+      chatConfig,
+      setChatConfig,
+      setChatConfigFn,
+      knowledgeRefreshKey,
+      allowKnowledgeBaseSelection = true,
+      allowMentions = true,
+      embeddingReady,
+      multimodalEmbeddingReady,
+      rerankReady,
+      disabledReason,
+      disabledDescription,
+      disabledAction,
+      onConversationSettingsChange,
+      initialConversationSettings,
+      hasWorkflowSession,
+      lockedWorkflowMode,
+      conversationTrailEnabled = true,
+      showThinkingDepth = true,
+      showSkillDeposit = true,
+      showConversationConfig = true,
+      showModelSelector = true,
+      fixedThinkingDepth,
+      concurrentStream = false,
+      thinkingDepth,
+      onThinkingDepthChange,
+      onStreamingChange,
+      onRequestPendingChange,
+      onOpenSideChat,
+    } = props;
+
+    const { clearPendingMessage: clearStorePendingMessage } =
+      useChatMessageStore();
+    const chatInputRef = useRef<ChatInputImperativeProps>(null);
+    const userEditRef = useRef<ReturnType<typeof useUserMessageEdit>>();
+    const modelSelectionSavingRef = useRef(false);
+    const [modelSelectionSaving, setModelSelectionSaving] = useState(false);
+    const handleModelSelectionSavingChange = useCallback((saving: boolean) => {
+      modelSelectionSavingRef.current = saving;
+      setModelSelectionSaving(saving);
+    }, []);
+    const [sourcePanelSources, setSourcePanelSources] = useState<ChatSource[]>([]);
+    const skillDepositWasReadyRef = useRef(false);
+    const skillDepositMessageCountRef = useRef(0);
+    const [developerModeActive, setDeveloperModeActive] = useState(isDeveloperModeActive());
+    const [performanceStatsEnabled, setPerformanceStatsEnabled] = useState(
+      isPerformanceStatsEnabled(),
+    );
+
+    useEffect(() => {
+      const syncDeveloper = (event?: Event) => {
+        const detail = (event as CustomEvent<{ active?: boolean }>)?.detail;
+        setDeveloperModeActive(
+          typeof detail?.active === "boolean" ? detail.active : isDeveloperModeActive(),
+        );
+      };
+      const syncPreferences = (event?: Event) => {
+        const detail = (event as CustomEvent<{ performance_stats_enabled?: boolean }>)?.detail;
+        if (typeof detail?.performance_stats_enabled === "boolean") {
+          setPerformanceStatsEnabled(detail.performance_stats_enabled);
+          return;
+        }
+        void fetchUserUiPreferences()
+          .then((prefs) => setPerformanceStatsEnabled(Boolean(prefs.performance_stats_enabled)))
+          .catch(() => undefined);
+      };
+      window.addEventListener(DEVELOPER_ACTIVE_EVENT, syncDeveloper);
+      window.addEventListener(USER_UI_PREFERENCES_CHANGED_EVENT, syncPreferences);
+      const syncPerformancePreference = (event: Event) => {
+        const detail = (event as CustomEvent<{ performance_stats_enabled?: boolean }>)?.detail;
+        if (typeof detail?.performance_stats_enabled === "boolean") {
+          setPerformanceStatsEnabled(detail.performance_stats_enabled);
+        }
+      };
+      window.addEventListener(PERFORMANCE_STATS_EVENT, syncPerformancePreference);
+      syncPreferences();
+      return () => {
+        window.removeEventListener(DEVELOPER_ACTIVE_EVENT, syncDeveloper);
+        window.removeEventListener(USER_UI_PREFERENCES_CHANGED_EVENT, syncPreferences);
+        window.removeEventListener(PERFORMANCE_STATS_EVENT, syncPerformancePreference);
+      };
+    }, []);
+
+    useEffect(() => {
+      setSourcePanelSources([]);
+    }, [sessionId]);
+
+    const {
+      thinkingCollapseMap,
+      toggleThinkingCollapse,
+      isThinkingCollapsed,
+      collapseAllThinking,
+    } = useThinkingCollapse();
+
+    const {
+      citeMessages,
+      citeHistoryIds,
+      handleAddCiteMessage,
+      handleRemoveCiteMessage,
+      clearCiteMessages,
+    } = useCiteMessagesInput(chatInputRef);
+
+    const conversation = useChatConversation({
+      canChat,
+      disabledReason,
+      onOpenSSE,
+      onOpenResumeSSE,
+      onConversationIdChange,
+      setIsChatContent,
+      clearStorePendingMessage,
+      clearCiteMessages,
+      chatInputRef,
+      thinkingCollapseMap,
+      getUserEdit: () => userEditRef.current,
+      isModelSelectionSaving: () => modelSelectionSavingRef.current,
+      concurrentStream,
+      onRequestPendingChange,
+      t,
+    });
+
+    useEffect(() => {
+      onStreamingChange?.(conversation.isStreaming);
+      if (conversation.isStreaming) {
+        onRequestPendingChange?.(false);
+      }
+    }, [conversation.isStreaming, onRequestPendingChange, onStreamingChange]);
+
+    const unreadConversationId = conversation.currentConversationIdRef.current || sessionId;
+    useEffect(() => {
+      if (!concurrentStream) useConversationUnreadStore.getState().setCount(unreadConversationId, conversation.scroll.unreadCount || 0);
+    }, [concurrentStream, unreadConversationId, conversation.scroll.unreadCount]);
+    useEffect(() => () => {
+      if (!concurrentStream) useConversationUnreadStore.getState().setCount(unreadConversationId, 0);
+    }, [concurrentStream, unreadConversationId]);
+
+    const handleRegenerate = useCallback(() => {
+      if (modelSelectionSavingRef.current) {
+        return;
+      }
+      setSourcePanelSources([]);
+      void conversation.regenerate();
+    }, [conversation.regenerate]);
+
+    const chatContentRef = conversation.scroll.chatContentRef;
+    const handleConversationWheel = useCallback(
+      (event: ReactWheelEvent<HTMLDivElement>) => {
+        if (event.deltaY === 0) {
+          return;
+        }
+
+        const target = event.target;
+        const messageContainer = chatContentRef.current;
+        if (
+          !(target instanceof Node) ||
+          !messageContainer ||
+          !event.currentTarget.contains(target)
+        ) {
+          return;
+        }
+
+        if (messageContainer.contains(target)) {
+          return;
+        }
+
+        const targetElement =
+          target instanceof Element ? target : target.parentElement;
+        if (
+          targetElement?.closest(".input-wrapper") ||
+          targetElement?.closest(".chat-source-panel") ||
+          targetElement?.closest(".conversation-trail") ||
+          targetElement?.closest(".writer-markdown-editor")
+        ) {
+          return;
+        }
+
+        let ancestor: HTMLElement | null =
+          targetElement instanceof HTMLElement
+            ? targetElement
+            : targetElement?.parentElement ?? null;
+        while (ancestor && ancestor !== event.currentTarget) {
+          if (canScrollVertically(ancestor, event.deltaY)) {
+            return;
+          }
+          ancestor = ancestor.parentElement;
+        }
+
+        if (event.deltaY < 0) conversation.scroll.pauseFollowing();
+        messageContainer.scrollBy({ top: event.deltaY, behavior: "auto" });
+      },
+      [chatContentRef, conversation.scroll.pauseFollowing],
+    );
+
+    const trailLocateRequestRef = useRef(0);
+    useEffect(() => {
+      trailLocateRequestRef.current += 1;
+      return () => { trailLocateRequestRef.current += 1; };
+    }, [sessionId]);
+
+    const loadTrailHistory = async (historyId: string) => {
+      const id = conversation.currentConversationIdRef.current;
+      if (!id) return false;
+      const request = ++trailLocateRequestRef.current;
+      try {
+        const response = await ChatServiceApi().conversationServiceGetConversationHistory({ name: id, anchorHistoryId: historyId });
+        if (request !== trailLocateRequestRef.current || conversation.currentConversationIdRef.current !== id) return false;
+        conversation.mergeHistoryPage(id, response.data.history || []);
+        return true;
+      } catch {
+        if (request === trailLocateRequestRef.current) message.error(t("chat.fork.historyLoadFailed"));
+        return false;
+      }
+    };
+
+    const trailRefreshKey = `${conversation.messageList.length}:${conversation.isStreaming ? "streaming" : "idle"}`;
+    const conversationTrail = useConversationTrail({
+      conversationId: sessionId,
+      refreshKey: trailRefreshKey,
+      enabled: Boolean(sessionId) && conversationTrailEnabled,
+    });
+    useEffect(() => {
+      if (conversationTrail.items.length === 0) {
+        return;
+      }
+      const merged = mergeConversationTrailIntoMessageList(
+        conversation.messageList,
+        conversationTrail.items,
+      );
+      if (merged === conversation.messageList) {
+        return;
+      }
+      conversation.messageListRef.current = merged;
+      conversation.setMessageList(merged);
+      const currentId = conversation.currentConversationIdRef.current;
+      if (currentId) {
+        conversation.conversationMessagesCache.current.set(currentId, merged);
+      }
+    }, [
+      conversation.messageList,
+      conversationTrail.items,
+    ]);
+
+    const userEdit = useUserMessageEdit({
+      canChat: canChat && !modelSelectionSaving,
+      disabledReason: modelSelectionSaving
+        ? t("chat.modelSelectorSwitching")
+        : disabledReason,
+      loading: conversation.loading || modelSelectionSaving,
+      activeStreamRef: conversation.activeStreamRef,
+      messageList: conversation.messageList,
+      messageListRef: conversation.messageListRef,
+      setMessageList: conversation.setMessageList,
+      currentConversationIdRef: conversation.currentConversationIdRef,
+      conversationMessagesCache: conversation.conversationMessagesCache,
+      openSSE: conversation.openSSE,
+      scrollToEnd: conversation.scroll.scrollToEnd,
+    });
+
+    const sendMessage = useCallback(
+      (params: Parameters<typeof conversation.sendMessage>[0]) => {
+        if (modelSelectionSavingRef.current) {
+          return Promise.resolve(false);
+        }
+        collapseAllThinking();
+        return conversation.sendMessage(params);
+      },
+      [collapseAllThinking, conversation.sendMessage],
+    );
+
+    userEditRef.current = userEdit;
+
+    const skillDepositStats = useMemo(
+      () => getSkillDepositStats(conversation.messageList),
+      [conversation.messageList],
+    );
+    const performanceStats = useMemo(
+      () => foldSessionPerformanceStats(conversation.messageList),
+      [conversation.messageList],
+    );
+    const isLastUserMessageSkillDepositPrompt = useMemo(() => {
+      const lastUserMessage = conversation.messageList.findLast(
+        (item) => item?.role === RoleTypes.USER,
+      );
+      return isSkillDepositPromptMessage(
+        lastUserMessage,
+        t("chat.skillDepositPrompt"),
+      );
+    }, [conversation.messageList, t]);
+    const canSkillDeposit =
+      skillDepositStats.userTurns >= SKILL_DEPOSIT_MIN_USER_TURNS &&
+      skillDepositStats.toolCallTurns >= SKILL_DEPOSIT_MIN_TOOL_CALL_TURNS &&
+      !isLastUserMessageSkillDepositPrompt;
+    const isSkillDepositTurnFinished = useMemo(() => {
+      const lastAssistantMessage = conversation.messageList.findLast(
+        (item) => item?.role === RoleTypes.ASSISTANT,
+      );
+      return Boolean(
+        lastAssistantMessage &&
+          (lastAssistantMessage.run_status ||
+            lastAssistantMessage.finish_reason !==
+              ChatConversationsResponseFinishReasonEnum.FinishReasonUnspecified),
+      );
+    }, [conversation.messageList]);
+    const shouldRemindSkillDeposit =
+      canSkillDeposit &&
+      isSkillDepositTurnFinished &&
+      !conversation.isStreaming &&
+      !conversation.loading;
+
+    useEffect(() => {
+      const previousMessageCount = skillDepositMessageCountRef.current;
+      skillDepositMessageCountRef.current = conversation.messageList.length;
+      if (
+        previousMessageCount === 0 &&
+        conversation.messageList.length > 0 &&
+        canSkillDeposit &&
+        !conversation.isStreaming &&
+        !conversation.loading
+      ) {
+        skillDepositWasReadyRef.current = true;
+      }
+    }, [
+      canSkillDeposit,
+      conversation.isStreaming,
+      conversation.loading,
+      conversation.messageList.length,
+    ]);
+
+    useEffect(() => {
+      if (!canSkillDeposit) {
+        skillDepositWasReadyRef.current = false;
+        return;
+      }
+      if (!shouldRemindSkillDeposit || skillDepositWasReadyRef.current) {
+        return;
+      }
+
+      const conversationId =
+        conversation.currentConversationIdRef.current || sessionId;
+      if (!conversationId || conversationId.startsWith("temp_")) {
+        return;
+      }
+
+      skillDepositWasReadyRef.current = true;
+      const reminderKey = `${SKILL_DEPOSIT_REMINDER_KEY_PREFIX}${conversationId}`;
+      if (sessionStorage.getItem(reminderKey)) {
+        return;
+      }
+      sessionStorage.setItem(reminderKey, "1");
+      message.info(t("chat.skillDepositReminder"));
+    }, [
+      canSkillDeposit,
+      conversation.currentConversationIdRef,
+      sessionId,
+      shouldRemindSkillDeposit,
+      t,
+    ]);
+
+    useImperativeHandle(ref, () => ({
+      replaceMessageList: conversation.replaceMessageList,
+      mergeHistoryPage: conversation.mergeHistoryPage,
+      createNewChat: conversation.createNewChat,
+      sendMessage,
+      prepareMessage: ({
+        text,
+        citeMessage,
+        citeMessages: nextCiteMessages,
+        appendCitations = false,
+      }) => {
+        conversation.setContent(text);
+        if (!appendCitations) {
+          clearCiteMessages();
+        }
+        const citations = nextCiteMessages ?? (citeMessage ? [citeMessage] : []);
+        citations.forEach((citation) => handleAddCiteMessage(citation));
+        requestAnimationFrame(() => chatInputRef.current?.focus());
+      },
+      disconnectConversationStream: conversation.disconnectConversationStream,
+      uploadFiles: (files: File[]) => {
+        chatInputRef.current?.uploadFiles(files);
+      },
+      openResumeSSE: onOpenResumeSSE
+        ? conversation.openResumeSSE
+        : undefined,
+      appendAutoAdvanceTurn: onOpenResumeSSE
+        ? conversation.appendAutoAdvanceTurn
+        : undefined,
+      ensureAutoAdvanceUserTurn: conversation.ensureAutoAdvanceUserTurn,
+      focusInput: () => chatInputRef.current?.focus(),
+    }));
+
+    const renderText = useCallback(
+      (item: any, uniqueKey?: string) => (
+        <ChatMessageContent
+          item={item}
+          uniqueKey={uniqueKey}
+          conversationId={conversation.currentConversationIdRef.current || sessionId}
+          onCiteMessage={handleAddCiteMessage}
+          isThinkingCollapsed={isThinkingCollapsed}
+          onToggleThinkingCollapse={toggleThinkingCollapse}
+        />
+      ),
+      [conversation, handleAddCiteMessage, isThinkingCollapsed, sessionId, toggleThinkingCollapse],
+    );
+
+    const handleSkillDeposit = useCallback(() => {
+      clearCiteMessages();
+      sendMessage({
+        text: t("chat.skillDepositPrompt"),
+        clearInput: true,
+        create_time: new Date().toISOString(),
+      });
+    }, [clearCiteMessages, sendMessage, t]);
+
+    const sourcePanel = !props.onOpenSources && sourcePanelSources.length > 0 ? (
+      <ChatSourcePanel
+        sources={sourcePanelSources}
+        onClose={() => setSourcePanelSources([])}
+      />
+    ) : null;
+
+    return (
+      <div
+        className="chat-chat-container"
+        onWheelCapture={handleConversationWheel}
+      >
+        <div className={`chat-box${sourcePanelSources.length && !props.onOpenSources && !props.sourcePanelOverlay ? " has-source-panel" : ""}`}>
+          <div className="chat-main-column">
+            <MessageList
+              onFork={props.onFork}
+              forkPending={props.forkPending}
+              messageList={conversation.messageList}
+              initialCard={initialCard}
+              suppressAskPending={Boolean(conversation.mediaCapabilityDependency)}
+              capabilityConfigCard={(
+                <CapabilityConfigCard
+                  detail={conversation.mediaCapabilityDependency}
+                  continueDisabled={
+                    !canChat ||
+                    conversation.loading ||
+                    conversation.isStreaming ||
+                    conversation.runtimeWaiting ||
+                    modelSelectionSaving
+                  }
+                  continueLoading={conversation.mediaCapabilityChecking}
+                  onContinue={() => {
+                    setSourcePanelSources([]);
+                    void conversation.continueAfterMediaCapabilityConfiguration();
+                  }}
+                />
+              )}
+              sendMessage={(text, clearInput, extras) => {
+                return sendMessage({ text, clearInput, ...(extras ?? {}) });
+              }}
+              regenerate={handleRegenerate}
+              regenerateDisabled={
+                !canChat ||
+                conversation.loading ||
+                conversation.isStreaming ||
+                conversation.runtimeWaiting ||
+                modelSelectionSaving
+              }
+              stopGeneration={conversation.stopGeneration}
+              renderText={renderText}
+              updateAssistantMessage={conversation.updateAssistantMessage}
+              onCiteMessage={handleAddCiteMessage}
+              onOpenSideChat={onOpenSideChat}
+              onOpenSources={props.onOpenSources ?? setSourcePanelSources}
+              onScroll={conversation.scroll.handleScroll}
+              chatContentRef={conversation.scroll.chatContentRef}
+              sessionId={sessionId}
+              editingUserMessageIndex={userEdit.editingUserMessageIndex}
+              editingUserMessageText={userEdit.editingUserMessageText}
+              editingUserMessageCites={userEdit.editingUserMessageCites}
+              onUserMessageEditTextChange={userEdit.setEditingUserMessageText}
+              onRemoveEditingUserMessageCite={
+                userEdit.handleRemoveEditingUserMessageCite
+              }
+              onStartEditUserMessage={userEdit.handleStartEditUserMessage}
+              onCancelEditUserMessage={userEdit.handleCancelEditUserMessage}
+              onResendEditedUserMessage={userEdit.handleResendEditedUserMessage}
+              onCopyUserMessage={userEdit.handleCopyUserMessage}
+            />
+
+            {conversation.messageList.length > 0 && (
+              <ScrollToBottomButton
+                visible={conversation.scroll.showScrollButton}
+                inputHeight={conversation.scroll.inputHeight}
+                onClick={conversation.scroll.handleToBottom}
+              />
+            )}
+
+            <StreamRecoveryBanner
+              recovery={conversation.streamRecovery}
+              onReconnect={conversation.retryStreamRecovery}
+            />
+
+            <ChatInput
+              sideChatAction={props.sideChatAction}
+              value={conversation.content}
+              onChange={conversation.setContent}
+              onSend={sendMessage}
+              openHistory={
+                setShowHistoryList ? () => setShowHistoryList(true) : undefined
+              }
+              isChatContent={true}
+              showHistoryList={showHistoryList}
+              showHistoryButton={showHistoryButton}
+              showPromptSuggestions={false}
+              openNewChat={conversation.createNewChat}
+              ref={chatInputRef}
+              onHeightChange={conversation.scroll.handleInputHeightChange}
+              chatConfig={chatConfig}
+              setChatConfig={setChatConfig}
+              setChatConfigFn={setChatConfigFn}
+              knowledgeRefreshKey={knowledgeRefreshKey}
+              allowKnowledgeBaseSelection={allowKnowledgeBaseSelection}
+              allowMentions={allowMentions}
+              embeddingReady={embeddingReady}
+              multimodalEmbeddingReady={multimodalEmbeddingReady}
+              rerankReady={rerankReady}
+              sessionId={sessionId}
+              isStreaming={conversation.isStreaming}
+              onStopGeneration={conversation.stopGeneration}
+              disabled={!canChat || conversation.runtimeWaiting}
+              disabledReason={canChat ? undefined : disabledReason}
+              disabledDescription={canChat ? undefined : disabledDescription}
+              disabledAction={canChat ? undefined : disabledAction}
+              citeMessages={citeMessages}
+              citeHistoryIds={citeHistoryIds}
+              onRemoveCiteMessage={handleRemoveCiteMessage}
+              onClearCiteMessage={clearCiteMessages}
+              skillDepositStats={skillDepositStats}
+              skillDepositDisabledReason={
+                isLastUserMessageSkillDepositPrompt
+                  ? t("chat.skillDepositAlreadyRequestedTooltip")
+                  : undefined
+              }
+              onSkillDeposit={handleSkillDeposit}
+              onConversationSettingsChange={onConversationSettingsChange}
+              initialConversationSettings={initialConversationSettings}
+              hasWorkflowSession={hasWorkflowSession}
+              lockedWorkflowMode={lockedWorkflowMode}
+              showThinkingDepth={showThinkingDepth}
+              showSkillDeposit={showSkillDeposit}
+              showConversationConfig={showConversationConfig}
+              showModelSelector={showModelSelector}
+              modelSelectorBusy={conversation.runtimeWaiting}
+              onModelSelectionSavingChange={handleModelSelectionSavingChange}
+              fixedThinkingDepth={fixedThinkingDepth}
+              showPerformanceStats={developerModeActive && performanceStatsEnabled}
+              performanceStats={performanceStats}
+              thinkingDepth={thinkingDepth}
+              onThinkingDepthChange={onThinkingDepthChange}
+            />
+          </div>
+          {!props.sourcePanelOverlay && sourcePanel}
+        </div>
+        <Drawer
+          open={Boolean(props.sourcePanelOverlay && sourcePanelSources.length)}
+          onClose={() => setSourcePanelSources([])}
+          closable={false}
+          mask={false}
+          width="min(360px, 100vw)"
+          zIndex={1100}
+          rootClassName="chat-source-drawer-root"
+          styles={{ body: { padding: 0, display: "flex" } }}
+        >
+          {props.sourcePanelOverlay && sourcePanel}
+        </Drawer>
+        <ConversationTrail
+          key={sessionId || "new-conversation"}
+          items={conversationTrail.items}
+          scrollContainerRef={conversation.scroll.chatContentRef}
+          messageListLength={conversation.messageList.length}
+          loading={conversationTrail.loading}
+          error={conversationTrail.error}
+          onRetry={conversationTrail.retry}
+          onLocate={loadTrailHistory}
+          onNavigate={conversation.scroll.pauseFollowing}
+        />
+      </div>
+    );
+  },
+);
+
+ChatContainerComponent.displayName = "ChatContainerComponent";
+
+export default ChatContainerComponent;

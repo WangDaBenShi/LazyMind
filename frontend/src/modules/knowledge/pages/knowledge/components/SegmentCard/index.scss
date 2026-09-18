@@ -1,0 +1,157 @@
+.segmentCard {
+  align-self: flex-start;
+  width: 100%;
+  margin-bottom: 8px;
+  border: 1px solid #dfe6ef;
+  border-radius: 4px;
+
+  box-shadow: 0 2px 6px 0 rgb(133 158 182 / 15%);
+
+  max-height: 230px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+
+  .segment-number {
+    flex: 0 0 auto;
+    padding: 10px 12px 4px;
+    color: #8d9ab2;
+    font-size: 13px;
+    line-height: 18px;
+    background-color: #fff;
+    cursor: pointer;
+  }
+
+  &:hover {
+    border: 1px solid #006ae6;
+  }
+
+  .content {
+    flex: 1;
+    padding: 0;
+    border-bottom: 1px solid #dfe6ef;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+
+    cursor: pointer;
+
+    .contentInner {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      overflow: hidden;
+      background-color: #fff;
+
+      .mdx-editor-wrapper {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        isolation: isolate;
+
+        .mdx-editor {
+          flex: 1;
+          display: flex;
+          flex-direction: column;
+          min-height: 0;
+          background-color: #fff;
+
+          .mdxeditor-toolbar {
+            flex-shrink: 0;
+            background: white;
+            border-bottom: 1px solid #dfe6ef;
+            border-radius: 4px 4px 0 0;
+          }
+
+          .mdxeditor-root-contenteditable {
+            flex: 1;
+            overflow-y: auto;
+            overflow-x: hidden;
+            padding: 0;
+            min-height: 0;
+          }
+        }
+      }
+    }
+  }
+
+  .contentReadOnly,
+  .contentWithNumber:not(.contentReadOnly) {
+    overflow-y: auto !important;
+    overflow-x: hidden;
+  }
+
+  .contentReadOnly {
+    padding: 10px 12px;
+  }
+
+  .contentWithNumber:not(.contentReadOnly) {
+    padding: 0 12px;
+  }
+
+  .contentInner {
+    height: 100%;
+    overflow: hidden;
+
+    word-break: break-all;
+    white-space: normal;
+
+    img {
+      display: block;
+      max-width: 100%;
+      max-height: 160px;
+      height: auto;
+      margin: 0 auto;
+    }
+
+    .rag-markdown {
+      white-space: normal;
+
+      * {
+        margin-top: 0 !important;
+        margin-bottom: 0 !important;
+        padding-top: 0 !important;
+        padding-bottom: 0 !important;
+
+        font-size: 14px !important;
+        line-height: 22px !important;
+      }
+    }
+  }
+
+  .footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    background-color: #fff;
+
+    color: #8d9ab2;
+
+    .segment-chat-action {
+      height: auto;
+      padding: 0;
+      font-size: 12px;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.15s ease;
+    }
+
+    .delete-icon {
+      font-size: 20px;
+      cursor: pointer;
+
+      &:hover {
+        color: #006ae6;
+      }
+    }
+  }
+
+  &:hover .segment-chat-action,
+  &:focus-within .segment-chat-action {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}

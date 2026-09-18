@@ -1,0 +1,747 @@
+import { Button, message, Modal, Popover, Spin, Tag, Tooltip, Row, Col, Select, Switch, Tabs } from "antd";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import type { ReactNode } from "react";
+import { useTranslation } from "react-i18next";
+import { useParams, useSearchParams, useNavigate } from "react-router-dom";
+import {
+  CopyOutlined,
+  DoubleLeftOutlined,
+  DoubleRightOutlined,
+  FileImageOutlined,
+  HistoryOutlined,
+  SnippetsOutlined,
+  SettingOutlined,
+} from "@ant-design/icons";
+import moment from "moment";
+import { Doc } from "@/api/generated/core-client";
+import type { Conversation } from "@/api/generated/chatbot-client";
+import { Segment } from "@/api/generated/knowledge-client";
+
+import type { Dataset as KnowledgeDataset } from "@/api/generated/knowledge-client";
+import { TIME_FORMAT } from "@/modules/knowledge/constants/common";
+import FileUtils from "@/modules/knowledge/utils/file";
+import FileViewer, {
+  type FileViewerRef,
+} from "@/modules/knowledge/components/FileViewer";
+import KnowledgeTabs from "./components/KnowledgeTabs";
+import {
+  DocumentServiceApi,
+  SegmentServiceApi,
+  KnowledgeBaseServiceApi,
+  normalizeProxyableUrl,
+} from "@/modules/knowledge/utils/request";
+import { useDatasetPermissionStore } from "@/modules/knowledge/store/dataset_permission";
+import {
+  DEVELOPER_ACTIVE_EVENT,
+  isDeveloperModeActive,
+} from "@/utils/developerMode";
+import { DetailPageHeader, type PdfTextSelection } from "@/components/ui";
+import type { DocumentChatSelection, DocumentTranslationRequest } from "@/modules/knowledge/components/PdfTemporaryChat/types";
+import PdfTemporaryChat from "@/modules/knowledge/components/PdfTemporaryChat";
+import { readCachedPdfChat, touchCachedPdfChat } from "@/modules/knowledge/components/PdfTemporaryChat/cache";
+import { localizeErrorCode } from "@/components/request";
+import { ChatServiceApi } from "@/modules/chat/utils/request";
+import { getTranslationStatus, translateSelectionText, TranslationUnavailableError } from "@/modules/knowledge/api/translation";
+import AddVocabularyModal from "@/modules/vocabulary/AddVocabularyModal";
+import DocumentVocabularyPanel from "@/modules/vocabulary/DocumentVocabularyPanel";
+import { isVocabularyEnabled } from "@/runtime/mode";
+import AddLearningContentModal, { type LearningSelection } from "@/modules/learning/AddLearningContentModal";
+import { getKnowledgeBaseCapabilities, getLearningCatalog, type LearningCapability } from "@/modules/learning/api";
+import DocumentLearningPanel from "@/modules/learning/DocumentLearningPanel";
+import { capabilityFamilies, capabilityFamily, capabilityFamilyI18nKey, chooseFamilyCapability, type CapabilityFamily } from "@/modules/learning/capabilityFamilies";
+import {
+  processingLevelSupportsSegments,
+  type ProcessingLevel,
+} from "@/modules/knowledge/utils/processingLevel";
+import "./index.scss";
+
+type KnowledgeDetail = Doc & {
+  file_url?: string;
+  download_file_url?: string;
+};
+
+type KnowledgeDatasetWithProcessingLevel = KnowledgeDataset & {
+  processing_level?: ProcessingLevel;
+};
+
+async function writeTextToClipboard(text: string) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+  } catch {
+    // Fall back for denied permissions and browsers with partial Clipboard API support.
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.left = "0";
+  textarea.style.top = "0";
+  textarea.style.width = "1px";
+  textarea.style.height = "1px";
+  textarea.style.opacity = "0";
+  textarea.style.pointerEvents = "none";
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  textarea.setSelectionRange(0, text.length);
+
+  try {
+    if (
+      typeof document.execCommand !== "function" ||
+      !document.execCommand("copy")
+    ) {
+      throw new Error("Copy command failed");
+    }
+  } finally {
+    document.body.removeChild(textarea);
+  }
+}
+
+const Detail = () => {
+  const { t } = useTranslation();
+  const [knowledgeDetail, setKnowledgeDetail] = useState<KnowledgeDetail>();
+
+  const { knowledgeBaseId = "", knowledgeId = "" } = useParams();
+  const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
+  const [segmentDetail, setSegmentDetail] = useState<Segment>();
+  const [developerActive, setDeveloperActive] = useState(isDeveloperModeActive);
+  const fileViewerRef = useRef<FileViewerRef>(null);
+  const [canExportImagePdf, setCanExportImagePdf] = useState(false);
+  const [exportingImagePdf, setExportingImagePdf] = useState(false);
+  const [documentChatSelection, setDocumentChatSelection] =
+    useState<DocumentChatSelection | null>(null);
+  const [previewSideTab, setPreviewSideTab] = useState("chat");
+  const [previewSideCollapsed, setPreviewSideCollapsed] = useState(false);
+  const [segmentViewKey, setSegmentViewKey] = useState("");
+  const [segmentViewOptions, setSegmentViewOptions] = useState<
+    Array<{ label: ReactNode; value: string }>
+  >([]);
+  const [showSegmentSequence, setShowSegmentSequence] = useState(true);
+  const [documentChatHistory, setDocumentChatHistory] = useState<Conversation[]>([]);
+  const [selectedDocumentConversation, setSelectedDocumentConversation] = useState<string>();
+  const [chatHistoryPopoverOpen, setChatHistoryPopoverOpen] = useState(false);
+  const [translationRequest, setTranslationRequest] = useState<DocumentTranslationRequest | null>(null);
+  const [translationSelection, setTranslationSelection] = useState<PdfTextSelection | null>(null);
+  const [translationConfigured, setTranslationConfigured] = useState(false);
+  const [translationLoading, setTranslationLoading] = useState(false);
+  const [translationSource, setTranslationSource] = useState("");
+  const [translationResult, setTranslationResult] = useState("");
+  const [vocabularySelection, setVocabularySelection] = useState<PdfTextSelection | null>(null);
+  const [vocabularyRefreshToken, setVocabularyRefreshToken] = useState(0);
+  const [learningSelection,setLearningSelection]=useState<LearningSelection|null>(null);
+  const [learningAnalysisSelection,setLearningAnalysisSelection]=useState<{selections:PdfTextSelection[];requestId:number}|undefined>();
+  const [paragraphSelectionMode,setParagraphSelectionMode]=useState(false);
+  const [quickReferenceOpen,setQuickReferenceOpen]=useState(false);
+  const [learningCapabilities,setLearningCapabilities]=useState<LearningCapability[]>([]);
+  const [learningLocalAvailable,setLearningLocalAvailable]=useState(false);
+  const [processingLevel, setProcessingLevel] =
+    useState<ProcessingLevel>("indexed");
+  const canShowSegments =
+    developerActive && processingLevelSupportsSegments(processingLevel);
+
+  useEffect(() => {
+    getTranslationStatus().then(setTranslationConfigured).catch(() => setTranslationConfigured(false));
+  }, []);
+
+  useEffect(()=>{ if(!knowledgeBaseId)return; Promise.all([getLearningCatalog(),getKnowledgeBaseCapabilities(knowledgeBaseId)]).then(([catalog,configured])=>{const enabled=new Set(configured.filter(x=>x.enabled).map(x=>x.capability_key));setLearningCapabilities(catalog.capabilities.filter(x=>enabled.has(x.key)));setLearningLocalAvailable(catalog.local_available)}).catch(()=>setLearningCapabilities([])); },[knowledgeBaseId]);
+
+  useEffect(()=>setLearningAnalysisSelection(undefined),[knowledgeId]);
+
+  useEffect(() => {
+    if (!canShowSegments && previewSideTab === "segments") {
+      setPreviewSideTab("chat");
+    }
+  }, [canShowSegments, previewSideTab]);
+
+  const translatePdfSelection = useCallback(async (selection: PdfTextSelection) => {
+    setTranslationSelection(selection);
+    setTranslationSource(selection.text);
+    setTranslationResult("");
+    setTranslationLoading(true);
+    try {
+      const result = await translateSelectionText(selection.text);
+      setTranslationResult(result.translated_text);
+    } catch (error) {
+      message.error(error instanceof TranslationUnavailableError&&error.reason==="dictionary_not_found"?t("knowledge.dictionaryNotFound"):error instanceof TranslationUnavailableError?t("knowledge.translationConfigureTip"):t("knowledge.translationFailed"));
+    } finally {
+      setTranslationLoading(false);
+    }
+  }, [t]);
+
+  const translateWithModel = useCallback(() => {
+    if (!translationSelection) return;
+    const selection: DocumentChatSelection = { source: "pdf", ...translationSelection };
+    setDocumentChatSelection(selection);
+    setTranslationRequest({ id: Date.now(), selection });
+    setTranslationSource("");
+    setTranslationResult("");
+    setPreviewSideCollapsed(false);
+    setPreviewSideTab("chat");
+  }, [translationSelection]);
+
+  const refreshDocumentChatHistory = useCallback(() => {
+    if (!knowledgeId) return;
+    ChatServiceApi().conversationServiceListConversations(
+      { pageSize: 100 },
+      {
+        params: {
+          include_ephemeral: true,
+          source_type: "pdf_preview",
+          source_document_id: knowledgeId,
+          is_task_conv: false,
+        },
+        silentError: true,
+      } as never,
+    ).then((response) => {
+      const conversations = response.data.conversations || [];
+      setDocumentChatHistory(conversations);
+      const cached = readCachedPdfChat(knowledgeId);
+      if (cached && conversations.some((item) => item.conversation_id === cached.conversationId)) {
+        setSelectedDocumentConversation((current) => current || cached.conversationId);
+      }
+    }).catch(() => {});
+  }, [knowledgeId]);
+
+  useEffect(() => {
+    setSelectedDocumentConversation(undefined);
+    refreshDocumentChatHistory();
+  }, [refreshDocumentChatHistory]);
+
+  const handleSegmentViewOptionsChange = useCallback(
+    (options: Array<{ label: ReactNode; value: string }>) => {
+      setSegmentViewOptions(options);
+    },
+    [],
+  );
+
+  const askPdfSelection = useCallback((selection: PdfTextSelection) => {
+    setDocumentChatSelection({ source: "pdf", ...selection });
+    setPreviewSideCollapsed(false);
+    setPreviewSideTab("chat");
+  }, []);
+
+  const askSegment = useCallback((
+    segment: Segment,
+    selectedText?: string,
+    segmentGroup?: string,
+  ) => {
+    let metadata: Record<string, unknown> = {};
+    if (segment.meta) {
+      try {
+        metadata = JSON.parse(segment.meta) as Record<string, unknown>;
+      } catch {
+        metadata = {};
+      }
+    }
+    const rawPage = Number(metadata.page);
+    const rawBbox = metadata.bbox;
+    setDocumentChatSelection({
+      source: "segment",
+      text: selectedText || segment.display_content || segment.content || "",
+      page: Number.isFinite(rawPage) ? rawPage + 1 : undefined,
+      bbox: Array.isArray(rawBbox) && rawBbox.length === 4
+        ? rawBbox.map(Number) as [number, number, number, number]
+        : undefined,
+      segmentId: segment.segment_id,
+      segmentNumber: segment.number,
+      group: segmentGroup,
+    });
+    setPreviewSideCollapsed(false);
+    setPreviewSideTab("chat");
+  }, []);
+
+  const {
+    getDatasetDetail: getKbDetail,
+    setCurrentDataset,
+    clearDataset,
+  } = useDatasetPermissionStore();
+  const hasWritePermission = useDatasetPermissionStore((state) =>
+    state.hasWritePermission(),
+  );
+
+  const group = useMemo(() => {
+    return searchParams.get("group_name") || "";
+  }, [searchParams]);
+
+  const segmentId = useMemo(() => {
+    return searchParams.get("segement_id") || "";
+  }, [searchParams]);
+
+  const getDetail = useCallback(() => {
+    DocumentServiceApi()
+      .documentServiceGetDocument({
+        dataset: knowledgeBaseId,
+        document: knowledgeId,
+      })
+      .then((res) => {
+        setKnowledgeDetail(res.data);
+      });
+  }, [knowledgeBaseId, knowledgeId]);
+
+  const getDatasetDetail = useCallback(() => {
+    KnowledgeBaseServiceApi()
+      .datasetServiceGetDataset({ dataset: knowledgeBaseId })
+      .then((res) => {
+        const dataset = res.data as unknown as KnowledgeDatasetWithProcessingLevel;
+        setCurrentDataset(dataset);
+        setProcessingLevel(dataset.processing_level || "indexed");
+      });
+  }, [knowledgeBaseId, setCurrentDataset]);
+
+  useEffect(() => {
+    getDetail();
+    getDatasetDetail();
+
+    return () => {
+      clearDataset();
+    };
+  }, [getDetail, getDatasetDetail, clearDataset]);
+
+  useEffect(() => {
+    const syncDeveloperActive = () => {
+      setDeveloperActive(isDeveloperModeActive());
+    };
+
+    const handleDeveloperActiveChange = (event: Event) => {
+      const nextActive = (event as CustomEvent<{ active?: boolean }>).detail
+        ?.active;
+      setDeveloperActive(
+        typeof nextActive === "boolean" ? nextActive : isDeveloperModeActive(),
+      );
+    };
+
+    window.addEventListener("storage", syncDeveloperActive);
+    window.addEventListener(
+      DEVELOPER_ACTIVE_EVENT,
+      handleDeveloperActiveChange,
+    );
+
+    return () => {
+      window.removeEventListener("storage", syncDeveloperActive);
+      window.removeEventListener(
+        DEVELOPER_ACTIVE_EVENT,
+        handleDeveloperActiveChange,
+      );
+    };
+  }, []);
+
+  const getSegmentDetail = useCallback(() => {
+    if (group && segmentId) {
+      SegmentServiceApi()
+        .segmentServiceGetSegment({
+          dataset: knowledgeBaseId,
+          document: knowledgeId,
+          segment: segmentId,
+          group: group,
+        })
+        .then((res) => {
+          setSegmentDetail(res.data);
+        });
+    }
+  }, [group, segmentId, knowledgeBaseId, knowledgeId]);
+
+  useEffect(() => {
+    getSegmentDetail();
+  }, [group, segmentId, getSegmentDetail]);
+
+  const previewFile = useMemo(() => {
+    const filePath = knowledgeDetail?.file_url;
+    if (!filePath) {
+      return "";
+    }
+
+    const fileUrl = `${window.location.origin}/api/core${filePath}`;
+    return normalizeProxyableUrl(fileUrl);
+  }, [knowledgeDetail?.download_file_url, knowledgeDetail?.file_url]);
+
+  const handleExportImagePdf = useCallback(async () => {
+    if (!canExportImagePdf || exportingImagePdf) {
+      return;
+    }
+    setExportingImagePdf(true);
+    try {
+      await fileViewerRef.current?.exportImagePdf();
+      message.success("已导出图片 PDF");
+    } catch {
+      message.error(localizeErrorCode("2000509"));
+    } finally {
+      setExportingImagePdf(false);
+    }
+  }, [canExportImagePdf, exportingImagePdf]);
+
+  const pageTitle = useMemo(() => {
+    const displayName = knowledgeDetail?.display_name;
+    if (!displayName) {
+      return displayName;
+    }
+    if (!canExportImagePdf) {
+      return displayName;
+    }
+    return (
+      <span
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 8,
+          minWidth: 0,
+          maxWidth: "100%",
+        }}
+      >
+        <Tooltip title={displayName}>
+          <span className="detail-title-text">{displayName}</span>
+        </Tooltip>
+        {learningCapabilities.length ? <Tooltip title={t("learning.quickReference")}>
+          <Button
+            type="text"
+            size="small"
+            icon={<SnippetsOutlined />}
+            aria-label={t("learning.quickReference")}
+            onClick={() => setQuickReferenceOpen(true)}
+          />
+        </Tooltip> : null}
+        <Tooltip title="导出成图片pdf">
+          <Button
+            type="text"
+            size="small"
+            icon={<FileImageOutlined />}
+            loading={exportingImagePdf}
+            onClick={handleExportImagePdf}
+            style={{ flexShrink: 0 }}
+          />
+        </Tooltip>
+      </span>
+    );
+  }, [
+    canExportImagePdf,
+    exportingImagePdf,
+    handleExportImagePdf,
+    learningCapabilities.length,
+    knowledgeDetail?.display_name,
+    t,
+  ]);
+
+  return (
+    <div className="knowledge-container !h-full !items-start">
+      <DetailPageHeader
+        breadcrumbs={[
+          { title: t("layout.knowledgeBase"), href: "/lib/knowledge/list" },
+          {
+            title: getKbDetail()?.display_name || t("knowledge.detail"),
+            href: `/lib/knowledge/detail/${getKbDetail()?.dataset_id}`,
+          },
+          { title: knowledgeDetail?.display_name },
+        ]}
+        title={pageTitle}
+        onBack={() => {
+          const bool = ["aiwrite", "aireview", "chat"].includes(
+            searchParams.get("from") ?? "",
+          );
+          if (bool) {
+            navigate(`/lib/knowledge/detail/${knowledgeBaseId}?from=aiwrite`);
+          } else {
+            navigate(-1);
+          }
+        }}
+        titleExtra={
+          developerActive ? (
+            <div>
+              <span
+                style={{
+                  marginRight: "4px",
+                  color: "var(--color-text-description)",
+                }}
+              >
+                ID: {knowledgeId}
+              </span>
+              <Tooltip title={t("common.copy")}>
+                <Button
+                  type="text"
+                  size="small"
+                  aria-label={t("common.copy")}
+                  icon={<CopyOutlined />}
+                  style={{ color: "var(--color-text-description)" }}
+                  onClick={async () => {
+                    try {
+                      await writeTextToClipboard(knowledgeId);
+                      message.success(t("knowledge.copySuccess"));
+                    } catch {
+                      message.error(t("knowledge.copyFailedManual"));
+                    }
+                  }}
+                />
+              </Tooltip>
+            </div>
+          ) : null
+        }
+        extraContent={[
+          { label: t("knowledge.source"), value: t("knowledge.localFile") },
+          {
+            label: t("knowledge.createTime"),
+            value: moment(knowledgeDetail?.create_time).format(TIME_FORMAT),
+          },
+          {
+            label: t("knowledge.creator"),
+            value: knowledgeDetail?.creator || "-",
+          },
+          {
+            label: t("knowledge.originalFile"),
+            value: (
+              <a
+                href={previewFile}
+                rel="noreferrer noopener"
+                target="_blank"
+                title={knowledgeDetail?.display_name}
+              >
+                {knowledgeDetail?.display_name}
+              </a>
+            ),
+            hidden: !hasWritePermission,
+          },
+          {
+            label: t("knowledge.updateTime"),
+            value: moment(knowledgeDetail?.update_time).format(TIME_FORMAT),
+          },
+          {
+            label: t("knowledge.size"),
+            value:
+              FileUtils.formatFileSize(knowledgeDetail?.document_size) || "-",
+          },
+          {
+            label: t("knowledge.tags"),
+            value:
+              knowledgeDetail?.tags && knowledgeDetail?.tags.length > 0
+                ? knowledgeDetail.tags.map((tag) => (
+                    <Tag style={{ marginLeft: "8px" }} key={tag}>
+                      {tag}
+                    </Tag>
+                  ))
+                : "-",
+          },
+        ]}
+      />
+      <Row gutter={[12, 12]} className="knowledge-preview-layout mt-6 min-h-0 w-full flex-1">
+        <Col
+          flex={previewSideCollapsed ? "auto" : "0 0 62.5%"}
+          className="knowledge-preview-file-column min-h-0 min-w-0"
+        >
+          <FileViewer
+            ref={fileViewerRef}
+            file={previewFile}
+            fileName={knowledgeDetail?.display_name || ""}
+            segment={segmentDetail}
+            onExportReadyChange={setCanExportImagePdf}
+            onPdfSelection={askPdfSelection}
+            onPdfTranslateSelection={translatePdfSelection}
+            onAddVocabularySelection={isVocabularyEnabled() ? (selection) => setVocabularySelection(selection) : undefined}
+            translationConfigured={translationConfigured}
+            learningSelectionActions={capabilityFamilies(learningCapabilities).map(family=>({key:family,label:t(capabilityFamilyI18nKey(family)),languages:Array.from(new Set(learningCapabilities.filter(item=>item.key!=="pinyin"&&family===capabilityFamily(item.key)).flatMap(item=>item.languages))),subjectKinds:Array.from(new Set(learningCapabilities.filter(item=>family===capabilityFamily(item.key)).flatMap(item=>item.subject_kinds))),disabled:!learningLocalAvailable,disabledTip:t("vocabulary.localOnlyDesktop")}))}
+            onLearningSelection={(family,selection)=>{const capability=chooseFamilyCapability(learningCapabilities,family as CapabilityFamily,selection.text);if(capability)setLearningSelection({capabilityKey:capability.key,selection})}}
+            paragraphSelectionMode={paragraphSelectionMode}
+            onParagraphSelectionCancel={()=>setParagraphSelectionMode(false)}
+            onParagraphSelectionConfirm={selections=>{setParagraphSelectionMode(false);setLearningAnalysisSelection({selections,requestId:Date.now()});setQuickReferenceOpen(true)}}
+          />
+        </Col>
+        <Col
+          flex={previewSideCollapsed ? "0 0 48px" : "0 0 37.5%"}
+          className="knowledge-preview-panel-column min-h-0 min-w-0"
+        >
+          <div
+            style={{
+              height: "100%",
+              display: "flex",
+              flexDirection: "column",
+              overflow: "hidden",
+              paddingBottom: "4px",
+            }}
+          >
+            {knowledgeDetail ? (
+              <>
+                <div className={`knowledge-preview-side${previewSideCollapsed ? " is-collapsed" : ""}`}>
+                  <Tabs
+                    className="knowledge-preview-mode-tabs"
+                    activeKey={previewSideTab}
+                    onChange={setPreviewSideTab}
+                    tabBarExtraContent={(
+                      <div className="knowledge-preview-toolbar">
+                        {previewSideTab === "segments" ? (
+                          <Popover
+                            trigger="click"
+                            placement="bottomRight"
+                            content={<div className="knowledge-preview-options-popover">
+                            <Select
+                              className="knowledge-preview-segment-select"
+                              value={segmentViewKey || undefined}
+                              options={segmentViewOptions}
+                              onChange={setSegmentViewKey}
+                            />
+                            <div className="knowledge-preview-sequence">
+                              <span>{t("knowledge.sequence")}</span>
+                              <Switch
+                                size="small"
+                                checked={showSegmentSequence}
+                                onChange={setShowSegmentSequence}
+                              />
+                            </div>
+                            </div>}
+                          >
+                            <Button type="text" icon={<SettingOutlined />} aria-label="切片显示选项" title="切片显示选项" />
+                          </Popover>
+                        ) : previewSideTab === "chat" ? (
+                          <Popover
+                            trigger="click"
+                            placement="bottomRight"
+                            open={chatHistoryPopoverOpen}
+                            onOpenChange={setChatHistoryPopoverOpen}
+                            content={<Select
+                              allowClear
+                              className="knowledge-preview-chat-history-select"
+                              placeholder={t("knowledge.pdfChatHistoryPlaceholder")}
+                              value={selectedDocumentConversation}
+                              options={documentChatHistory.map((conversation) => ({
+                                value: conversation.conversation_id || "",
+                                label: `${conversation.display_name || t("knowledge.pdfChatPanelLabel")} · ${moment(conversation.update_time).format("MM-DD HH:mm")}`,
+                              })).filter((option) => Boolean(option.value))}
+                              onChange={(value: string | undefined) => {
+                                setSelectedDocumentConversation(value || undefined);
+                                if (value) touchCachedPdfChat(knowledgeId, value);
+                                setChatHistoryPopoverOpen(false);
+                              }}
+                            />}
+                          >
+                            <Button type="text" icon={<HistoryOutlined />} aria-label="选择历史对话" title="选择历史对话" />
+                          </Popover>
+                        ) : null}
+                        <Button
+                          type="text"
+                          icon={<DoubleRightOutlined />}
+                          aria-label={t("common.collapse")}
+                          title={t("common.collapse")}
+                          onClick={() => setPreviewSideCollapsed(true)}
+                        />
+                      </div>
+                    )}
+                    items={[
+                      {
+                        key: "chat",
+                        label: t("knowledge.pdfChatTab"),
+                        children: (
+                          <PdfTemporaryChat
+                            datasetId={knowledgeBaseId}
+                            documentId={knowledgeId}
+                            fileName={knowledgeDetail.display_name || ""}
+                            selection={documentChatSelection || undefined}
+                            translationRequest={translationRequest}
+                            conversationToLoad={selectedDocumentConversation}
+                            onConversationChange={setSelectedDocumentConversation}
+                            onHistoryChange={refreshDocumentChatHistory}
+                            onClose={() => {
+                              setDocumentChatSelection(null);
+                              setPreviewSideTab(canShowSegments ? "segments" : "chat");
+                            }}
+                          />
+                        ),
+                      },
+                      ...(canShowSegments ? [{
+                        key: "segments",
+                        label: t("knowledge.segmentPreviewTab"),
+                        children: (
+                          <KnowledgeTabs
+                            knowledgeDetail={knowledgeDetail}
+                            onGetItemInfo={(data) => setSegmentDetail(data)}
+                            onAskSegment={askSegment}
+                            activeKey={segmentViewKey}
+                            onActiveKeyChange={setSegmentViewKey}
+                            onOptionsChange={handleSegmentViewOptionsChange}
+                            showSequence={showSegmentSequence}
+                          />
+                        ),
+                      }] : []),
+                      ...(isVocabularyEnabled() ? [{
+                        key: "vocabulary",
+                        label: "生词",
+                        children: <DocumentVocabularyPanel documentId={knowledgeId} refreshToken={vocabularyRefreshToken} />,
+                      }] : []),
+                    ]}
+                  />
+                </div>
+                {previewSideCollapsed ? (
+                  <div className="knowledge-preview-collapsed">
+                    <Button
+                      type="text"
+                      icon={<DoubleLeftOutlined />}
+                      aria-label={t("common.expand")}
+                      title={t("common.expand")}
+                      onClick={() => setPreviewSideCollapsed(false)}
+                    />
+                  </div>
+                ) : null}
+              </>
+            ) : null}
+          </div>
+        </Col>
+      </Row>
+      <Modal
+        className="knowledge-quick-reference-modal"
+        open={quickReferenceOpen}
+        title={t("learning.quickReference")}
+        width={960}
+        footer={null}
+        destroyOnHidden={false}
+        onCancel={() => setQuickReferenceOpen(false)}
+      >
+        <DocumentLearningPanel
+          datasetId={knowledgeBaseId}
+          documentId={knowledgeId}
+          revision={knowledgeDetail?.update_time?.toString()}
+          capabilities={learningCapabilities}
+          localAvailable={learningLocalAvailable}
+          analysisSelection={learningAnalysisSelection}
+          onRequestParagraphSelection={()=>{setQuickReferenceOpen(false);setParagraphSelectionMode(true)}}
+        />
+      </Modal>
+      <Modal
+        open={Boolean(translationSource)}
+        title={t("knowledge.translationTitle")}
+        footer={null}
+        onCancel={() => {
+          if (!translationLoading) {
+            setTranslationSource("");
+            setTranslationResult("");
+          }
+        }}
+      >
+        <div className="knowledge-translation-block">
+          <div className="knowledge-translation-label">{t("knowledge.translationOriginal")}</div>
+          <div className="knowledge-translation-text">{translationSource}</div>
+        </div>
+        <div className="knowledge-translation-block">
+          <div className="knowledge-translation-label">{t("knowledge.translationResult")}</div>
+          {translationLoading ? <Spin size="small" /> : <div className="knowledge-translation-text">{translationResult}</div>}
+        </div>
+        {!translationLoading && translationResult ? (
+          <div className="knowledge-translation-model-action">
+            <Button onClick={translateWithModel}>{t("knowledge.translateWithModel")}</Button>
+            <span>{t("knowledge.translateWithModelHint")}</span>
+          </div>
+        ) : null}
+      </Modal>
+      {isVocabularyEnabled() ? <AddVocabularyModal
+        selection={vocabularySelection}
+        datasetId={knowledgeBaseId}
+        documentId={knowledgeId}
+        segmentId={segmentDetail?.segment_id}
+        context={vocabularySelection?.context || segmentDetail?.content || vocabularySelection?.text || undefined}
+        onClose={() => setVocabularySelection(null)}
+        onAdded={() => { setVocabularyRefreshToken((value) => value + 1); setPreviewSideTab("vocabulary"); setPreviewSideCollapsed(false); }}
+      /> : null}
+      <AddLearningContentModal value={learningSelection} datasetId={knowledgeBaseId} documentId={knowledgeId} segmentId={segmentDetail?.segment_id} context={learningSelection?.selection.context||segmentDetail?.content} onClose={()=>setLearningSelection(null)} onAdded={()=>{setVocabularyRefreshToken(v=>v+1);setPreviewSideCollapsed(false)}} />
+    </div>
+  );
+};
+
+export default Detail;

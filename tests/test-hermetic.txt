@@ -1,0 +1,30 @@
+# Aggregated Python dependencies for the current make test scope.
+# Keep auth-service runtime deps inline so the shared hermetic venv can use one
+# cryptography version with algorithm/requirements.txt.
+alembic==1.15.2
+fastapi==0.115.0
+uvicorn==0.30.6
+sqlalchemy==2.0.41
+greenlet==3.2.2
+psycopg[binary]==3.2.6
+pymysql==1.1.1
+python-jose[cryptography]==3.3.0
+passlib==1.7.4
+pyyaml==6.0.2
+redis==7.0.1
+
+-r ../backend/channel-gateway/requirements.txt
+
+-r ../tests/backend/auth-service/requirements-test.txt
+-r ../algorithm/requirements.txt
+
+# Test runners and algorithm test extras used by the current make test scope.
+-r algorithm/requirements-test.txt
+
+# Compatibility pins shared by the current make test scope.
+aiosqlite
+anyio<4.5
+
+# Build support for installing the in-tree lazyllm package.
+scikit-build-core
+pybind11

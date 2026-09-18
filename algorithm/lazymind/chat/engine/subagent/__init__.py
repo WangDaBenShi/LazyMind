@@ -1,0 +1,20 @@
+"""SubAgent infrastructure: per-task DB persistence, tools, and ReAct runner."""
+
+SUBAGENT_CORE_TOOL_NAMES = (
+    'save_artifacts',
+    'get_artifact',
+    'list_artifacts',
+    'list_knowledge_bases',
+    'grep',
+    'read_file',
+    'read_user_attachment',
+    'find_user_attachment',
+    'string_replace',
+    'find_artifact',
+    'patch_artifact',
+    'discard_draft',
+)
+
+SUBAGENT_ATTACHMENT_CONTEXT_KEY = '_attachment_context'
+SUBAGENT_ENVIRONMENT_CONTEXT_KEY = '_environment_context'
+SUBAGENT_SKILLS_CONTEXT_KEY = '_inherited_skills'

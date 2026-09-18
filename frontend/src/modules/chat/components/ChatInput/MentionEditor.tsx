@@ -1,0 +1,636 @@
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { useTranslation } from "react-i18next";
+import { message } from "antd";
+import {
+  AppstoreOutlined,
+  BookOutlined,
+  BulbOutlined,
+  CommentOutlined,
+  DatabaseOutlined,
+  ThunderboltOutlined,
+} from "@ant-design/icons";
+import { axiosInstance, BASE_URL } from "@/components/request";
+import { listSkillAssetsPage } from "@/modules/memory/skillApi";
+import { listToolAssetsPage } from "@/modules/memory/toolApi";
+import {
+  ChatServiceApi,
+  KnowledgeBaseServiceApi,
+  PromptServiceApi,
+} from "@/modules/chat/utils/request";
+
+export type MentionType =
+  | "knowledge_base"
+  | "skill"
+  | "workflow"
+  | "tool"
+  | "conversation";
+
+export interface ChatMention {
+  mention_id: string;
+  type: MentionType;
+  resource_id: string;
+  display_name: string;
+  start?: number;
+  end?: number;
+}
+
+type CandidateType = MentionType | "prompt";
+type Candidate = {
+  id: string;
+  type: CandidateType;
+  name: string;
+  description?: string;
+  content?: string;
+  disabled?: boolean;
+  disabledReason?: string;
+};
+
+type QueryState = {
+  keyword: string;
+  type?: CandidateType;
+  range: Range;
+};
+
+type MenuPlacement = {
+  direction: "above" | "below";
+  height: number;
+};
+
+export interface MentionEditorRef {
+  focus: () => void;
+  getMentions: () => ChatMention[];
+  setPlainText: (value: string) => void;
+}
+
+const isImeComposingEvent = (event: React.KeyboardEvent<HTMLElement>) =>
+  event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229;
+
+const groups: Array<{
+  type: CandidateType;
+  shortcut: string;
+  labelKey: string;
+  icon: React.ReactNode;
+}> = [
+  { type: "knowledge_base", shortcut: "kb", labelKey: "chat.mentionKnowledgeBase", icon: <DatabaseOutlined /> },
+  { type: "skill", shortcut: "skill", labelKey: "chat.mentionSkill", icon: <BulbOutlined /> },
+  { type: "workflow", shortcut: "workflow", labelKey: "chat.mentionWorkflow", icon: <AppstoreOutlined /> },
+  { type: "tool", shortcut: "tool", labelKey: "chat.mentionTool", icon: <ThunderboltOutlined /> },
+  { type: "prompt", shortcut: "prompt", labelKey: "chat.mentionPrompt", icon: <BookOutlined /> },
+  { type: "conversation", shortcut: "chat", labelKey: "chat.mentionConversation", icon: <CommentOutlined /> },
+];
+
+const shortcutTypes = new Map(groups.map((group) => [group.shortcut, group.type]));
+const candidateCache = new Map<string, Candidate[]>();
+const candidateRequests = new Map<string, Promise<Candidate[]>>();
+const MENU_MAX_HEIGHT = 420;
+const MENU_MIN_UPWARD_HEIGHT = 160;
+// Keep the existing 8px anchor gap plus an 8px viewport margin.
+const MENU_VIEWPORT_OFFSET = 16;
+
+const cacheKey = (type: CandidateType, keyword: string) =>
+  `${type}:${keyword.trim().toLocaleLowerCase()}`;
+
+const bypassCandidateCache = (type: CandidateType) =>
+  type === "skill" || type === "tool" || type === "workflow";
+
+function escapeHtml(value: string) {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function escapeAttribute(value: string) {
+  return escapeHtml(value).replace(/"/g, "&quot;");
+}
+
+function mentionHtml(mention: ChatMention) {
+  return `<span class="chat-mention-chip" contenteditable="false" data-mention-id="${escapeAttribute(mention.mention_id)}" data-mention-type="${mention.type}" data-resource-id="${escapeAttribute(mention.resource_id)}" data-display-name="${escapeAttribute(mention.display_name)}">${escapeHtml(mention.display_name)}</span>&#8203;`;
+}
+
+function serializeEditor(editor: HTMLElement) {
+  let text = "";
+  const mentions: ChatMention[] = [];
+  const visit = (node: Node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      text += (node.textContent || "").replace(/\u200b/g, "");
+      return;
+    }
+    if (!(node instanceof HTMLElement)) return;
+    if (node.dataset.mentionId) {
+      const start = text.length;
+      const mention: ChatMention = {
+        mention_id: node.dataset.mentionId,
+        type: node.dataset.mentionType as MentionType,
+        resource_id: node.dataset.resourceId || "",
+        display_name: node.dataset.displayName || node.textContent || "",
+        start,
+        end: start + (node.dataset.displayName || node.textContent || "").length,
+      };
+      mentions.push(mention);
+      text += mention.display_name;
+      return;
+    }
+    if (node.tagName === "BR") {
+      text += "\n";
+      return;
+    }
+    node.childNodes.forEach(visit);
+    if (node !== editor && node.tagName === "DIV") text += "\n";
+  };
+  editor.childNodes.forEach(visit);
+  return { text: text.replace(/\n+$/, ""), mentions };
+}
+
+function queryAtCaret(editor: HTMLElement): QueryState | null {
+  const selection = window.getSelection();
+  if (!selection || !selection.isCollapsed || selection.rangeCount === 0) return null;
+  const caret = selection.getRangeAt(0);
+  const node = caret.startContainer;
+  if (node.nodeType !== Node.TEXT_NODE || !editor.contains(node)) return null;
+  const before = (node.textContent || "").slice(0, caret.startOffset);
+  const at = before.lastIndexOf("@");
+  if (at < 0 || (at > 0 && !/[\s，。！？、；：,.!?;:]/.test(before[at - 1]))) return null;
+  const raw = before.slice(at + 1);
+  const shortcut = raw.match(/^([a-z]+):( *)(.*)$/i);
+  let type: CandidateType | undefined;
+  let keyword = raw;
+  if (shortcut && shortcutTypes.has(shortcut[1].toLowerCase())) {
+    if (shortcut[2].length > 1) return null;
+    type = shortcutTypes.get(shortcut[1].toLowerCase());
+    keyword = shortcut[3];
+  }
+  const range = document.createRange();
+  range.setStart(node, at);
+  range.setEnd(node, caret.startOffset);
+  return { keyword, type, range };
+}
+
+function unwrap<T>(value: T | { data?: T }): T {
+  return value && typeof value === "object" && "data" in value && (value as { data?: T }).data
+    ? (value as { data: T }).data
+    : (value as T);
+}
+
+async function loadCandidates(type: CandidateType, keyword: string): Promise<Candidate[]> {
+  if (type === "knowledge_base") {
+    const response = await KnowledgeBaseServiceApi().datasetServiceListDatasets({ keyword, pageSize: 100 });
+    return (response.data.datasets || []).map((item) => ({
+      id: item.dataset_id || "",
+      type,
+      name: item.display_name || item.dataset_id || "",
+    }));
+  }
+  if (type === "skill") {
+    const response = await listSkillAssetsPage({ keyword, page: 1, pageSize: 100 });
+    return response.records.map((item) => ({ id: item.id, type, name: item.name, description: item.description }));
+  }
+  if (type === "tool") {
+    const response = await listToolAssetsPage({ keyword, silentError: true });
+    return response.records.map((item) => ({
+      id: item.id,
+      type,
+      name: item.name,
+      description: item.description,
+      disabled: item.isEnabled === false,
+      disabledReason: item.isEnabled === false ? "已在设置中停用" : undefined,
+    }));
+  }
+  if (type === "workflow") {
+    const response = await axiosInstance.get(`${BASE_URL}/api/core/chat/settings/workflows`, { params: { keyword } });
+    const payload = unwrap<{ workflows?: Array<Record<string, unknown>> }>(response.data);
+    return (payload.workflows || [])
+      .filter((item) => !keyword || `${item.name || ""} ${item.description || ""}`.toLowerCase().includes(keyword.toLowerCase()))
+      .map((item) => ({ id: String(item.workflow_ref || item.workflow_id || ""), type, name: String(item.name || item.workflow_id || ""), description: String(item.description || "") }));
+  }
+  if (type === "prompt") {
+    const response = await PromptServiceApi().listPrompts({ keyword, pageSize: 100 });
+    return (response.data.prompts || []).map((item) => ({ id: item.id || "", type, name: item.display_name || item.name || "", content: item.content || "" }));
+  }
+  const response = await ChatServiceApi().conversationServiceListConversations({ keyword, pageSize: 50, pageToken: "" });
+  return (response.data.conversations || []).map((item) => ({ id: item.conversation_id || item.name || "", type, name: item.display_name || item.conversation_id || "" }));
+}
+
+function loadAndCacheCandidates(type: CandidateType, keyword: string) {
+  if (bypassCandidateCache(type)) return loadCandidates(type, keyword);
+  const key = cacheKey(type, keyword);
+  const cached = candidateCache.get(key);
+  if (cached) return Promise.resolve(cached);
+  const pending = candidateRequests.get(key);
+  if (pending) return pending;
+  const request = loadCandidates(type, keyword)
+    .then((items) => {
+      const normalizedKeyword = keyword.trim().toLocaleLowerCase();
+      const seen = new Set<string>();
+      const filtered = items.filter((item) => {
+        if (normalizedKeyword && !item.name.toLocaleLowerCase().includes(normalizedKeyword)) {
+          return false;
+        }
+        const identity = `${item.type}:${item.id}`;
+        if (seen.has(identity)) return false;
+        seen.add(identity);
+        return true;
+      });
+      candidateCache.set(key, filtered);
+      return filtered;
+    })
+    .finally(() => candidateRequests.delete(key));
+  candidateRequests.set(key, request);
+  return request;
+}
+
+function cachedCandidates(type: CandidateType, keyword: string) {
+  if (bypassCandidateCache(type)) return [];
+  const exact = candidateCache.get(cacheKey(type, keyword));
+  if (exact) return exact;
+  const base = candidateCache.get(cacheKey(type, ""));
+  const normalized = keyword.trim().toLocaleLowerCase();
+  if (!base || !normalized) return [];
+  return base.filter((item) => item.name.toLocaleLowerCase().includes(normalized));
+}
+
+function replaceCandidateGroup(current: Candidate[], type: CandidateType, items: Candidate[]) {
+  const byType = new Map<CandidateType, Candidate[]>();
+  for (const item of current) {
+    if (item.type === type) continue;
+    const groupItems = byType.get(item.type) || [];
+    groupItems.push(item);
+    byType.set(item.type, groupItems);
+  }
+  byType.set(type, items);
+  return groups.flatMap((group) => byType.get(group.type) || []);
+}
+
+const MentionEditor = forwardRef<MentionEditorRef, {
+  value: string;
+  initialMentions?: ChatMention[];
+  disabled?: boolean;
+  placeholder: string;
+  onChange: (value: string) => void;
+  onMentionsChange: (mentions: ChatMention[]) => void;
+  onPaste: (event: React.ClipboardEvent<HTMLDivElement>) => void;
+  onSend: () => void;
+  onCompositionChange: (composing: boolean) => void;
+  disabledMentionReasons?: Partial<Record<MentionType, string>>;
+  allowKnowledgeBaseSelection?: boolean;
+  allowMentions?: boolean;
+}>(({
+  value,
+  initialMentions,
+  disabled,
+  placeholder,
+  onChange,
+  onMentionsChange,
+  onPaste,
+  onSend,
+  onCompositionChange,
+  disabledMentionReasons,
+  allowKnowledgeBaseSelection = true,
+  allowMentions = true,
+}, ref) => {
+  const { t } = useTranslation();
+  const availableGroups = useMemo(() => allowMentions ? groups.filter((group) =>
+    allowKnowledgeBaseSelection || group.type !== 'knowledge_base',
+  ) : [], [allowKnowledgeBaseSelection, allowMentions]);
+  const editorRef = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const emittedRef = useRef<string | null>(null);
+  const queryRef = useRef<QueryState | null>(null);
+  const requestRef = useRef(0);
+  const [query, setQuery] = useState<QueryState | null>(null);
+  const [candidates, setCandidates] = useState<Candidate[]>([]);
+  const [activeIndex, setActiveIndex] = useState(-1);
+  const [loading, setLoading] = useState(false);
+  const [expandedTypes, setExpandedTypes] = useState<Set<CandidateType>>(new Set());
+  const [menuPlacement, setMenuPlacement] = useState<MenuPlacement>({
+    direction: "above",
+    height: MENU_MAX_HEIGHT,
+  });
+
+  const updateMenuPlacement = useCallback(() => {
+    const editor = editorRef.current;
+    if (!editor) return;
+    const rect = editor.getBoundingClientRect();
+    const aboveSpace = Math.max(0, rect.top - MENU_VIEWPORT_OFFSET);
+    const belowSpace = Math.max(
+      0,
+      window.innerHeight - rect.bottom - MENU_VIEWPORT_OFFSET,
+    );
+    const direction = aboveSpace >= MENU_MIN_UPWARD_HEIGHT || aboveSpace >= belowSpace
+      ? "above"
+      : "below";
+    const height = Math.min(MENU_MAX_HEIGHT, Math.floor(
+      direction === "above" ? aboveSpace : belowSpace,
+    ));
+    setMenuPlacement((current) => (
+      current.direction === direction && current.height === height
+        ? current
+        : { direction, height }
+    ));
+  }, []);
+
+  const emit = useCallback(() => {
+    if (!editorRef.current) return;
+    const serialized = serializeEditor(editorRef.current);
+    emittedRef.current = serialized.text;
+    onChange(serialized.text);
+    onMentionsChange(allowMentions ? serialized.mentions : []);
+  }, [allowMentions, onChange, onMentionsChange]);
+
+  useImperativeHandle(ref, () => ({
+    focus: () => editorRef.current?.focus(),
+    getMentions: () => allowMentions && editorRef.current ? serializeEditor(editorRef.current).mentions : [],
+    setPlainText: (text) => {
+      if (!editorRef.current) return;
+      editorRef.current.textContent = text;
+      emit();
+    },
+  }), [allowMentions, emit]);
+
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!editor) return;
+    if (value === emittedRef.current) {
+      let removed = false;
+      editor.querySelectorAll<HTMLElement>('.chat-mention-chip').forEach((chip) => {
+        if (!availableGroups.some((group) => group.type === chip.dataset.mentionType)) {
+          const separator = chip.nextSibling;
+          if (separator?.nodeType === Node.TEXT_NODE) {
+            separator.textContent = (separator.textContent || '').replace(/^\u200b/, '');
+          }
+          chip.replaceWith(document.createTextNode(chip.dataset.displayName || chip.textContent || ''));
+          removed = true;
+        }
+      });
+      if (removed) onMentionsChange(serializeEditor(editor).mentions);
+      return;
+    }
+    let cursor = 0;
+    let html = '';
+    for (const mention of [...(allowMentions ? initialMentions || [] : [])].sort((a, b) => (a.start ?? 0) - (b.start ?? 0))) {
+      const { start, end } = mention;
+      if (start === undefined || end === undefined || !Number.isInteger(start) || !Number.isInteger(end)
+        || start < cursor || end <= start || end > value.length || value.slice(start, end) !== mention.display_name
+        || !availableGroups.some((group) => group.type === mention.type)) continue;
+      html += escapeHtml(value.slice(cursor, start)) + mentionHtml(mention);
+      cursor = end;
+    }
+    editor.innerHTML = html + escapeHtml(value.slice(cursor));
+    emittedRef.current = value;
+    onMentionsChange(serializeEditor(editor).mentions);
+  }, [allowMentions, availableGroups, initialMentions, onMentionsChange, value]);
+
+  useEffect(() => {
+    // Warm the session cache as soon as the composer mounts. Opening `@` can
+    // then paint immediately while a background refresh keeps data current.
+    availableGroups.forEach((group) => {
+      void loadAndCacheCandidates(group.type, "");
+    });
+  }, [availableGroups]);
+
+  useEffect(() => {
+    if (!query) {
+      setCandidates([]);
+      return;
+    }
+    const requestId = ++requestRef.current;
+    const targetGroups = query.type ? availableGroups.filter((item) => item.type === query.type) : availableGroups;
+    const warmCandidates = targetGroups.flatMap((item) =>
+      cachedCandidates(item.type, query.keyword),
+    );
+    setCandidates(warmCandidates);
+    setLoading(false);
+    const hasExactCache = targetGroups.every((item) =>
+      !bypassCandidateCache(item.type) && candidateCache.has(cacheKey(item.type, query.keyword)),
+    );
+    if (hasExactCache) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      if (warmCandidates.length === 0) setLoading(true);
+      let remaining = targetGroups.length;
+      const settleGroup = () => {
+        remaining -= 1;
+        if (remaining === 0 && requestRef.current === requestId) {
+          setLoading(false);
+        }
+      };
+      targetGroups.forEach((group) => {
+        loadAndCacheCandidates(group.type, query.keyword)
+          .then((items) => {
+            if (requestRef.current !== requestId) return;
+            setCandidates((current) => replaceCandidateGroup(current, group.type, items));
+          })
+          .finally(settleGroup);
+      });
+    }, query.keyword ? 180 : 0);
+    return () => window.clearTimeout(timer);
+  }, [query?.keyword, query?.type, availableGroups]);
+
+  useEffect(() => {
+    if (!query) return;
+    requestAnimationFrame(() => {
+      menuRef.current?.scrollTo({ top: 0 });
+    });
+  }, [query?.keyword, query?.type]);
+
+  useLayoutEffect(() => {
+    if (!query) return;
+    updateMenuPlacement();
+    window.addEventListener("resize", updateMenuPlacement);
+    window.addEventListener("scroll", updateMenuPlacement, true);
+    return () => {
+      window.removeEventListener("resize", updateMenuPlacement);
+      window.removeEventListener("scroll", updateMenuPlacement, true);
+    };
+  }, [query, updateMenuPlacement]);
+
+  const refreshQuery = useCallback(() => {
+    const next = allowMentions && editorRef.current ? queryAtCaret(editorRef.current) : null;
+    queryRef.current = next;
+    setQuery(next);
+    setActiveIndex(-1);
+    setExpandedTypes(new Set());
+  }, [allowMentions]);
+
+  const getDisabledReason = useCallback((candidate: Candidate) => (
+    candidate.disabledReason || disabledMentionReasons?.[candidate.type as MentionType]
+  ), [disabledMentionReasons]);
+
+  const isCandidateDisabled = useCallback((candidate: Candidate) => (
+    candidate.disabled || Boolean(getDisabledReason(candidate))
+  ), [getDisabledReason]);
+
+  const insertCandidate = useCallback((candidate: Candidate) => {
+    const editor = editorRef.current;
+    const currentQuery = queryRef.current;
+    if (!editor || !currentQuery) return;
+    const candidateDisabledReason = getDisabledReason(candidate);
+    if (candidate.disabled || candidateDisabledReason) {
+      message.info(candidateDisabledReason || "该能力已停用");
+      return;
+    }
+    if (
+      candidate.type === "workflow" &&
+      serializeEditor(editor).mentions.some((mention) => mention.type === "workflow")
+    ) {
+      message.warning(t("chat.mentionSingleWorkflowOnly"));
+      return;
+    }
+    const selection = window.getSelection();
+    currentQuery.range.deleteContents();
+    if (candidate.type === "prompt") {
+      const node = document.createTextNode(candidate.content || candidate.name);
+      currentQuery.range.insertNode(node);
+      const selected = document.createRange();
+      selected.selectNodeContents(node);
+      selection?.removeAllRanges();
+      selection?.addRange(selected);
+    } else {
+      const mention: ChatMention = {
+        mention_id: crypto.randomUUID(),
+        type: candidate.type,
+        resource_id: candidate.id,
+        display_name: candidate.name,
+      };
+      const holder = document.createElement("span");
+      holder.innerHTML = mentionHtml(mention);
+      const chip = holder.firstChild!;
+      const spacer = holder.lastChild!;
+      currentQuery.range.insertNode(spacer);
+      currentQuery.range.insertNode(chip);
+      const caret = document.createRange();
+      caret.setStartAfter(spacer);
+      caret.collapse(true);
+      selection?.removeAllRanges();
+      selection?.addRange(caret);
+    }
+    queryRef.current = null;
+    setQuery(null);
+    setActiveIndex(-1);
+    emit();
+    editor.focus();
+  }, [emit, getDisabledReason, t]);
+
+  const visibleCandidates = candidates.filter((candidate) => {
+    if (expandedTypes.has(candidate.type)) return true;
+    return candidates.filter((item) => item.type === candidate.type).indexOf(candidate) < 9;
+  });
+
+  const moveActiveCandidate = (direction: 1 | -1) => {
+    if (!visibleCandidates.some((candidate) => !isCandidateDisabled(candidate))) {
+      setActiveIndex(-1);
+      return;
+    }
+    setActiveIndex((current) => {
+      let index = current < 0 ? (direction > 0 ? -1 : 0) : current;
+      for (let step = 0; step < visibleCandidates.length; step += 1) {
+        index = (index + direction + visibleCandidates.length) % visibleCandidates.length;
+        if (!isCandidateDisabled(visibleCandidates[index])) return index;
+      }
+      return -1;
+    });
+  };
+
+  return (
+    <div className="chat-mention-editor-wrapper">
+      <div
+        ref={editorRef}
+        className="message-input chat-mention-editor"
+        contentEditable={!disabled}
+        suppressContentEditableWarning
+        role="textbox"
+        aria-multiline="true"
+        aria-label={placeholder}
+        data-placeholder={placeholder}
+        data-empty={value === "" ? "true" : "false"}
+        onInput={() => { emit(); refreshQuery(); }}
+        onClick={refreshQuery}
+        onKeyUp={(event) => { if (!["ArrowUp", "ArrowDown", "Enter"].includes(event.key)) refreshQuery(); }}
+        onCompositionStart={() => onCompositionChange(true)}
+        onCompositionEnd={() => { onCompositionChange(false); refreshQuery(); }}
+        onPaste={onPaste}
+        onKeyDown={(event) => {
+          if (isImeComposingEvent(event)) {
+            return;
+          }
+          if (allowMentions && query) {
+            if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+              event.preventDefault();
+              moveActiveCandidate(event.key === "ArrowDown" ? 1 : -1);
+              return;
+            }
+            if ((event.key === "Enter" || event.key === "Tab") && activeIndex >= 0 && visibleCandidates[activeIndex]) {
+              event.preventDefault();
+              insertCandidate(visibleCandidates[activeIndex]);
+              return;
+            }
+            if (event.key === "Escape") {
+              event.preventDefault();
+              queryRef.current = null;
+              setQuery(null);
+              return;
+            }
+          }
+          if (event.key === "Enter" && !event.shiftKey) {
+            event.preventDefault();
+            onSend();
+          }
+        }}
+      />
+      {allowMentions && query && (
+        <div
+          ref={menuRef}
+          className={`chat-mention-menu${menuPlacement.direction === "below" ? " is-below" : ""}`}
+          role="listbox"
+          style={{ height: menuPlacement.height }}
+          onMouseDown={(event) => event.preventDefault()}
+        >
+          {loading && candidates.length === 0 ? <div className="chat-mention-empty">{t("common.loading")}</div> : null}
+          {!loading && candidates.length === 0 ? <div className="chat-mention-empty">{t("chat.mentionNoResults")}</div> : null}
+          {availableGroups.filter((group) => !query.type || group.type === query.type).map((group) => {
+            const allItems = candidates.filter((item) => item.type === group.type);
+            const isExpanded = expandedTypes.has(group.type);
+            const items = isExpanded ? allItems : allItems.slice(0, 9);
+            if (!items.length) return null;
+            return <div className={`chat-mention-group${group.type === "conversation" ? " is-conversation" : ""}`} key={group.type}>
+              <div className="chat-mention-group-title">
+                <span>{group.icon}{t(group.labelKey)}</span>
+                <span className="chat-mention-shortcut"><code>@{group.shortcut}:</code>{t("chat.mentionShortcutHint")}</span>
+              </div>
+              <div className="chat-mention-options">
+              {items.map((item) => {
+                const index = visibleCandidates.indexOf(item);
+                const itemDisabled = isCandidateDisabled(item);
+                const itemDisabledReason = getDisabledReason(item);
+                const title = itemDisabled
+                  ? `${item.name}\n${itemDisabledReason || "该能力已停用"}`
+                  : item.description ? `${item.name}\n${item.description}` : item.name;
+                return <button type="button" role="option" title={title} aria-selected={activeIndex === index} className={`chat-mention-option${activeIndex === index ? " is-active" : ""}`} disabled={itemDisabled} key={`${item.type}-${item.id}`} onMouseEnter={() => { if (!itemDisabled) setActiveIndex(index); }} onMouseDown={(event) => { event.preventDefault(); if (!itemDisabled) insertCandidate(item); }}>
+                  <span className="chat-mention-option-name">{item.name}</span>
+                  {itemDisabled ? <span className="chat-mention-option-status">{itemDisabledReason || "已停用"}</span> : null}
+                  {group.type === "conversation" && item.description ? <span className="chat-mention-option-description">{item.description}</span> : null}
+                </button>;
+              })}
+              </div>
+              {allItems.length > 9 || isExpanded ? (
+                <button type="button" className="chat-mention-expand" onMouseDown={(event) => { event.preventDefault(); setExpandedTypes((current) => { const next = new Set(current); if (isExpanded) next.delete(group.type); else next.add(group.type); return next; }); setActiveIndex(-1); }}>
+                  {isExpanded ? t("chat.mentionCollapse") : t("chat.mentionShowMore", { count: allItems.length })}
+                </button>
+              ) : null}
+            </div>;
+          })}
+        </div>
+      )}
+    </div>
+  );
+});
+
+MentionEditor.displayName = "MentionEditor";
+export default MentionEditor;

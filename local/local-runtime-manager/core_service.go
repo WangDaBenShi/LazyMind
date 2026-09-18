@@ -1,0 +1,281 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+)
+
+const (
+	coreServiceHealthPath    = "/health"
+	coreServiceHealthTimeout = 180 * time.Second
+)
+
+var coreServiceDBWaitTimeout = 180 * time.Second
+
+type CoreServiceManager struct {
+	runner CommandRunner
+}
+
+func NewCoreServiceManager(r CommandRunner) *CoreServiceManager {
+	return &CoreServiceManager{runner: r}
+}
+
+func (m *CoreServiceManager) Run(ctx context.Context, cfg RuntimeConfig, paths RuntimePaths) error {
+	if err := paths.EnsureAllDirs(); err != nil {
+		return err
+	}
+	for _, dir := range []string{
+		paths.UploadRoot,
+		paths.LazyLLMTempDir,
+		paths.OCRCacheDir,
+		paths.SubagentDataDir,
+	} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	if err := m.buildCore(ctx, cfg, paths); err != nil {
+		return err
+	}
+	if cfg.SQLiteServerPort > 0 {
+		if err := waitForHTTPOnly(ctx, cfg.SQLiteServerPort, sqliteServerHealthPath, sqliteServerProcessName, 5*time.Minute); err != nil {
+			return err
+		}
+	}
+	if err := m.waitForCoreDatabase(ctx, cfg, paths); err != nil {
+		return err
+	}
+
+	cmd := exec.CommandContext(ctx, paths.CoreBin)
+	cmd.Dir = filepath.Join(paths.RepoRoot, coreSourceDirName)
+	cmd.Env = append(os.Environ(), coreServiceEnv(cfg, paths)...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	configureChildProcess(cmd, false)
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start core failed: %w", err)
+	}
+	releaseJob, err := attachManagedProcess(paths, coreProcessName, cmd.Process)
+	if err != nil {
+		_ = forceKillProcessTree(cmd.Process.Pid)
+		return fmt.Errorf("attach core process containment failed: %w", err)
+	}
+	defer releaseJob()
+	if err := os.WriteFile(paths.CorePIDFile, []byte(strconv.Itoa(cmd.Process.Pid)+"\n"), 0o600); err != nil {
+		_ = cmd.Process.Kill()
+		return err
+	}
+	registerLocalProcess(paths, coreProcessName, cmd.Process.Pid, []int{cfg.LocalProxy.CoreHostPort}, []string{paths.CoreBin})
+
+	waitErr := make(chan error, 1)
+	go func() {
+		waitErr <- cmd.Wait()
+	}()
+
+	if err := waitForCoreServiceHealth(ctx, cfg.LocalProxy.CoreHostPort, coreServiceHealthTimeout, waitErr); err != nil {
+		_ = cmd.Process.Kill()
+		_ = os.Remove(paths.CorePIDFile)
+		unregisterLocalProcess(paths, coreProcessName, cmd.Process.Pid)
+		return err
+	}
+
+	err = <-waitErr
+	_ = os.Remove(paths.CorePIDFile)
+	unregisterLocalProcess(paths, coreProcessName, cmd.Process.Pid)
+	if ctx.Err() != nil {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("core exited: %w", err)
+	}
+	return nil
+}
+
+func (m *CoreServiceManager) buildCore(ctx context.Context, cfg RuntimeConfig, paths RuntimePaths) error {
+	if cfg.Profile == "desktop" {
+		if info, err := os.Stat(paths.CoreBin); err == nil && !info.IsDir() {
+			return nil
+		}
+		return fmt.Errorf("desktop core binary not found: %s", paths.CoreBin)
+	}
+	if err := os.MkdirAll(filepath.Dir(paths.CoreBin), 0o755); err != nil {
+		return err
+	}
+	goBin := strings.TrimSpace(os.Getenv("GO"))
+	if goBin == "" {
+		goBin = "go"
+	}
+	res, err := m.runner.Run(ctx, Command{
+		Name: goBin,
+		Args: []string{"build", "-buildvcs=false", "-o", paths.CoreBin, "."},
+		Dir:  filepath.Join(paths.RepoRoot, coreSourceDirName),
+		Env:  goToolEnv(paths),
+	})
+	if err != nil {
+		return fmt.Errorf("build core failed: %w (%s)", err, strings.TrimSpace(res.Stderr))
+	}
+	return nil
+}
+
+func (m *CoreServiceManager) Down(ctx context.Context, cfg RuntimeConfig, paths RuntimePaths) error {
+	if err := paths.EnsureAllDirs(); err != nil {
+		return err
+	}
+	raw, err := os.ReadFile(paths.CorePIDFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || pid <= 0 {
+		_ = os.Remove(paths.CorePIDFile)
+		return nil
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		_ = os.Remove(paths.CorePIDFile)
+		return nil
+	}
+	_ = proc
+	_ = interruptProcess(pid)
+
+	deadline := time.NewTimer(10 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			_ = forceStopManagedProcess(paths, coreProcessName, pid)
+			return ctx.Err()
+		case <-deadline.C:
+			_ = forceStopManagedProcess(paths, coreProcessName, pid)
+			_ = os.Remove(paths.CorePIDFile)
+			return nil
+		case <-ticker.C:
+			alive, err := upLockProcessAlive(paths.CorePIDFile)
+			if err != nil || !alive {
+				_ = os.Remove(paths.CorePIDFile)
+				return nil
+			}
+		}
+	}
+}
+
+func coreServiceEnv(cfg RuntimeConfig, paths RuntimePaths) []string {
+	endpoints := serviceEndpointsFromConfig(cfg)
+	coreDSN := "sqliteproxy://core"
+	coreURL := "sqliteproxy://core"
+	preferredBrowser := strings.TrimSpace(os.Getenv("LAZYMIND_BROWSER_PREFERRED_DEVICE_BROWSER"))
+	return []string{
+		"LAZYMIND_RUNTIME_MODE=local",
+		"LAZYMIND_VOCABULARY_ENABLED=" + envText("LAZYMIND_VOCABULARY_ENABLED", "true"),
+		"LAZYMIND_CORE_HOST=127.0.0.1",
+		"LAZYMIND_CORE_PORT=" + strconv.Itoa(cfg.LocalProxy.CoreHostPort),
+		"ACL_DB_DRIVER=sqlite",
+		"ACL_DB_DSN=" + coreDSN,
+		"LAZYMIND_CORE_DATABASE_URL=" + coreURL,
+		sqliteServerURLEnvVar + "=http://127.0.0.1:" + strconv.Itoa(cfg.SQLiteServerPort),
+		sqliteServerTokenFileEnvVar + "=" + paths.RunDirTokenFile,
+		"MIGRATIONS_DIR=" + filepath.Join(paths.RepoRoot, coreSourceDirName, "migrations"),
+		"LAZYMIND_REDIS_URL=",
+		"LAZYMIND_STATE_BACKEND=sqlite",
+		"LAZYMIND_STATE_SQLITE_DIR=" + paths.CoreStateDir,
+		"LAZYMIND_RUNTIME_ROOT=" + paths.RuntimeRoot,
+		"LAZYMIND_UPLOAD_ROOT=" + paths.UploadRoot,
+		"LAZYMIND_SHARED_UPLOAD_DIR=" + paths.UploadRoot,
+		"LAZYMIND_HISTORY_INJECTION_ENABLED=" + envText("LAZYMIND_HISTORY_INJECTION_ENABLED", "true"),
+		"LAZYMIND_HISTORY_INJECTION_ROOT=" + paths.HistoryInjectionRoot,
+		"LAZYMIND_BOOTSTRAP_ADMIN_USERNAME=" + envText("LAZYMIND_BOOTSTRAP_ADMIN_USERNAME", "admin"),
+		"LAZYMIND_BOOTSTRAP_ADMIN_PASSWORD=" + envText("LAZYMIND_BOOTSTRAP_ADMIN_PASSWORD", "admin"),
+		"LAZYLLM_TEMP_DIR=" + paths.LazyLLMTempDir,
+		"LAZYMIND_OCR_CACHE_DIR=" + paths.OCRCacheDir,
+		"LAZYMIND_UPLOAD_TEXT_UTF8_CONVERT_ENABLED=" + envText("LAZYMIND_UPLOAD_TEXT_UTF8_CONVERT_ENABLED", "true"),
+		"LAZYMIND_PUBLIC_BASE_URL=http://localhost:" + strconv.Itoa(cfg.LocalProxy.Port) + "/api/core",
+		"LAZYMIND_FILE_URL_SIGN_SECRET=" + envText("LAZYMIND_FILE_URL_SIGN_SECRET", "changeme-in-production"),
+		"LAZYMIND_FILE_URL_EXPIRE_SECONDS=" + envText("LAZYMIND_FILE_URL_EXPIRE_SECONDS", "3600"),
+		"LAZYMIND_AUTH_SERVICE_URL=" + endpoints.Host.AuthServiceBaseURL + "/api/authservice",
+		"LAZYMIND_ALGO_SERVICE_URL=" + endpoints.Host.DocumentServiceBaseURL,
+		"LAZYMIND_DOCUMENT_SERVICE_URL=" + endpoints.Host.DocumentServiceBaseURL,
+		"LAZYMIND_PARSING_SERVICE_URL=" + endpoints.Host.ProcessorBaseURL,
+		"LAZYMIND_PROCESSOR_SERVICE_URL=" + endpoints.Host.ProcessorBaseURL,
+		"LAZYMIND_CHAT_SERVICE_URL=" + endpoints.Host.ChatBaseURL,
+		"LAZYMIND_EVO_SERVICE_URL=" + endpoints.Host.EvoBaseURL,
+		"LAZYMIND_CORE_SELF_URL=" + endpoints.Host.CoreBaseURL,
+		"LAZYMIND_BROWSER_ENABLED=" + envText("LAZYMIND_BROWSER_ENABLED", "true"),
+		"LAZYMIND_BROWSER_MCP_URL=" + endpoints.Host.CoreBaseURL + "/mcp/browser/v1",
+		"LAZYMIND_BROWSER_PREFERRED_DEVICE_BROWSER=" + preferredBrowser,
+		"LAZYMIND_BROWSER_EXTENSION_SOURCE_DIR=" + filepath.Join(paths.RepoRoot, "browser-extension"),
+		"LAZYMIND_SCAN_CONTROL_PLANE_URL=http://127.0.0.1:" + strconv.Itoa(cfg.LocalProxy.ScanHostPort),
+		"LAZYMIND_OFFICE_CONVERT_URL=" + endpoints.Host.OfficeConvertURL,
+		"LAZYMIND_OFFICE_CONVERT_WORKERS=" + envText("LAZYMIND_OFFICE_CONVERT_WORKERS", "4"),
+		"LAZYMIND_SUBAGENT_WORKSPACE=" + paths.SubagentDataDir,
+		"LAZYMIND_READONLY_VALIDATE=0",
+		"LAZYMIND_READONLY_DB_DRIVER=sqlite",
+		"LAZYMIND_READONLY_DB_DSN=sqliteproxy://lazyllm",
+		"LAZYMIND_READONLY_SCHEMA=",
+		"LAZYMIND_READONLY_TABLES=lazyllm_documents,lazyllm_doc_service_tasks,lazyllm_kb_documents",
+		"LAZYMIND_RESOURCE_UPDATE_ENABLED=" + envText("LAZYMIND_RESOURCE_UPDATE_ENABLED", "true"),
+		"LAZYMIND_AUTH_SERVICE_INTERNAL_TOKEN=" + envText("LAZYMIND_AUTH_SERVICE_INTERNAL_TOKEN", "dev-internal-service-token"),
+		"LAZYMIND_WORKFLOW_EXECUTOR_TOKEN=" + envText("LAZYMIND_WORKFLOW_EXECUTOR_TOKEN", "dev-workflow-executor-token"),
+		"LAZYMIND_MODEL_PROVIDER_SECRET_KEY=" + envText("LAZYMIND_MODEL_PROVIDER_SECRET_KEY", "lazymind-core-model-provider-default-secret"),
+		"LAZYMIND_MCP_SECRET_KEY=" + envText("LAZYMIND_MCP_SECRET_KEY", "lazymind-core-mcp-default-secret"),
+	}
+}
+
+func (m *CoreServiceManager) waitForCoreDatabase(ctx context.Context, cfg RuntimeConfig, paths RuntimePaths) error {
+	_ = ctx
+	_ = cfg
+	for _, path := range []string{paths.CoreDBPath, paths.LazyLLMDBPath} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func waitForCoreServiceHealth(ctx context.Context, port int, timeout time.Duration, waitErr <-chan error) error {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if coreServiceHealthAlive(port, time.Second) {
+			return nil
+		}
+		select {
+		case err := <-waitErr:
+			if err == nil {
+				return fmt.Errorf("core exited before becoming healthy")
+			}
+			return fmt.Errorf("core exited before becoming healthy: %w", err)
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return fmt.Errorf("core health check timed out on port %d", port)
+		case <-ticker.C:
+		}
+	}
+}
+
+func coreServiceHealthAlive(port int, timeout time.Duration) bool {
+	client := http.Client{Timeout: timeout}
+	resp, err := client.Get("http://127.0.0.1:" + strconv.Itoa(port) + coreServiceHealthPath)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode >= 200 && resp.StatusCode < 300
+}

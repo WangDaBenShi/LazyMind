@@ -1,0 +1,229 @@
+.chat-selector-wrapper {
+  position: relative;
+  display: inline-block;
+}
+
+.chat-selector-button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border: 1px solid #d9d9d9;
+  border-radius: 6px;
+  background: white;
+  cursor: pointer;
+  transition: all 0.2s;
+  min-height: 32px;
+
+  &:hover {
+    border-color: #4096ff;
+  }
+
+  &:focus {
+    border-color: #4096ff;
+    box-shadow: 0 0 0 2px rgba(64, 150, 255, 0.2);
+    outline: none;
+  }
+
+  .chat-selector-button-text {
+    flex: 1;
+    color: #262626;
+    font-size: 14px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+
+    &:empty::before {
+      content: attr(placeholder);
+      color: #bfbfbf;
+    }
+  }
+
+  .chat-selector-button-arrow {
+    color: #bfbfbf;
+    font-size: 12px;
+    margin-left: 8px;
+    transition: transform 0.2s;
+  }
+
+  &.open .chat-selector-button-arrow {
+    transform: rotate(180deg);
+  }
+}
+
+@keyframes slideDown {
+  from {
+    opacity: 0;
+    transform: translateY(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.chat-selector-container {
+  width: min(500px, calc(100vw - 24px));
+  max-width: calc(100vw - 24px);
+  background: white;
+  border-radius: 8px;
+  overflow: hidden;
+  padding-top: clamp(12px, 1.1vw, 20px);
+}
+
+.chat-selector-search-box {
+  padding: 0.3vw clamp(12px, 1.1vw, 20px);
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  column-gap: clamp(12px, 1vw, 20px);
+  row-gap: clamp(6px, 0.6vw, 12px);
+
+  .chat-selector-search-input {
+    flex: 1 1 240px;
+    min-width: 0;
+    font-size: 14px;
+
+    :global(.ant-input) {
+      font-size: 14px;
+    }
+
+    &:focus,
+    &:hover {
+      background-color: transparent;
+    }
+  }
+
+  .chat-selector-action-button {
+    padding: 0;
+    margin-left: 0;
+    flex: 0 0 auto;
+  }
+}
+
+.chat-selector-list-container {
+  max-height: min(40vh, 22vw);
+  overflow-y: auto;
+  padding: clamp(4px, 0.3vw, 8px) clamp(8px, 0.7vw, 14px);
+
+  &::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    background-color: rgba(0, 0, 0, 0.2);
+    border-radius: 3px;
+  }
+
+  &::-webkit-scrollbar-track {
+    background-color: transparent;
+  }
+}
+
+.chat-selector-list-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: clamp(8px, 0.7vw, 14px) clamp(12px, 1vw, 20px);
+  cursor: pointer;
+  transition: background-color 0.2s;
+  color: #333;
+  font-size: 14px;
+
+  &:hover {
+    background-color: #f5f5f5;
+  }
+
+  &.selected {
+    color: #1890ff;
+
+    &:hover {
+      background-color: #e6f0ff;
+    }
+  }
+
+  &.is-disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+    pointer-events: none;
+  }
+
+  .cancelDefaultDataset {
+    color: #333;
+  }
+
+  &.defaultDataset {
+    color: #1890ff;
+  }
+
+  .chat-selector-item-label {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .chat-selector-item-actions {
+    display: flex;
+    align-items: center;
+    gap: clamp(8px, 0.6vw, 12px);
+    margin-left: clamp(6px, 0.5vw, 10px);
+    flex-shrink: 0;
+  }
+
+  .chat-selector-pin-icon {
+    color: #8c8c8c;
+    font-size: 14px;
+    flex-shrink: 0;
+
+    &:hover,
+    &.is-pinned {
+      color: #1890ff;
+    }
+  }
+
+  .chat-selector-check-icon {
+    color: #1890ff;
+    font-size: 14px;
+    flex-shrink: 0;
+  }
+}
+
+.chat-selector-empty-text {
+  padding: 40px 16px;
+  text-align: center;
+  color: #999;
+  font-size: 14px;
+}
+
+.knowledgePopover {
+  .ant-popover-content {
+    .ant-popover-inner {
+      padding: 0;
+      border: 1px solid rgba(218, 226, 239, 0.82);
+      box-shadow: 0 16px 42px rgba(39, 61, 98, 0.16);
+    }
+  }
+}
+
+@media (max-width: 768px) {
+  .chat-selector-container {
+    width: calc(100vw - 24px);
+    max-width: calc(100vw - 24px);
+  }
+
+  .chat-selector-list-container {
+    max-height: 45vh;
+  }
+}

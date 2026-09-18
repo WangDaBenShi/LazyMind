@@ -1,0 +1,189 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestLoadResolvesRelativeBaseRootFromConfigDir(t *testing.T) {
+	root := t.TempDir()
+	cfgPath := writeTestConfig(t, root, `../../../data/scan`)
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	want := filepath.Join(root, "data", "scan")
+	if cfg.BaseRoot != want {
+		t.Fatalf("BaseRoot = %q, want %q", cfg.BaseRoot, want)
+	}
+	if cfg.Staging.HostRoot != filepath.Join(want, "staging") {
+		t.Fatalf("Staging.HostRoot = %q", cfg.Staging.HostRoot)
+	}
+	if cfg.Staging.ContainerRoot != "/data/staging" {
+		t.Fatalf("Staging.ContainerRoot = %q, want cloud default", cfg.Staging.ContainerRoot)
+	}
+}
+
+func TestLoadAllowsEnvOverrideForBaseRoot(t *testing.T) {
+	root := t.TempDir()
+	override := filepath.Join(root, "custom-scan-root")
+	t.Setenv("LAZYMIND_FILE_WATCHER_BASE_ROOT", override)
+	cfgPath := writeTestConfig(t, root, `${LAZYMIND_FILE_WATCHER_BASE_ROOT:-../../../data/scan}`)
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.BaseRoot != override {
+		t.Fatalf("BaseRoot = %q, want %q", cfg.BaseRoot, override)
+	}
+}
+
+func TestLoadAllowsEnvOverrideForStagingRuntimeRoot(t *testing.T) {
+	root := t.TempDir()
+	runtimeRoot := root + string(filepath.Separator) + "native-staging" + string(filepath.Separator) + ".." + string(filepath.Separator) + "native-staging" + string(filepath.Separator)
+	t.Setenv("LAZYMIND_FILE_WATCHER_STAGING_RUNTIME_ROOT", runtimeRoot)
+	cfgPath := writeTestConfig(t, root, `${LAZYMIND_FILE_WATCHER_BASE_ROOT:-../../../data/scan}`)
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	want := filepath.Clean(runtimeRoot)
+	if cfg.Staging.ContainerRoot != want {
+		t.Fatalf("Staging.ContainerRoot = %q, want %q", cfg.Staging.ContainerRoot, want)
+	}
+}
+
+func TestLoadExpandsAgentEndpointsAndPathMappingsFromEnv(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("LAZYMIND_FILE_WATCHER_LISTEN_ADDR", "0.0.0.0:19090")
+	t.Setenv("LAZYMIND_FILE_WATCHER_CONTROL_PLANE_BASE_URL", "http://scan-control-plane:18080")
+	t.Setenv("LAZYMIND_FILE_WATCHER_HOST_PATH_STYLE", "windows")
+	t.Setenv("LAZYMIND_FILE_WATCHER_PATH_MAPPINGS", "C:/Users/alice/Documents=/watch/documents,D:/Data=/watch/data")
+	cfgPath := writeTestConfig(t, root, `${LAZYMIND_FILE_WATCHER_BASE_ROOT:-../../../data/scan}`)
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.ListenAddr != "0.0.0.0:19090" {
+		t.Fatalf("ListenAddr = %q", cfg.ListenAddr)
+	}
+	if cfg.ControlPlaneBaseURL != "http://scan-control-plane:18080" {
+		t.Fatalf("ControlPlaneBaseURL = %q", cfg.ControlPlaneBaseURL)
+	}
+	if cfg.HostPathStyle != "windows" {
+		t.Fatalf("HostPathStyle = %q", cfg.HostPathStyle)
+	}
+	if len(cfg.PathMappings) != 2 {
+		t.Fatalf("expected 2 path mappings, got %d", len(cfg.PathMappings))
+	}
+	if cfg.PathMappings[0].PublicRoot != "C:/Users/alice/Documents" || cfg.PathMappings[0].RuntimeRoot != "/watch/documents" {
+		t.Fatalf("unexpected first mapping: %#v", cfg.PathMappings[0])
+	}
+}
+
+func TestLoadDerivesPathMappingFromWatchVolumeEnv(t *testing.T) {
+	root := t.TempDir()
+	hostRoot := filepath.Join(root, "watch-root")
+	t.Setenv("LAZYMIND_FILE_WATCHER_WATCH_HOST_DIR", hostRoot)
+	t.Setenv("LAZYMIND_FILE_WATCHER_WATCH_CONTAINER_DIR", "/watch/docs")
+	cfgPath := writeTestConfig(t, root, `${LAZYMIND_FILE_WATCHER_BASE_ROOT:-../../../data/scan}`)
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if len(cfg.PathMappings) != 1 {
+		t.Fatalf("expected 1 path mapping, got %d", len(cfg.PathMappings))
+	}
+	if cfg.PathMappings[0].PublicRoot != hostRoot || cfg.PathMappings[0].RuntimeRoot != "/watch/docs" {
+		t.Fatalf("unexpected mapping: %#v", cfg.PathMappings[0])
+	}
+}
+
+func TestLoadAllowsMultipleAllowedRootsFromJSONEnv(t *testing.T) {
+	root := t.TempDir()
+	first := filepath.Join(root, "Documents", "LazyMind")
+	second := filepath.Join(root, ".codex", "skills")
+	t.Setenv("LAZYMIND_FILE_WATCHER_ALLOWED_ROOTS_JSON", `["`+first+`","`+second+`"]`)
+	cfgPath := writeTestConfig(t, root, `${LAZYMIND_FILE_WATCHER_BASE_ROOT:-../../../data/scan}`)
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(cfg.Security.AllowedRoots) != 2 || cfg.Security.AllowedRoots[1] != second {
+		t.Fatalf("AllowedRoots = %#v", cfg.Security.AllowedRoots)
+	}
+}
+
+func TestLoadEnablesDynamicRootUpdatesOnlyFromExplicitEnv(t *testing.T) {
+	root := t.TempDir()
+	cfgPath := writeTestConfig(t, root, `${LAZYMIND_FILE_WATCHER_BASE_ROOT:-../../../data/scan}`)
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.DynamicRootUpdates {
+		t.Fatal("dynamic root updates must default to disabled")
+	}
+
+	t.Setenv("LAZYMIND_FILE_WATCHER_DYNAMIC_ROOT_UPDATES", "true")
+	cfg, err = Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load() with dynamic roots error = %v", err)
+	}
+	if !cfg.DynamicRootUpdates {
+		t.Fatal("dynamic root updates should be enabled explicitly")
+	}
+}
+
+func TestLoadAllowsEmptyTenantID(t *testing.T) {
+	root := t.TempDir()
+	cfgPath := writeTestConfigWithTenant(t, root, `${LAZYMIND_FILE_WATCHER_TENANT_ID:-}`, `${LAZYMIND_FILE_WATCHER_BASE_ROOT:-../../../data/scan}`)
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.TenantID != "" {
+		t.Fatalf("TenantID = %q, want empty", cfg.TenantID)
+	}
+}
+
+func writeTestConfig(t *testing.T, root, baseRoot string) string {
+	t.Helper()
+	return writeTestConfigWithTenant(t, root, "tenant-test", baseRoot)
+}
+
+func writeTestConfigWithTenant(t *testing.T, root, tenantID, baseRoot string) string {
+	t.Helper()
+
+	cfgDir := filepath.Join(root, "backend", "file-watcher", "configs")
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+
+	cfgPath := filepath.Join(cfgDir, "agent.yaml")
+	data := []byte(`agent_id: "agent-test"
+tenant_id: "` + tenantID + `"
+listen_addr: "${LAZYMIND_FILE_WATCHER_LISTEN_ADDR:-127.0.0.1:19090}"
+control_plane_base_url: "${LAZYMIND_FILE_WATCHER_CONTROL_PLANE_BASE_URL:-http://127.0.0.1:18080}"
+base_root: "` + baseRoot + `"
+`)
+	if err := os.WriteFile(cfgPath, data, 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	return cfgPath
+}

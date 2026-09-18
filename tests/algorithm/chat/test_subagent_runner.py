@@ -1,0 +1,748 @@
+"""Tests for lazymind.chat.engine.subagent.runner.
+
+Uses a FakeDB (in-memory) and a FakeAgent (injects known tag sequences) to
+drive run_subagent_stream without any real database, LLM, or network calls.
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+from typing import Any, Dict, List, Optional
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+import lazymind.chat.engine.subagent.runner as runner_mod
+
+
+def test_workflow_script_tool_is_loaded_from_pinned_revision():
+    source = 'def create_list_fixtures():\n    return ["one", "two"]\n'
+    response = MagicMock()
+    response.result = {
+        'revision_id': 'revision-1',
+        'tree_hash': 'tree-1',
+        'files': {
+            'scripts/tools.py': base64.b64encode(source.encode()).decode(),
+        },
+    }
+    client = MagicMock()
+    client.get_workflow.return_value = response
+
+    with patch('lazymind.workflow_sdk.WorkflowClient', return_value=client):
+        tools = runner_mod._resolve_runtime_tools(
+            ['create_list_fixtures'],
+            {
+                'workflow_id': 'test-workflow',
+                'revision_id': 'revision-1',
+                'tree_hash': 'tree-1',
+                'user_id': 'user-1',
+            },
+        )
+
+    assert [tool.__name__ for tool in tools] == ['create_list_fixtures']
+    assert tools[0]() == ['one', 'two']
+    client.get_workflow.assert_called_once_with('test-workflow', 'revision-1')
+
+
+def test_terminal_tools_only_filters_model_tools_without_mutating_runtime_tools():
+    def cloud_files():
+        pass
+
+    def writer_prepare_workspace():
+        pass
+
+    runtime_tools = [cloud_files, writer_prepare_workspace]
+
+    assert runner_mod._model_visible_runtime_tools(runtime_tools, {}) is runtime_tools
+    visible = runner_mod._model_visible_runtime_tools(runtime_tools, {
+        'terminal_tools_only': True,
+        'terminal_tools': ['writer_prepare_workspace'],
+    })
+
+    assert runtime_tools == [cloud_files, writer_prepare_workspace]
+    assert visible == [writer_prepare_workspace]
+
+
+# ---------------------------------------------------------------------------
+# In-memory FakeDB
+# ---------------------------------------------------------------------------
+
+class FakeDB:
+    def __init__(self, task: Optional[Dict[str, Any]] = None):
+        self._task = task
+        self.steps: List[Dict[str, Any]] = []
+
+    def load_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+        return self._task
+
+    def append_step(self, task_id: str, seq: int, role: str, content: Dict[str, Any]) -> None:
+        self.steps.append({'task_id': task_id, 'seq': seq, 'role': role, 'content': content})
+
+    def load_steps(self, task_id: str) -> List[Dict[str, Any]]:
+        return [s for s in self.steps if s['task_id'] == task_id]
+
+    def max_step_seq(self, task_id: str) -> int:
+        relevant = [s['seq'] for s in self.steps if s['task_id'] == task_id]
+        return max(relevant) if relevant else -1
+
+    def next_artifact_seq(self, task_id: str, key: str) -> int:
+        return 1
+
+    def save_artifact(self, task_id: str, key: str, content_type: str,
+                      value: Dict[str, Any], seq: int) -> None:
+        pass
+
+    def load_artifacts(self, task_id: str, keys=None) -> List[Dict[str, Any]]:
+        return []
+
+    def saved_artifact_keys(self, task_id: str) -> List[str]:
+        return []
+
+    def dispose(self) -> None:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Default task fixture
+# ---------------------------------------------------------------------------
+
+_DEFAULT_TASK_ID = 'task-001'
+_DEFAULT_TASK = {
+    'id': _DEFAULT_TASK_ID,
+    'conversation_id': 'conv-1',
+    'agent_type': 'test',
+    'objective': 'do something',
+    'params': {'required_output_artifact_keys': ['result']},
+    'workspace_path': '/tmp/ws',
+    'input_artifact_keys': [],
+    'output_artifact_keys': ['result'],
+    'mode': 'auto',
+}
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _sse_to_events(raw: str) -> List[Dict[str, Any]]:
+    """Parse SSE lines into a list of dicts (skips [DONE] and empty lines)."""
+    events = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if line.startswith('data: ') and '[DONE]' not in line:
+            events.append(json.loads(line[len('data: '):]))
+    return events
+
+
+async def _collect(gen) -> str:
+    parts = []
+    async for chunk in gen:
+        parts.append(chunk)
+    return ''.join(parts)
+
+
+def _install_fake_db(monkeypatch, task=None):
+    db = FakeDB(task or {**_DEFAULT_TASK})
+    monkeypatch.setattr(
+        runner_mod,
+        'MemorySubAgentStore',
+        lambda task_spec, initial_steps=None, artifacts=None: db,
+    )
+    return db
+
+
+def _install_fake_lazyllm(monkeypatch):
+    """Patch lazyllm globals/locals init and AutoModel."""
+    fake_llm_mod = MagicMock()
+    fake_llm_mod.globals._init_sid = lambda sid: None
+    fake_llm_mod.locals._init_sid = lambda sid: None
+    monkeypatch.setattr(runner_mod, 'lazyllm', fake_llm_mod)
+    monkeypatch.setattr(runner_mod, 'AutoModel', lambda model: 'fake_llm')
+    monkeypatch.setattr(runner_mod, 'inject_model_config', lambda cfg: None)
+    monkeypatch.setattr(runner_mod, 'set_context', lambda ctx: None)
+
+
+def _install_fake_drive(monkeypatch, events, final_value='task done'):
+    """Replace AgentExecutor with a deterministic event stream."""
+    class FakeExecutor:
+        async def stream(self, llm, plan):
+            for ev in events:
+                yield 'event', ev
+            yield 'final', final_value
+
+    monkeypatch.setattr(runner_mod, 'AgentExecutor', FakeExecutor)
+
+
+def _install_fake_build(monkeypatch):
+    """Agent creation is covered by AgentExecutor tests; runner tests replace the executor."""
+
+
+def _install_fake_translator(monkeypatch):
+    """AgentEventFrameTranslator that turns text events into {text:...} frames."""
+    class FakeTranslator:
+        def __init__(self, query=''):
+            self.citation_state: Dict[str, Any] = {}
+
+        def feed(self, item):
+            tag = item.get('tag', '')
+            if tag == 'text':
+                return [{'text': item.get('delta', ''), 'think': None}]
+            if tag == 'think':
+                return [{'text': None, 'think': item.get('delta', '')}]
+            return []
+
+        def finish(self, result):
+            return []
+
+    monkeypatch.setattr(runner_mod, 'AgentEventFrameTranslator', FakeTranslator)
+
+
+def test_subagent_plan_preserves_extension_params_without_structured_duplicates(tmp_path):
+    from lazymind.chat.engine.subagent.context import SubAgentContext
+
+    ctx = SubAgentContext(
+        task_id='task-params',
+        conversation_id='conv-1',
+        agent_type='test',
+        objective='do something',
+        params={
+            'custom_plugin_option': 'keep-me',
+            'count': 3,
+            'history_files_per_turn': {'1': ['/tmp/input.txt']},
+            'partial_indices': {'items': [0]},
+            'required_output_artifact_keys': ['result'],
+            'workflow_id': 'test-workflow',
+            'session_id': 'session-1',
+            'step_id': 'prompt',
+            'user_input': 'run the whole workflow',
+        },
+        workspace_path=str(tmp_path),
+        input_slots=[],
+        output_slots=['result'],
+        db=None,
+        emit=lambda _event: None,
+    )
+
+    plan = runner_mod._build_subagent_plan(
+        ctx,
+        None,
+        tools=[],
+        tool_prompt_appendices={},
+    )
+
+    parameter_section = next(
+        section for section in plan.prompt.sections
+        if section.section_id == 'subagent_parameters'
+    )
+    assert 'custom_plugin_option: keep-me' in parameter_section.content
+    assert 'count: 3' in parameter_section.content
+    assert 'history_files_per_turn' not in parameter_section.content
+    assert 'partial_indices' not in parameter_section.content
+    assert 'required_output_artifact_keys' not in parameter_section.content
+    assert 'workflow_id' not in parameter_section.content
+    assert 'session_id' not in parameter_section.content
+    assert 'user_input' not in parameter_section.content
+    role_section = next(
+        section for section in plan.prompt.sections
+        if section.section_id == 'subagent_role'
+    )
+    assert 'must never ask the user a question' in role_section.content
+    assert 'Never emit a fenced Markdown block with the language `editable`' in role_section.content
+    assert all(section.section_id != 'editable_writing' for section in plan.prompt.sections)
+
+
+def test_subagent_plan_uses_200_rounds_in_max_mode(tmp_path):
+    import lazyllm
+    from lazymind.chat.engine.subagent.context import SubAgentContext
+
+    ctx = SubAgentContext(
+        task_id='task-max', conversation_id='conv-1', agent_type='research',
+        objective='deep research', params={'_thinking_depth': 'max'}, workspace_path=str(tmp_path),
+        input_slots=[], output_slots=[], db=None, emit=lambda _event: None,
+    )
+    previous = lazyllm.globals.get('agentic_config')
+    try:
+        lazyllm.globals['agentic_config'] = {'thinking_depth': 'max'}
+        with runner_mod._cfg.temp('agentic_expanded_max_rounds', 200):
+            plan = runner_mod._build_subagent_plan(
+                ctx, None, tools=[], tool_prompt_appendices={},
+            )
+    finally:
+        lazyllm.globals['agentic_config'] = previous or {}
+
+    assert plan.execution_options.max_retries == 199
+
+
+def test_subagent_plan_forwards_llm_config_for_context_budget(tmp_path):
+    from lazymind.chat.engine.subagent.context import SubAgentContext
+
+    ctx = SubAgentContext(
+        task_id='task-budget', conversation_id='conv-1', agent_type='workflow_step',
+        objective='retrieve literature', params={}, workspace_path=str(tmp_path),
+        input_slots=[], output_slots=[], db=None, emit=lambda _event: None,
+    )
+    llm_config = {'llm': {'source': 'deepseek', 'model': 'deepseek-v4-flash', 'max_input_tokens': '1M'}}
+    plan = runner_mod._build_subagent_plan(
+        ctx, None, tools=[], tool_prompt_appendices={}, llm_config=llm_config,
+    )
+
+    assert plan.execution_options.llm_config == llm_config
+
+
+def test_ordinary_subagent_enables_inherited_skill_runtime(tmp_path):
+    from lazymind.chat.engine.subagent.context import SubAgentContext
+
+    ctx = SubAgentContext(
+        task_id='task-image-skill', conversation_id='conv-1', agent_type='image_generation',
+        objective='generate a presentation background',
+        params={'_inherited_skills': ['design/image-prompt-craft']},
+        workspace_path=str(tmp_path), input_slots=[], output_slots=[], db=None,
+        emit=lambda _event: None,
+    )
+    plan = runner_mod._build_subagent_plan(
+        ctx, None, tools=[], tool_prompt_appendices={},
+    )
+
+    assert plan.execution_options.skills == ['design/image-prompt-craft']
+    assert plan.execution_options.fs is runner_mod.FS
+    assert plan.execution_options.skills_dir
+    assert all(
+        '_inherited_skills' not in section.content for section in plan.prompt.sections
+    )
+
+
+def test_workflow_step_keeps_skill_runtime_isolated(tmp_path):
+    from lazymind.chat.engine.subagent.context import SubAgentContext
+
+    ctx = SubAgentContext(
+        task_id='task-workflow-skill', conversation_id='conv-1', agent_type='workflow_step',
+        objective='generate a presentation background',
+        params={'_inherited_skills': ['design/image-prompt-craft']},
+        workspace_path=str(tmp_path), input_slots=[], output_slots=[], db=None,
+        emit=lambda _event: None,
+    )
+    plan = runner_mod._build_subagent_plan(
+        ctx, None, tools=[], tool_prompt_appendices={},
+    )
+
+    assert plan.execution_options.skills is None
+    assert plan.execution_options.fs is None
+    assert plan.execution_options.skills_dir is None
+
+
+# ---------------------------------------------------------------------------
+# Test: task not found
+# ---------------------------------------------------------------------------
+
+def test_run_subagent_stream_task_not_found(monkeypatch):
+    db = FakeDB(task=None)
+    monkeypatch.setattr(
+        runner_mod,
+        'MemorySubAgentStore',
+        lambda task_spec, initial_steps=None, artifacts=None: db,
+    )
+
+    async def run():
+        return await _collect(runner_mod.run_subagent_stream(
+            'bad-id', task_spec={**_DEFAULT_TASK},
+        ))
+
+    raw = asyncio.run(run())
+    events = _sse_to_events(raw)
+    assert events[0]['type'] == 'error'
+    assert 'not found' in events[0]['message']
+    assert raw.endswith('data: [DONE]\n\n')
+
+
+# ---------------------------------------------------------------------------
+# Test: happy path SSE sequence
+# ---------------------------------------------------------------------------
+
+def test_run_subagent_stream_happy_path(monkeypatch):
+    db = _install_fake_db(monkeypatch)
+    _install_fake_lazyllm(monkeypatch)
+    _install_fake_build(monkeypatch)
+    _install_fake_translator(monkeypatch)
+
+    # Simulate: text event → tool_calls → tool_results (triggers artifact emit) → text
+    tool_calls_event = {'tag': 'tool_calls', 'tool_calls': [{'id': 'c1', 'name': 'save_artifacts', 'args': {}}]}
+    tool_results_event = {'tag': 'tool_results', 'tool_results': [{'id': 'c1', 'name': 'save_artifacts', 'result': 'ok'}]}
+    events = [
+        {'tag': 'text', 'delta': 'Starting...'},
+        tool_calls_event,
+        tool_results_event,
+        {'tag': 'text', 'delta': 'Done.'},
+    ]
+    _install_fake_drive(monkeypatch, events)
+
+    # Patch ctx.saved_keys to return declared key so completeness check passes.
+    real_ensure = runner_mod.SubAgentContext if hasattr(runner_mod, 'SubAgentContext') else None
+    original_set_ctx = runner_mod.set_context
+
+    ctx_holder: list = []
+
+    def capturing_set_context(ctx):
+        ctx_holder.append(ctx)
+        # Pre-populate saved keys to pass completeness check.
+        ctx._artifact_counts['result'] = 1
+
+    monkeypatch.setattr(runner_mod, 'set_context', capturing_set_context)
+
+    async def run():
+        return await _collect(runner_mod.run_subagent_stream(
+            _DEFAULT_TASK_ID, task_spec={**_DEFAULT_TASK},
+        ))
+
+    raw = asyncio.run(run())
+    events_out = _sse_to_events(raw)
+    types_out = [e['type'] for e in events_out]
+
+    assert types_out[0] == 'task_start'
+    assert types_out[1] == 'progress'  # initial progress
+    assert 'text' in types_out
+    assert 'progress' in types_out   # tool_results progress bump
+    assert 'done' in types_out
+    assert raw.endswith('data: [DONE]\n\n')
+
+
+def test_tool_result_sends_separate_resume_safe_payload(monkeypatch):
+    db = _install_fake_db(monkeypatch)
+    _install_fake_lazyllm(monkeypatch)
+    _install_fake_build(monkeypatch)
+    _install_fake_translator(monkeypatch)
+    full_result = 'x' * 3000
+    _install_fake_drive(monkeypatch, [{
+        'tag': 'tool_results',
+        'tool_results': [{'id': 'c1', 'name': 'read_file', 'result': full_result}],
+    }])
+
+    def pre_save_ctx(ctx):
+        ctx._artifact_counts['result'] = 1
+
+    monkeypatch.setattr(runner_mod, 'set_context', pre_save_ctx)
+
+    async def run():
+        return await _collect(runner_mod.run_subagent_stream(
+            _DEFAULT_TASK_ID, task_spec={**_DEFAULT_TASK},
+        ))
+
+    events = _sse_to_events(asyncio.run(run()))
+    result_event = next(event for event in events if event.get('type') == 'tool_results')
+    assert result_event['tool_results'][0]['result'] == full_result[:2000]
+    assert result_event['durable_tool_results'][0]['result'] == full_result
+    assert db.steps[0]['content']['tool_results'][0]['result'] == full_result
+
+
+# ---------------------------------------------------------------------------
+# Test: missing artifact → error frame
+# ---------------------------------------------------------------------------
+
+def test_run_subagent_stream_missing_artifact_emits_error(monkeypatch):
+    db = _install_fake_db(monkeypatch)
+    _install_fake_lazyllm(monkeypatch)
+    _install_fake_build(monkeypatch)
+    _install_fake_translator(monkeypatch)
+    _install_fake_drive(monkeypatch, [])
+    # set_context does NOT pre-populate saved keys → completeness check fails
+
+    async def run():
+        return await _collect(runner_mod.run_subagent_stream(
+            _DEFAULT_TASK_ID, task_spec={**_DEFAULT_TASK},
+        ))
+
+    raw = asyncio.run(run())
+    events_out = _sse_to_events(raw)
+    error_events = [e for e in events_out if e.get('type') == 'error']
+    assert error_events, 'Expected an error event for missing artifact'
+    assert 'result' in error_events[0]['message']
+    assert raw.endswith('data: [DONE]\n\n')
+
+
+# ---------------------------------------------------------------------------
+# Test: AgentExecutor raises → outer except → error frame
+# ---------------------------------------------------------------------------
+
+def test_run_subagent_stream_agent_exception_emits_error(monkeypatch):
+    _install_fake_db(monkeypatch)
+    _install_fake_lazyllm(monkeypatch)
+    _install_fake_build(monkeypatch)
+    _install_fake_translator(monkeypatch)
+
+    class ExplodingExecutor:
+        async def stream(self, llm, plan):
+            raise RuntimeError('llm exploded')
+            yield  # pragma: no cover
+
+    monkeypatch.setattr(runner_mod, 'AgentExecutor', ExplodingExecutor)
+
+    async def run():
+        return await _collect(runner_mod.run_subagent_stream(
+            _DEFAULT_TASK_ID, task_spec={**_DEFAULT_TASK},
+        ))
+
+    raw = asyncio.run(run())
+    events_out = _sse_to_events(raw)
+    error_events = [e for e in events_out if e.get('type') == 'error']
+    assert error_events
+    assert 'llm exploded' in error_events[0]['message']
+
+
+# ---------------------------------------------------------------------------
+# Test: text/think frames from AgentEventFrameTranslator appear in SSE
+# ---------------------------------------------------------------------------
+
+def test_run_subagent_stream_text_think_events(monkeypatch):
+    db = _install_fake_db(monkeypatch)
+    _install_fake_lazyllm(monkeypatch)
+    _install_fake_build(monkeypatch)
+    _install_fake_translator(monkeypatch)
+
+    events = [
+        {'tag': 'think', 'delta': 'reasoning...'},
+        {'tag': 'text', 'delta': 'answer'},
+    ]
+    _install_fake_drive(monkeypatch, events)
+
+    # Pre-populate saved key.
+    def pre_save_ctx(ctx):
+        ctx._artifact_counts['result'] = 1
+    monkeypatch.setattr(runner_mod, 'set_context', pre_save_ctx)
+
+    async def run():
+        return await _collect(runner_mod.run_subagent_stream(
+            _DEFAULT_TASK_ID, task_spec={**_DEFAULT_TASK},
+        ))
+
+    raw = asyncio.run(run())
+    events_out = _sse_to_events(raw)
+    types_out = [e['type'] for e in events_out]
+    assert 'think' in types_out
+    assert 'text' in types_out
+
+
+def test_run_subagent_stream_coalesces_tiny_text_deltas(monkeypatch):
+    db = _install_fake_db(monkeypatch)
+    _install_fake_lazyllm(monkeypatch)
+    _install_fake_build(monkeypatch)
+    _install_fake_translator(monkeypatch)
+    _install_fake_drive(monkeypatch, [
+        {'tag': 'text', 'delta': 'x'} for _ in range(1024)
+    ])
+
+    def pre_save_ctx(ctx):
+        ctx._artifact_counts['result'] = 1
+    monkeypatch.setattr(runner_mod, 'set_context', pre_save_ctx)
+
+    async def run():
+        return await _collect(runner_mod.run_subagent_stream(
+            _DEFAULT_TASK_ID, task_spec={**_DEFAULT_TASK},
+        ))
+
+    events_out = _sse_to_events(asyncio.run(run()))
+    text_events = [event for event in events_out if event.get('type') == 'text']
+    assert ''.join(event.get('text', '') for event in text_events) == 'x' * 1024
+    assert len(text_events) <= 4
+    assert len(db.steps) == 1
+
+
+def test_workflow_tool_internal_text_is_not_forwarded(monkeypatch):
+    workflow_task = {
+        **_DEFAULT_TASK,
+        'agent_type': 'workflow_step',
+        'params': {'required_output_artifact_keys': ['result']},
+    }
+    _install_fake_db(monkeypatch, workflow_task)
+    _install_fake_lazyllm(monkeypatch)
+    _install_fake_build(monkeypatch)
+    _install_fake_translator(monkeypatch)
+    _install_fake_drive(monkeypatch, [
+        {'tag': 'text', 'delta': 'Starting.'},
+        {'tag': 'tool_calls', 'tool_calls': [
+            {'id': 'ppt-1', 'name': 'ppt_generate_pages', 'args': {}},
+        ]},
+        {'tag': 'text', 'delta': '<html>large internal page output</html>'},
+        {'tag': 'tool_results', 'tool_results': [
+            {'id': 'ppt-1', 'name': 'ppt_generate_pages', 'result': 'ok'},
+        ]},
+        {'tag': 'text', 'delta': 'Finished.'},
+    ])
+
+    def pre_save_ctx(ctx):
+        ctx._artifact_counts['result'] = 1
+    monkeypatch.setattr(runner_mod, 'set_context', pre_save_ctx)
+
+    async def run():
+        return await _collect(runner_mod.run_subagent_stream(
+            _DEFAULT_TASK_ID, task_spec=workflow_task,
+        ))
+
+    events_out = _sse_to_events(asyncio.run(run()))
+    visible_text = ''.join(
+        event.get('text', '') for event in events_out if event.get('type') == 'text'
+    )
+    assert visible_text == 'Starting.Finished.'
+    assert '<html>' not in visible_text
+
+
+def test_workflow_tool_artifact_is_streamed_before_tool_returns(monkeypatch):
+    workflow_task = {
+        **_DEFAULT_TASK,
+        'agent_type': 'workflow_step',
+        'params': {'required_output_artifact_keys': ['result']},
+    }
+    _install_fake_db(monkeypatch, workflow_task)
+    _install_fake_lazyllm(monkeypatch)
+    _install_fake_build(monkeypatch)
+    _install_fake_translator(monkeypatch)
+    context_holder: Dict[str, Any] = {}
+
+    def capture_context(ctx):
+        context_holder['ctx'] = ctx
+        ctx._artifact_counts['result'] = 1
+
+    monkeypatch.setattr(runner_mod, 'set_context', capture_context)
+
+    class ProgressiveArtifactExecutor:
+        async def stream(self, llm, plan):
+            yield 'event', {
+                'tag': 'tool_calls',
+                'tool_calls': [{'id': 'ppt-1', 'name': 'ppt_generate_pages', 'args': {}}],
+            }
+            context_holder['ctx'].emit({
+                'type': 'artifact',
+                'slot': 'result',
+                'content_type': 'text',
+                'seq': 1,
+                'value': {'text': '<html>page one</html>', 'list_index': 0},
+            })
+            # Model a publisher that keeps generating more pages after page one
+            # has already been made available to the UI.
+            await asyncio.sleep(0.01)
+            yield 'event', {
+                'tag': 'tool_results',
+                'tool_results': [{'id': 'ppt-1', 'name': 'ppt_generate_pages', 'result': 'ok'}],
+            }
+            yield 'final', 'done'
+
+    monkeypatch.setattr(runner_mod, 'AgentExecutor', ProgressiveArtifactExecutor)
+
+    async def run():
+        return await _collect(runner_mod.run_subagent_stream(
+            _DEFAULT_TASK_ID, task_spec=workflow_task,
+        ))
+
+    events_out = _sse_to_events(asyncio.run(run()))
+    event_types = [event.get('type') for event in events_out]
+
+    assert event_types.count('artifact') == 1
+    assert event_types.index('artifact') < event_types.index('tool_results')
+
+
+def test_run_subagent_stream_emits_task_scoped_source_snapshot(monkeypatch):
+    _install_fake_db(monkeypatch)
+    _install_fake_lazyllm(monkeypatch)
+    _install_fake_build(monkeypatch)
+    _install_fake_translator(monkeypatch)
+    _install_fake_drive(monkeypatch, [{
+        'tag': 'tool_results',
+        'tool_results': [{'id': 'search-1', 'name': 'web_search', 'result': 'ok'}],
+    }])
+    monkeypatch.setattr(
+        runner_mod,
+        'materialize_source_views',
+        MagicMock(side_effect=[[], [{
+            'index': '1.1',
+            'source_type': 'external',
+            'title': 'Example',
+            'url': 'https://example.test',
+            'source_roles': ['searched'],
+        }], [{
+            'index': '1.1',
+            'source_type': 'external',
+            'title': 'Example',
+            'url': 'https://example.test',
+            'source_roles': ['searched'],
+        }]]),
+    )
+
+    def pre_save_ctx(ctx):
+        ctx._artifact_counts['result'] = 1
+
+    monkeypatch.setattr(runner_mod, 'set_context', pre_save_ctx)
+
+    async def run():
+        return await _collect(runner_mod.run_subagent_stream(
+            _DEFAULT_TASK_ID, task_spec={**_DEFAULT_TASK},
+        ))
+
+    events_out = _sse_to_events(asyncio.run(run()))
+    source_events = [event for event in events_out if event.get('type') == 'sources']
+    assert len(source_events) == 1
+    assert source_events[0]['task_id'] == _DEFAULT_TASK_ID
+    assert source_events[0]['sources'][0]['source_roles'] == ['searched']
+
+
+# ---------------------------------------------------------------------------
+# Test: _rebuild_history_from_steps pairing validation
+# ---------------------------------------------------------------------------
+
+def test_rebuild_history_valid_pairs():
+    db = FakeDB()
+    db.steps = [
+        {'task_id': 't1', 'seq': 0, 'role': 'assistant',
+         'content': {'text': '', 'tool_calls': [{'id': 'c1', 'name': 'tool_a', 'args': {}}]}},
+        {'task_id': 't1', 'seq': 1, 'role': 'tool',
+         'content': {'tool_results': [{
+             'tool_call_id': 'c1',
+             'name': 'tool_a',
+             'result': {'path': '/tmp/result.txt', 'offset': 4},
+         }]}},
+    ]
+    history = runner_mod._rebuild_history_from_steps(db, 't1')
+    assert len(history) == 2
+    assert history[0]['role'] == 'assistant'
+    assert history[1]['role'] == 'tool'
+    assert history[1]['tool_call_id'] == 'c1'
+    assert history[1][runner_mod.TOOL_OBSERVATION_KEY] == {
+        'version': 1,
+        'ok': None,
+        'value': {'path': '/tmp/result.txt', 'offset': 4},
+        'error': '',
+    }
+
+
+def test_rebuild_history_skips_observation_for_string_tool_results():
+    db = FakeDB()
+    db.steps = [
+        {'task_id': 't1', 'seq': 0, 'role': 'assistant',
+         'content': {'text': '', 'tool_calls': [{'id': 'c1', 'name': 'tool_a', 'args': {}}]}},
+        {'task_id': 't1', 'seq': 1, 'role': 'tool',
+         'content': {'tool_results': [{
+             'tool_call_id': 'c1',
+             'name': 'tool_a',
+             'result': 'plain tool output',
+         }]}},
+    ]
+    history = runner_mod._rebuild_history_from_steps(db, 't1')
+    assert history[1]['content'] == 'plain tool output'
+    assert runner_mod.TOOL_OBSERVATION_KEY not in history[1]
+
+
+def test_rebuild_history_orphan_tool_result_dropped():
+    db = FakeDB()
+    db.steps = [
+        {'task_id': 't1', 'seq': 0, 'role': 'assistant',
+         'content': {'text': '', 'tool_calls': [{'id': 'c1', 'name': 'tool_a', 'args': {}}]}},
+        {'task_id': 't1', 'seq': 1, 'role': 'tool',
+         'content': {'tool_results': [{'tool_call_id': 'WRONG_ID', 'name': 'tool_a', 'result': 'r'}]}},
+    ]
+    history = runner_mod._rebuild_history_from_steps(db, 't1')
+    # Orphan tool result: assistant step should also be dropped (we stop at last complete boundary).
+    assert all(h.get('role') != 'tool' for h in history)
+
+
+def test_rebuild_history_no_steps_returns_empty():
+    db = FakeDB()
+    history = runner_mod._rebuild_history_from_steps(db, 't1')
+    assert history == []

@@ -1,0 +1,503 @@
+package common
+
+import (
+	"net/http"
+	"regexp"
+	"strings"
+	"sync"
+)
+
+type AppError struct {
+	HTTPStatus int
+	Code       int
+	Message    string
+	Detail     any
+}
+
+type errorPattern struct {
+	template string
+	matcher  *regexp.Regexp
+	appErr   *AppError
+}
+
+var (
+	errorPatterns         []errorPattern
+	normalizedCatalogOnce sync.Once
+	normalizedCatalog     map[string]*AppError
+)
+
+func NewAppError(httpStatus, code int, message string) *AppError {
+	return &AppError{HTTPStatus: httpStatus, Code: code, Message: message}
+}
+
+func (e *AppError) WithDetail(detail any) *AppError {
+	dup := *e
+	dup.Detail = detail
+	return &dup
+}
+
+func (e *AppError) Error() string {
+	return e.Message
+}
+
+var errorCatalog = map[string]*AppError{
+	"invalid body":                      NewAppError(http.StatusBadRequest, 2000201, "Invalid request body"),
+	"invalid json":                      NewAppError(http.StatusBadRequest, 2000202, "Invalid JSON body"),
+	"invalid request":                   NewAppError(http.StatusBadRequest, 2000203, "Invalid request"),
+	"method not allowed":                NewAppError(http.StatusMethodNotAllowed, 2000204, "Method not allowed"),
+	"missing x-user-id":                 NewAppError(http.StatusBadRequest, 2000205, "X-User-Id is required"),
+	"missing dataset":                   NewAppError(http.StatusBadRequest, 2000206, "Dataset is required"),
+	"missing dataset or document":       NewAppError(http.StatusBadRequest, 2000207, "Dataset or document is required"),
+	"missing dataset or upload_file_id": NewAppError(http.StatusBadRequest, 2000208, "Dataset or upload_file_id is required"),
+	"missing path":                      NewAppError(http.StatusBadRequest, 2000209, "Path is required"),
+	"invalid path encoding":             NewAppError(http.StatusBadRequest, 2000210, "Invalid path encoding"),
+	"invalid path":                      NewAppError(http.StatusBadRequest, 2000211, "Invalid path"),
+	"missing signature":                 NewAppError(http.StatusForbidden, 2000301, "Signature is required"),
+	"url expired":                       NewAppError(http.StatusForbidden, 2000302, "Signed URL has expired"),
+	"invalid signature":                 NewAppError(http.StatusForbidden, 2000303, "Invalid signature"),
+	"document not found":                NewAppError(http.StatusNotFound, 2000401, "Document not found"),
+	"document file not found":           NewAppError(http.StatusNotFound, 2000402, "Document file not found"),
+	"uploaded file not found":           NewAppError(http.StatusNotFound, 2000403, "Uploaded file not found"),
+	"uploaded file path is empty":       NewAppError(http.StatusNotFound, 2000404, "Uploaded file path is empty"),
+	"task not found":                    NewAppError(http.StatusNotFound, 2000405, "Task not found"),
+	"prompt not found":                  NewAppError(http.StatusNotFound, 2000406, "Prompt not found"),
+	"conversation not found":            NewAppError(http.StatusNotFound, 2000407, "Conversation not found"),
+	"resource not found":                NewAppError(http.StatusNotFound, 2000408, "Resource not found"),
+	"avatar not found":                  NewAppError(http.StatusNotFound, 2000409, "Avatar not found"),
+	"query documents failed":            NewAppError(http.StatusInternalServerError, 2000501, "Failed to query documents"),
+	"create document failed":            NewAppError(http.StatusInternalServerError, 2000502, "Failed to create document"),
+	"update document failed":            NewAppError(http.StatusInternalServerError, 2000503, "Failed to update document"),
+	"search documents failed":           NewAppError(http.StatusInternalServerError, 2000504, "Failed to search documents"),
+	"query tasks failed":                NewAppError(http.StatusInternalServerError, 2000505, "Failed to query tasks"),
+	"failed to ensure conversation":     NewAppError(http.StatusInternalServerError, 2000506, "Failed to ensure conversation"),
+	"store not initialized":             NewAppError(http.StatusInternalServerError, 2000507, "Store is not initialized"),
+	"streaming not supported":           NewAppError(http.StatusInternalServerError, 2000508, "Streaming is not supported"),
+	"request failed":                    NewAppError(http.StatusInternalServerError, 2000509, "Request failed"),
+	"update failed":                     NewAppError(http.StatusInternalServerError, 2000510, "Update failed"),
+	"delete failed":                     NewAppError(http.StatusInternalServerError, 2000511, "Delete failed"),
+	"list failed":                       NewAppError(http.StatusInternalServerError, 2000512, "List failed"),
+	"avatar operation failed":           NewAppError(http.StatusInternalServerError, 2000523, "Avatar operation failed"),
+	"stored avatar is invalid":          NewAppError(http.StatusInternalServerError, 2000524, "Stored avatar is invalid"),
+	"name too long":                     NewAppError(http.StatusBadRequest, 2000601, "Name is too long"),
+	"content too long":                  NewAppError(http.StatusBadRequest, 2000602, "Content is too long"),
+	"display_name and content required": NewAppError(http.StatusBadRequest, 2000603, "Display name and content are required"),
+	"display_name/content required":     NewAppError(http.StatusBadRequest, 2000604, "Display name or content is required"),
+	"invalid prompt name":               NewAppError(http.StatusBadRequest, 2000605, "Invalid prompt name"),
+	"prompt existed":                    NewAppError(http.StatusConflict, 2000606, "Prompt already exists"),
+	"task_ids is required":              NewAppError(http.StatusBadRequest, 2000607, "task_ids is required"),
+	"invalid multipart form":            NewAppError(http.StatusBadRequest, 2000608, "Invalid multipart form"),
+	"no files uploaded":                 NewAppError(http.StatusBadRequest, 2000609, "No files uploaded"),
+	"no file uploaded":                  NewAppError(http.StatusBadRequest, 2000610, "No file uploaded"),
+	"invalid page_token":                NewAppError(http.StatusBadRequest, 2000611, "Invalid page_token"),
+	"input required":                    NewAppError(http.StatusBadRequest, 2000612, "Input is required"),
+	"query required":                    NewAppError(http.StatusBadRequest, 2000613, "Query is required"),
+	"display_name too long":             NewAppError(http.StatusBadRequest, 2000614, "Display name is too long"),
+	"conversation_id too long":          NewAppError(http.StatusBadRequest, 2000615, "conversation_id is too long"),
+	"external task id is empty":         NewAppError(http.StatusBadRequest, 2000616, "External task id is empty"),
+	"dataset name uses reserved prefix": NewAppError(http.StatusBadRequest, 2000617, "Dataset name uses reserved prefix"),
+	"avatar file is required":           NewAppError(http.StatusBadRequest, 2000618, "Avatar file is required"),
+	"invalid avatar upload":             NewAppError(http.StatusBadRequest, 2000619, "Invalid avatar upload"),
+	"unsupported avatar image":          NewAppError(http.StatusBadRequest, 2000620, "Unsupported avatar image"),
+	"avatar file is too large":          NewAppError(http.StatusRequestEntityTooLarge, 2000621, "Avatar file is too large"),
+	"task cannot be canceled":           NewAppError(http.StatusConflict, 2000701, "Task cannot be canceled"),
+	"job cannot be canceled":            NewAppError(http.StatusConflict, 2000702, "Job cannot be canceled"),
+
+	"missing dataset or task":                                NewAppError(http.StatusBadRequest, 2000212, "Dataset or task is required"),
+	"invalid request body":                                   NewAppError(http.StatusBadRequest, 2000213, "Invalid request body"),
+	"task_id in body does not match path":                    NewAppError(http.StatusBadRequest, 2000214, "task_id in body does not match path"),
+	"filename is required":                                   NewAppError(http.StatusBadRequest, 2000215, "Filename is required"),
+	"file_size must be >= 0":                                 NewAppError(http.StatusBadRequest, 2000216, "file_size must be >= 0"),
+	"part_size must be >= 0":                                 NewAppError(http.StatusBadRequest, 2000217, "part_size must be >= 0"),
+	"items is required":                                      NewAppError(http.StatusBadRequest, 2000218, "Items are required"),
+	"task can only be resumed from failed or canceled state": NewAppError(http.StatusBadRequest, 2000219, "Task can only be resumed from FAILED or CANCELED state"),
+	"未配置自进化模型":                                               NewAppError(http.StatusUnprocessableEntity, 2000228, "未配置自进化模型"),
+	"save upload file failed":                                NewAppError(http.StatusInternalServerError, 2000513, "Failed to save upload file"),
+	"create temp dir failed":                                 NewAppError(http.StatusInternalServerError, 2000514, "Failed to create temp dir"),
+	"open upload file failed":                                NewAppError(http.StatusBadRequest, 2000220, "Failed to open upload file"),
+	"create upload target failed":                            NewAppError(http.StatusInternalServerError, 2000515, "Failed to create upload target"),
+	"create uploaded file failed":                            NewAppError(http.StatusInternalServerError, 2000516, "Failed to create uploaded file"),
+	"load upload meta failed":                                NewAppError(http.StatusInternalServerError, 2000517, "Failed to load upload meta"),
+	"create part failed":                                     NewAppError(http.StatusInternalServerError, 2000518, "Failed to create upload part"),
+	"write part failed":                                      NewAppError(http.StatusInternalServerError, 2000519, "Failed to write upload part"),
+	"segment not found":                                      NewAppError(http.StatusNotFound, 2000410, "Segment not found"),
+	"missing segment":                                        NewAppError(http.StatusBadRequest, 2000221, "Segment is required"),
+	"read body failed":                                       NewAppError(http.StatusBadRequest, 2000222, "Failed to read request body"),
+	"invalid search_config (top_k 1-10, confidence 0-1)":     NewAppError(http.StatusBadRequest, 2000223, "Invalid search_config"),
+	"conversation_id required":                               NewAppError(http.StatusBadRequest, 2000224, "conversation_id is required"),
+	"member not found":                                       NewAppError(http.StatusNotFound, 2000411, "Member not found"),
+	"invalid role":                                           NewAppError(http.StatusBadRequest, 2000225, "Invalid role"),
+	"acl store not initialized":                              NewAppError(http.StatusInternalServerError, 2000520, "ACL store is not initialized"),
+	"user_id_list and group_id_list cannot both be empty":    NewAppError(http.StatusBadRequest, 2000226, "user_id_list and group_id_list cannot both be empty"),
+	"no valid user_id_list or group_id_list provided":        NewAppError(http.StatusBadRequest, 2000227, "No valid user_id_list or group_id_list provided"),
+	"failed to add dataset members":                          NewAppError(http.StatusInternalServerError, 2000521, "Failed to add dataset members"),
+	"algo service unavailable":                               NewAppError(http.StatusBadGateway, 2000710, "Algo service is unavailable"),
+	"query datasets failed":                                  NewAppError(http.StatusInternalServerError, 2000522, "Failed to query datasets"),
+	"algo service error":                                     NewAppError(http.StatusBadGateway, 2000711, "Algo service returned an error"),
+	"external delete failed":                                 NewAppError(http.StatusBadGateway, 2000712, "Failed to delete documents in external service"),
+
+	// Generic auth errors.
+	"unauthorized": NewAppError(http.StatusUnauthorized, ErrCodeUnauthorized, "unauthorized"),
+	"forbidden":    NewAppError(http.StatusForbidden, ErrCodeForbidden, "forbidden"),
+
+	// Additional bad request errors discovered from handlers.
+	"action_list must be a non-empty array":                       NewAppError(http.StatusBadRequest, 2000801, "action_list must be a non-empty array"),
+	"apply_id and filename required":                              NewAppError(http.StatusBadRequest, 2000802, "apply_id and filename required"),
+	"at least 2 group_ids required":                               NewAppError(http.StatusBadRequest, 2000803, "at least 2 group_ids required"),
+	"bad dir":                                                     NewAppError(http.StatusBadRequest, 2000804, "bad dir"),
+	"child skill category is immutable":                           NewAppError(http.StatusBadRequest, 2000805, "child skill category is immutable"),
+	"child skill only supports content/file_ext/auto_evo updates": NewAppError(http.StatusBadRequest, 2000806, "child skill only supports content/file_ext/auto_evo updates"),
+	"children is not allowed when creating child skill":           NewAppError(http.StatusBadRequest, 2000807, "children is not allowed when creating child skill"),
+	"content exceeds 1500 characters after removing whitespace":   NewAppError(http.StatusBadRequest, 2000808, "content exceeds 1500 characters after removing whitespace"),
+	"content required":                                            NewAppError(http.StatusBadRequest, 2000809, "content required"),
+	"conversation_ids required":                                   NewAppError(http.StatusBadRequest, 2000810, "conversation_ids required"),
+	"create_user_id is required":                                  NewAppError(http.StatusBadRequest, 2000811, "create_user_id is required"),
+	"deleted_history_id required":                                 NewAppError(http.StatusBadRequest, 2000812, "deleted_history_id required"),
+	"description required":                                        NewAppError(http.StatusBadRequest, 2000813, "description required"),
+	"duplicate model_type in selections":                          NewAppError(http.StatusBadRequest, 2000814, "duplicate model_type in selections"),
+	"empty":                                                       NewAppError(http.StatusBadRequest, 2000815, "empty"),
+	"enabled required":                                            NewAppError(http.StatusBadRequest, 2000816, "enabled required"),
+	"end_time must be greater than or equal to start_time":        NewAppError(http.StatusBadRequest, 2000817, "end_time must be greater than or equal to start_time"),
+	"feedback type must be 0/1/2":                                 NewAppError(http.StatusBadRequest, 2000818, "feedback type must be 0/1/2"),
+	"file path is invalid":                                        NewAppError(http.StatusBadRequest, 2000819, "file path is invalid"),
+	"folder not found":                                            NewAppError(http.StatusBadRequest, 2000820, "folder not found"),
+	"frontmatter description required":                            NewAppError(http.StatusBadRequest, 2000821, "frontmatter description required"),
+	"frontmatter name required":                                   NewAppError(http.StatusBadRequest, 2000822, "frontmatter name required"),
+	"group_id is required":                                        NewAppError(http.StatusBadRequest, 2000823, "group_id is required"),
+	"group_ids is required":                                       NewAppError(http.StatusBadRequest, 2000824, "group_ids is required"),
+	"group_ids is required for add_to_group":                      NewAppError(http.StatusBadRequest, 2000825, "group_ids is required for add_to_group"),
+	"group_ids is required for conflict":                          NewAppError(http.StatusBadRequest, 2000826, "group_ids is required for conflict"),
+	"group_ids required":                                          NewAppError(http.StatusBadRequest, 2000824, "group_ids is required"),
+	"history ids are not in same conversation":                    NewAppError(http.StatusBadRequest, 2000828, "history ids are not in same conversation"),
+	"history_id required":                                         NewAppError(http.StatusBadRequest, 2000829, "history_id required"),
+	"id is required":                                              NewAppError(http.StatusBadRequest, 2000830, "id is required"),
+	"id is required when conflict is true":                        NewAppError(http.StatusBadRequest, 2000831, "id is required when conflict is true"),
+	"id required":                                                 NewAppError(http.StatusBadRequest, 2000830, "id is required"),
+	"ids required":                                                NewAppError(http.StatusBadRequest, 2000833, "ids required"),
+	"invalid action":                                              NewAppError(http.StatusBadRequest, 2000834, "invalid action"),
+	"invalid conversation name":                                   NewAppError(http.StatusBadRequest, 2000835, "invalid conversation name"),
+	"invalid dataset id":                                          NewAppError(http.StatusBadRequest, 2000836, "invalid dataset id"),
+	"invalid end_time":                                            NewAppError(http.StatusBadRequest, 2000837, "invalid end_time"),
+	"invalid feedback type":                                       NewAppError(http.StatusBadRequest, 2000838, "invalid feedback type"),
+	"invalid group_ids JSON":                                      NewAppError(http.StatusBadRequest, 2000839, "invalid group_ids JSON"),
+	"invalid mode":                                                NewAppError(http.StatusBadRequest, 2000840, "invalid mode"),
+	"invalid model_type":                                          NewAppError(http.StatusBadRequest, 2000841, "invalid model_type"),
+	"invalid path segment":                                        NewAppError(http.StatusBadRequest, 2000842, "invalid path segment"),
+	"invalid source":                                              NewAppError(http.StatusBadRequest, 2000843, "invalid source"),
+	"invalid start_time":                                          NewAppError(http.StatusBadRequest, 2000844, "invalid start_time"),
+	"invalid suggestion filter":                                   NewAppError(http.StatusBadRequest, 2000845, "invalid suggestion filter"),
+	"messages request body required":                              NewAppError(http.StatusBadRequest, 2000846, "messages request body required"),
+	"missing file_id":                                             NewAppError(http.StatusBadRequest, 2000847, "missing file_id"),
+	"missing group_id":                                            NewAppError(http.StatusBadRequest, 2000823, "group_id is required"),
+	"missing id":                                                  NewAppError(http.StatusBadRequest, 2000830, "id is required"),
+	"missing model_provider_id":                                   NewAppError(http.StatusBadRequest, 2000850, "missing model_provider_id"),
+	"missing model_provider_id or group_id":                       NewAppError(http.StatusBadRequest, 2000851, "missing model_provider_id or group_id"),
+	"missing model_provider_id, group_id, or model_id":            NewAppError(http.StatusBadRequest, 2000852, "missing model_provider_id, group_id, or model_id"),
+	"missing share_item_id":                                       NewAppError(http.StatusBadRequest, 2000853, "missing share_item_id"),
+	"missing skill_id":                                            NewAppError(http.StatusBadRequest, 2000854, "missing skill_id"),
+	"missing suggestion id":                                       NewAppError(http.StatusBadRequest, 2000855, "missing suggestion id"),
+	"model not found":                                             NewAppError(http.StatusBadRequest, 2000856, "model not found"),
+	"model_type is required":                                      NewAppError(http.StatusBadRequest, 2000857, "model_type is required"),
+	"model_key is required":                                       NewAppError(http.StatusBadRequest, 2001301, "model_key is required"),
+	"invalid model_key":                                           NewAppError(http.StatusBadRequest, 2001302, "invalid model_key"),
+	"name and base_url are required":                              NewAppError(http.StatusBadRequest, 2000858, "name and base_url are required"),
+	"name and model_type are required":                            NewAppError(http.StatusBadRequest, 2000859, "name and model_type are required"),
+	"name required":                                               NewAppError(http.StatusBadRequest, 2000860, "name required"),
+	"name/category/content required":                              NewAppError(http.StatusBadRequest, 2000861, "name/category/content required"),
+	"no accepted suggestions found":                               NewAppError(http.StatusBadRequest, 2000862, "no accepted suggestions found"),
+	"no target users to share":                                    NewAppError(http.StatusBadRequest, 2000863, "no target users to share"),
+	"only parent skill supports confirm":                          NewAppError(http.StatusBadRequest, 2000864, "only parent skill supports confirm"),
+	"only parent skill supports discard":                          NewAppError(http.StatusBadRequest, 2000865, "only parent skill supports discard"),
+	"only parent skill supports draft preview":                    NewAppError(http.StatusBadRequest, 2000866, "only parent skill supports draft preview"),
+	"only parent skill supports generate":                         NewAppError(http.StatusBadRequest, 2000867, "only parent skill supports generate"),
+	"only parent skill supports share":                            NewAppError(http.StatusBadRequest, 2000868, "only parent skill supports share"),
+	"only parent skill supports share status query":               NewAppError(http.StatusBadRequest, 2000869, "only parent skill supports share status query"),
+	"parent does not match dataset":                               NewAppError(http.StatusBadRequest, 2000870, "parent does not match dataset"),
+	"parent required":                                             NewAppError(http.StatusBadRequest, 2000871, "parent required"),
+	"parent skill content must contain closing frontmatter separator": NewAppError(http.StatusBadRequest, 2000872, "parent skill content must contain closing frontmatter separator"),
+	"parent skill content must include markdown body":                 NewAppError(http.StatusBadRequest, 2000873, "parent skill content must include markdown body"),
+	"parent skill content must start with YAML frontmatter":           NewAppError(http.StatusBadRequest, 2000874, "parent skill content must start with YAML frontmatter"),
+	"parent skill has pending_confirm draft":                          NewAppError(http.StatusBadRequest, 2000875, "parent skill has pending_confirm draft"),
+	"path namespace must be skills":                                   NewAppError(http.StatusBadRequest, 2000876, "path namespace must be skills"),
+	"path points to directory":                                        NewAppError(http.StatusBadRequest, 2000877, "path points to directory"),
+	"path required":                                                   NewAppError(http.StatusBadRequest, 2000209, "Path is required"),
+	"path segment cannot contain slash":                               NewAppError(http.StatusBadRequest, 2000879, "path segment cannot contain slash"),
+	"path segment required":                                           NewAppError(http.StatusBadRequest, 2000880, "path segment required"),
+	"provider_name, base_url, and api_key are required":               NewAppError(http.StatusBadRequest, 2000881, "provider_name, base_url, and api_key are required"),
+	"report_id required":                                              NewAppError(http.StatusBadRequest, 2000882, "report_id required"),
+	"request description and frontmatter description must match":      NewAppError(http.StatusBadRequest, 2000883, "request description and frontmatter description must match"),
+	"request name and frontmatter name must match":                    NewAppError(http.StatusBadRequest, 2000884, "request name and frontmatter name must match"),
+	"selections required":                                             NewAppError(http.StatusBadRequest, 2000885, "selections required"),
+	"session_id required":                                             NewAppError(http.StatusBadRequest, 2000886, "session_id required"),
+	"session_id and id or category/skill_name required":               NewAppError(http.StatusBadRequest, 2000904, "session_id and id or category/skill_name required"),
+	"session_id/category/skill_name required":                         NewAppError(http.StatusBadRequest, 2000887, "session_id/category/skill_name required"),
+	"session_id/category/skill_name/content required":                 NewAppError(http.StatusBadRequest, 2000888, "session_id/category/skill_name/content required"),
+	"set_history_id required":                                         NewAppError(http.StatusBadRequest, 2000889, "set_history_id required"),
+	"skill draft content invalid":                                     NewAppError(http.StatusBadRequest, 2000890, "skill draft content invalid"),
+	"status must be 0 or 1":                                           NewAppError(http.StatusBadRequest, 2000891, "status must be 0 or 1"),
+	"suggestion title/content required":                               NewAppError(http.StatusBadRequest, 2000892, "suggestion title/content required"),
+	"suggestion_ids or user_instruct required":                        NewAppError(http.StatusBadRequest, 2000893, "suggestion_ids or user_instruct required"),
+	"user_instruct required":                                          NewAppError(http.StatusBadRequest, 2001303, "user_instruct required"),
+	"content and user_instruct required":                              NewAppError(http.StatusBadRequest, 2001304, "content and user_instruct required"),
+	"suggestions length must be between 1 and 5":                      NewAppError(http.StatusBadRequest, 2000894, "suggestions length must be between 1 and 5"),
+	"term and aliases are empty":                                      NewAppError(http.StatusBadRequest, 2000895, "term and aliases are empty"),
+	"term is required":                                                NewAppError(http.StatusBadRequest, 2000896, "term is required"),
+	"thread_id required":                                              NewAppError(http.StatusBadRequest, 2000897, "thread_id required"),
+	"unable to resolve session user":                                  NewAppError(http.StatusBadRequest, 2000898, "unable to resolve session user"),
+	"unsupported order_by":                                            NewAppError(http.StatusBadRequest, 2000899, "unsupported order_by"),
+	"user_id required":                                                NewAppError(http.StatusBadRequest, 2000900, "user_id required"),
+	"word is required":                                                NewAppError(http.StatusBadRequest, 2000901, "word is required"),
+	"term must not match any alias":                                   NewAppError(http.StatusBadRequest, 2000902, "term must not match any alias"),
+	"aliases must be unique":                                          NewAppError(http.StatusBadRequest, 2000903, "aliases must be unique"),
+
+	// Additional not found errors discovered from handlers.
+	"dataset not found":             NewAppError(http.StatusNotFound, 2000951, "dataset not found"),
+	"deleted_history_id not found":  NewAppError(http.StatusNotFound, 2000952, "deleted_history_id not found"),
+	"export file not found":         NewAppError(http.StatusNotFound, 2000953, "export file not found"),
+	"file not found":                NewAppError(http.StatusNotFound, 2000954, "file not found"),
+	"group not found":               NewAppError(http.StatusNotFound, 2000955, "group not found"),
+	"history not found":             NewAppError(http.StatusNotFound, 2000956, "history not found"),
+	"model provider not found":      NewAppError(http.StatusNotFound, 2000959, "model provider not found"),
+	"path not found":                NewAppError(http.StatusNotFound, 2000960, "path not found"),
+	"session snapshot not found":    NewAppError(http.StatusNotFound, 2000961, "session snapshot not found"),
+	"set_history_id not found":      NewAppError(http.StatusNotFound, 2000962, "set_history_id not found"),
+	"share item not found":          NewAppError(http.StatusNotFound, 2000963, "share item not found"),
+	"skill draft not found":         NewAppError(http.StatusNotFound, 2000964, "skill draft not found"),
+	"skill not found":               NewAppError(http.StatusNotFound, 2000965, "skill not found"),
+	"source skill not found":        NewAppError(http.StatusNotFound, 2000966, "source skill not found"),
+	"suggestion not found":          NewAppError(http.StatusNotFound, 2000967, "suggestion not found"),
+	"target group not found":        NewAppError(http.StatusNotFound, 2000968, "target group not found"),
+	"thread not found":              NewAppError(http.StatusNotFound, 2000969, "thread not found"),
+	"upload session not found":      NewAppError(http.StatusNotFound, 2000970, "upload session not found"),
+	"word group conflict not found": NewAppError(http.StatusNotFound, 2000973, "word group conflict not found"),
+	"word group not found":          NewAppError(http.StatusNotFound, 2000974, "word group not found"),
+
+	// Additional internal errors discovered from handlers.
+	"read agent file content failed":        NewAppError(http.StatusInternalServerError, 2000998, "read agent file content failed"),
+	"read analysis report content failed":   NewAppError(http.StatusInternalServerError, 2000999, "read analysis report content failed"),
+	"read diff result content failed":       NewAppError(http.StatusInternalServerError, 2001000, "read diff result content failed"),
+	"accept share failed":                   NewAppError(http.StatusInternalServerError, 2001001, "accept share failed"),
+	"activate user thread failed":           NewAppError(http.StatusInternalServerError, 2001002, "activate user thread failed"),
+	"add conflict word to groups failed":    NewAppError(http.StatusInternalServerError, 2001003, "add conflict word to groups failed"),
+	"apply word group action failed":        NewAppError(http.StatusInternalServerError, 2001004, "apply word group action failed"),
+	"batch delete conversations failed":     NewAppError(http.StatusInternalServerError, 2001005, "batch delete conversations failed"),
+	"batch delete document failed":          NewAppError(http.StatusInternalServerError, 2001006, "batch delete document failed"),
+	"batch delete word group failed":        NewAppError(http.StatusInternalServerError, 2001007, "batch delete word group failed"),
+	"build chat resource context failed":    NewAppError(http.StatusInternalServerError, 2001008, "build chat resource context failed"),
+	"check existing model failed":           NewAppError(http.StatusInternalServerError, 2001011, "check existing model failed"),
+	"check suggestion outdated failed":      NewAppError(http.StatusInternalServerError, 2001012, "check suggestion outdated failed"),
+	"check words exist failed":              NewAppError(http.StatusInternalServerError, 2001013, "check words exist failed"),
+	"confirm skill draft failed":            NewAppError(http.StatusInternalServerError, 2001015, "confirm skill draft failed"),
+	"create dataset failed":                 NewAppError(http.StatusInternalServerError, 2001017, "create dataset failed"),
+	"create group failed":                   NewAppError(http.StatusInternalServerError, 2001018, "create group failed"),
+	"create model failed":                   NewAppError(http.StatusInternalServerError, 2001019, "create model failed"),
+	"create share task failed":              NewAppError(http.StatusInternalServerError, 2001020, "create share task failed"),
+	"create suggestion failed":              NewAppError(http.StatusInternalServerError, 2001021, "create suggestion failed"),
+	"create suggestions failed":             NewAppError(http.StatusInternalServerError, 2001022, "create suggestions failed"),
+	"create word group failed":              NewAppError(http.StatusInternalServerError, 2001023, "create word group failed"),
+	"delete dataset failed":                 NewAppError(http.StatusInternalServerError, 2001024, "delete dataset failed"),
+	"delete document failed":                NewAppError(http.StatusInternalServerError, 2001025, "delete document failed"),
+	"delete group failed":                   NewAppError(http.StatusInternalServerError, 2001026, "delete group failed"),
+	"delete model failed":                   NewAppError(http.StatusInternalServerError, 2001027, "delete model failed"),
+	"delete thread history failed":          NewAppError(http.StatusInternalServerError, 2001028, "delete thread history failed"),
+	"delete word group conflict failed":     NewAppError(http.StatusInternalServerError, 2001029, "delete word group conflict failed"),
+	"delete word group failed":              NewAppError(http.StatusInternalServerError, 2001030, "delete word group failed"),
+	"discard skill draft failed":            NewAppError(http.StatusInternalServerError, 2001032, "discard skill draft failed"),
+	"expand target users failed":            NewAppError(http.StatusInternalServerError, 2001034, "expand target users failed"),
+	"export conversations failed":           NewAppError(http.StatusInternalServerError, 2001035, "export conversations failed"),
+	"failed to save history":                NewAppError(http.StatusInternalServerError, 2001036, "failed to save history"),
+	"failed to update history":              NewAppError(http.StatusInternalServerError, 2001037, "failed to update history"),
+	"get word group failed":                 NewAppError(http.StatusInternalServerError, 2001038, "get word group failed"),
+	"list agent threads failed":             NewAppError(http.StatusInternalServerError, 2001039, "list agent threads failed"),
+	"list group parent ids failed":          NewAppError(http.StatusInternalServerError, 2001040, "list group parent ids failed"),
+	"list groups failed":                    NewAppError(http.StatusInternalServerError, 2001041, "list groups failed"),
+	"list model providers failed":           NewAppError(http.StatusInternalServerError, 2001042, "list model providers failed"),
+	"list models failed":                    NewAppError(http.StatusInternalServerError, 2001043, "list models failed"),
+	"list round records failed":             NewAppError(http.StatusInternalServerError, 2001044, "list round records failed"),
+	"list thread records failed":            NewAppError(http.StatusInternalServerError, 2001045, "list thread records failed"),
+	"list thread rounds failed":             NewAppError(http.StatusInternalServerError, 2001046, "list thread rounds failed"),
+	"list word group conflicts failed":      NewAppError(http.StatusInternalServerError, 2001047, "list word group conflicts failed"),
+	"list word group failed":                NewAppError(http.StatusInternalServerError, 2001048, "list word group failed"),
+	"load source skill failed":              NewAppError(http.StatusInternalServerError, 2001049, "load source skill failed"),
+	"load thread failed":                    NewAppError(http.StatusInternalServerError, 2001050, "load thread failed"),
+	"merge and add word group failed":       NewAppError(http.StatusInternalServerError, 2001051, "merge and add word group failed"),
+	"merge word group failed":               NewAppError(http.StatusInternalServerError, 2001052, "merge word group failed"),
+	"open file failed":                      NewAppError(http.StatusInternalServerError, 2001053, "open file failed"),
+	"query conversations failed":            NewAppError(http.StatusInternalServerError, 2001054, "query conversations failed"),
+	"query group failed":                    NewAppError(http.StatusInternalServerError, 2001055, "query group failed"),
+	"query model failed":                    NewAppError(http.StatusInternalServerError, 2001058, "query model failed"),
+	"query model provider failed":           NewAppError(http.StatusInternalServerError, 2001059, "query model provider failed"),
+	"query models failed":                   NewAppError(http.StatusInternalServerError, 2001060, "query models failed"),
+	"query personalization setting failed":  NewAppError(http.StatusInternalServerError, 2001061, "query personalization setting failed"),
+	"query prompts failed":                  NewAppError(http.StatusInternalServerError, 2001062, "query prompts failed"),
+	"query selected models failed":          NewAppError(http.StatusInternalServerError, 2001063, "query selected models failed"),
+	"query share items failed":              NewAppError(http.StatusInternalServerError, 2001064, "query share items failed"),
+	"query share tasks failed":              NewAppError(http.StatusInternalServerError, 2001065, "query share tasks failed"),
+	"query skill failed":                    NewAppError(http.StatusInternalServerError, 2001066, "query skill failed"),
+	"query skills failed":                   NewAppError(http.StatusInternalServerError, 2001067, "query skills failed"),
+	"query source children failed":          NewAppError(http.StatusInternalServerError, 2001068, "query source children failed"),
+	"query suggestion failed":               NewAppError(http.StatusInternalServerError, 2001069, "query suggestion failed"),
+	"query suggestions failed":              NewAppError(http.StatusInternalServerError, 2001070, "query suggestions failed"),
+	"read file failed":                      NewAppError(http.StatusInternalServerError, 2001072, "read file failed"),
+	"read skill content failed":             NewAppError(http.StatusInternalServerError, 2001073, "read skill content failed"),
+	"read skill draft failed":               NewAppError(http.StatusInternalServerError, 2001074, "read skill draft failed"),
+	"reject share failed":                   NewAppError(http.StatusInternalServerError, 2001075, "reject share failed"),
+	"reserve active thread failed":          NewAppError(http.StatusInternalServerError, 2001076, "reserve active thread failed"),
+	"resolve suggestion outdated failed":    NewAppError(http.StatusInternalServerError, 2001077, "resolve suggestion outdated failed"),
+	"save selected models failed":           NewAppError(http.StatusInternalServerError, 2001078, "save selected models failed"),
+	"save thread failed":                    NewAppError(http.StatusInternalServerError, 2001079, "save thread failed"),
+	"search word group failed":              NewAppError(http.StatusInternalServerError, 2001080, "search word group failed"),
+	"set default failed":                    NewAppError(http.StatusInternalServerError, 2001081, "set default failed"),
+	"set history failed":                    NewAppError(http.StatusInternalServerError, 2001082, "set history failed"),
+	"sync model providers failed":           NewAppError(http.StatusInternalServerError, 2001083, "sync model providers failed"),
+	"unset default failed":                  NewAppError(http.StatusInternalServerError, 2001084, "unset default failed"),
+	"update dataset failed":                 NewAppError(http.StatusInternalServerError, 2001085, "update dataset failed"),
+	"update document tags failed":           NewAppError(http.StatusInternalServerError, 2001086, "update document tags failed"),
+	"update feedback failed":                NewAppError(http.StatusInternalServerError, 2001087, "update feedback failed"),
+	"update group failed":                   NewAppError(http.StatusInternalServerError, 2001088, "update group failed"),
+	"update group verify status failed":     NewAppError(http.StatusInternalServerError, 2001089, "update group verify status failed"),
+	"update personalization setting failed": NewAppError(http.StatusInternalServerError, 2001092, "update personalization setting failed"),
+	"update skill draft failed":             NewAppError(http.StatusInternalServerError, 2001093, "update skill draft failed"),
+	"update suggestion failed":              NewAppError(http.StatusInternalServerError, 2001094, "update suggestion failed"),
+	"update suggestion status failed":       NewAppError(http.StatusInternalServerError, 2001095, "update suggestion status failed"),
+	"update word group failed":              NewAppError(http.StatusInternalServerError, 2001098, "update word group failed"),
+
+	// Additional conflict errors discovered from handlers.
+	"auto_evo apply conflict":                 NewAppError(http.StatusConflict, 2001101, "auto_evo apply conflict"),
+	"dataset name already exists":             NewAppError(http.StatusConflict, 2001102, "dataset name already exists"),
+	"model name already exists in this group": NewAppError(http.StatusConflict, 2001105, "model name already exists in this group"),
+	"prompt name already exists":              NewAppError(http.StatusConflict, 2001106, "prompt name already exists"),
+	"share item is not pending_accept":        NewAppError(http.StatusConflict, 2001107, "share item is not pending_accept"),
+	"skill already exists":                    NewAppError(http.StatusConflict, 2001108, "skill already exists"),
+	"skill draft version conflict":            NewAppError(http.StatusConflict, 2001109, "skill draft version conflict"),
+	"skill has pending remove suggestion":     NewAppError(http.StatusConflict, 2001110, "skill has pending remove suggestion"),
+	"thread has active message stream":        NewAppError(http.StatusConflict, 2001111, "thread has active message stream"),
+	"thread creation is busy, please retry":   NewAppError(http.StatusConflict, 2001114, "thread creation is busy, please retry"),
+	"thread activation is busy, please retry": NewAppError(http.StatusConflict, 2001115, "thread activation is busy, please retry"),
+	"thread creation already in progress":     NewAppError(http.StatusConflict, 2001116, "thread creation already in progress"),
+	"active thread status unknown":            NewAppError(http.StatusConflict, 2001117, "active thread status unknown"),
+	"当前已有任务正在运行，请先等待完成、暂停或取消后再继续该历史任务。":            NewAppError(http.StatusConflict, 2001118, "当前已有任务正在运行，请先等待完成、暂停或取消后再继续该历史任务。"),
+	"thread already has an active messages stream": NewAppError(http.StatusConflict, 2001119, "thread already has an active messages stream"),
+	"upstream messages request failed":             NewAppError(http.StatusConflict, 2001120, "upstream messages request failed"),
+	"auto_evo task is running":                     NewAppError(http.StatusConflict, 2001121, "auto_evo task is running"),
+
+	// Additional upstream errors discovered from handlers.
+	"auto_evo generated empty content":                NewAppError(http.StatusBadGateway, 2001201, "auto_evo generated empty content"),
+	"chat service unavailable":                        NewAppError(http.StatusBadGateway, 2001202, "chat service unavailable"),
+	"generated skill content invalid":                 NewAppError(http.StatusBadGateway, 2001203, "generated skill content invalid"),
+	"invalid upstream response":                       NewAppError(http.StatusBadGateway, 2001204, "invalid upstream response"),
+	"kb service create failed":                        NewAppError(http.StatusBadGateway, 2001205, "kb service create failed"),
+	"kb service update failed":                        NewAppError(http.StatusBadGateway, 2001206, "kb service update failed"),
+	"skill generate failed":                           NewAppError(http.StatusBadGateway, 2001208, "skill generate failed"),
+	"upstream /api/chat returned non-200":             NewAppError(http.StatusBadGateway, 2001209, "upstream /api/chat returned non-200"),
+	"upstream /api/chat_stream returned non-200":      NewAppError(http.StatusBadGateway, 2001210, "upstream /api/chat_stream returned non-200"),
+	"upstream thread response missing thread_id":      NewAppError(http.StatusBadGateway, 2001211, "upstream thread response missing thread_id"),
+	"marshal body":                                    NewAppError(http.StatusBadGateway, 2001220, "marshal body"),
+	"new request":                                     NewAppError(http.StatusBadGateway, 2001221, "new request"),
+	"do request":                                      NewAppError(http.StatusBadGateway, 2001222, "do request"),
+	"read response":                                   NewAppError(http.StatusBadGateway, 2001223, "read response"),
+	"unmarshal response":                              NewAppError(http.StatusBadGateway, 2001224, "unmarshal response"),
+	"upstream returned empty error body":              NewAppError(http.StatusBadGateway, 2001225, "upstream returned empty error body"),
+	"upstream returned error payload without message": NewAppError(http.StatusBadGateway, 2001226, "upstream returned error payload without message"),
+	"invalid external agent source":                   NewAppError(http.StatusBadRequest, 2002292, "Invalid external Agent source"),
+	"external agent thread belongs to another user or conversation": NewAppError(
+		http.StatusConflict, 2002293, "External Agent thread belongs to another user or conversation",
+	),
+	"conversation group name already exists":                                           NewAppError(http.StatusConflict, 2002701, "Conversation group name already exists"),
+	"conversation group not found":                                                     NewAppError(http.StatusNotFound, 2002702, "Conversation group not found"),
+	"conversation is locked by organizer":                                              NewAppError(http.StatusConflict, 2002703, "Conversation is being organized"),
+	"conversation membership changed":                                                  NewAppError(http.StatusConflict, 2002704, "Conversation membership changed"),
+	"conversation organizer run cannot be canceled":                                    NewAppError(http.StatusConflict, 2002705, "Conversation organizer run cannot be canceled"),
+	"conversation organizer run cannot be retried":                                     NewAppError(http.StatusConflict, 2002712, "Conversation organizer run cannot be retried"),
+	"conversation organizer run cannot be undone":                                      NewAppError(http.StatusConflict, 2002713, "Conversation organizer run cannot be undone"),
+	"no free conversations to organize":                                                NewAppError(http.StatusConflict, 2002706, "No free conversations to organize"),
+	"conversation group name must contain 1 to 24 characters":                          NewAppError(http.StatusBadRequest, 2002707, "Conversation group name must contain 1 to 24 characters"),
+	"conversation group scope must not exceed 500 characters":                          NewAppError(http.StatusBadRequest, 2002708, "Conversation group scope must not exceed 500 characters"),
+	"group_id is only valid when creating a conversation":                              NewAppError(http.StatusConflict, 2002709, "group_id is only valid when creating a conversation"),
+	"child conversation cannot be grouped independently":                               NewAppError(http.StatusConflict, 2002710, "Child conversation cannot be grouped independently"),
+	"conversation organizer run not found":                                             NewAppError(http.StatusNotFound, 2002711, "Conversation organizer run not found"),
+	"conversation or conversation group not found":                                     NewAppError(http.StatusNotFound, 2002714, "Conversation or conversation group not found"),
+	"conversation organizer lease lost":                                                NewAppError(http.StatusConflict, 2002715, "Conversation organizer lease lost"),
+	"invalid organizer payload":                                                        NewAppError(http.StatusBadRequest, 2002716, "Invalid organizer payload"),
+	"algorithm organizer failed":                                                       NewAppError(http.StatusBadGateway, 2002717, "Algorithm organizer failed"),
+	"algorithm returned empty checkpoint":                                              NewAppError(http.StatusBadGateway, 2002718, "Algorithm returned an empty checkpoint"),
+	"algorithm returned done without proposal":                                         NewAppError(http.StatusBadGateway, 2002719, "Algorithm returned done without a proposal"),
+	"conversation organizer exceeded step limit":                                       NewAppError(http.StatusInternalServerError, 2002720, "Conversation organizer exceeded its step limit"),
+	"proposal contains unknown conversation":                                           NewAppError(http.StatusBadGateway, 2002721, "Organizer proposal contains an unknown conversation"),
+	"proposal contains duplicate conversation":                                         NewAppError(http.StatusBadGateway, 2002722, "Organizer proposal contains a duplicate conversation"),
+	"proposal contains invalid candidate id":                                           NewAppError(http.StatusBadGateway, 2002723, "Organizer proposal contains an invalid candidate"),
+	"proposal references stale conversation group":                                     NewAppError(http.StatusConflict, 2002724, "Organizer proposal references a changed conversation group"),
+	"proposal repeats conversation group":                                              NewAppError(http.StatusBadGateway, 2002725, "Organizer proposal repeats a conversation group"),
+	"proposal does not partition the snapshot":                                         NewAppError(http.StatusBadGateway, 2002726, "Organizer proposal does not cover the snapshot exactly once"),
+	"automatic conversation group scope required":                                      NewAppError(http.StatusBadGateway, 2002727, "Automatic conversation group scope is required"),
+	"conversation organizer model config changed":                                      NewAppError(http.StatusConflict, 2002728, "Conversation organizer model configuration changed"),
+	"load organizer model config failed":                                               NewAppError(http.StatusInternalServerError, 2002729, "Failed to load organizer model configuration"),
+	"conversation organizer result cannot be confirmed":                                NewAppError(http.StatusConflict, 2002730, "Conversation organizer result cannot be confirmed"),
+	"conversation organizer run cannot be retried before reviewing the current result": NewAppError(http.StatusConflict, 2002731, "Review the current organizer result before retrying"),
+	"proposal contains invalid unassigned reason":                                      NewAppError(http.StatusBadGateway, 2002732, "Organizer proposal contains an invalid unassigned reason"),
+	"opening preparer is not registered":                                               NewAppError(http.StatusInternalServerError, 2002733, "Conversation opening preparer is not registered"),
+	"previous organizer execution has not confirmed termination":                       NewAppError(http.StatusConflict, 2002735, "Previous organizer execution has not confirmed termination"),
+}
+
+func ResolveAppError(message string, statusCode int) *AppError {
+	base, detail := splitErrorMessage(message)
+	if appErr, matchedPattern, ok := lookupErrorCatalogMatch(base); ok {
+		resolved := *appErr
+		resolved.HTTPStatus = statusCode
+		if matchedPattern && detail == "" {
+			detail = strings.TrimSpace(message)
+		}
+		if detail != "" {
+			resolved.Detail = detail
+		}
+		return &resolved
+	}
+	appErr := &AppError{HTTPStatus: statusCode, Code: ErrorCodeFromHTTPStatus(statusCode), Message: strings.TrimSpace(base)}
+	if detail != "" {
+		appErr.Detail = detail
+	}
+	return appErr
+}
+
+func lookupErrorCatalog(message string) (*AppError, bool) {
+	appErr, _, ok := lookupErrorCatalogMatch(message)
+	return appErr, ok
+}
+
+func lookupErrorCatalogMatch(message string) (*AppError, bool, bool) {
+	normalizedCatalogOnce.Do(func() {
+		normalizedCatalog = make(map[string]*AppError, len(errorCatalog))
+		for key, appErr := range errorCatalog {
+			normalized := normalizeErrorKey(key)
+			if previous, exists := normalizedCatalog[normalized]; exists && previous.Code != appErr.Code {
+				panic("duplicate normalized Core error catalog message: " + normalized)
+			}
+			normalizedCatalog[normalized] = appErr
+		}
+	})
+
+	normalized := normalizeErrorKey(message)
+	if appErr, ok := normalizedCatalog[normalized]; ok {
+		return appErr, false, true
+	}
+	for _, pattern := range errorPatterns {
+		if pattern.matcher.MatchString(normalized) {
+			return pattern.appErr, true, true
+		}
+	}
+	return nil, false, false
+}
+
+func splitErrorMessage(message string) (string, string) {
+	msg := strings.TrimSpace(message)
+	if msg == "" {
+		return "unknown error", ""
+	}
+	if idx := strings.Index(msg, ": "); idx > 0 {
+		return strings.TrimSpace(msg[:idx]), strings.TrimSpace(msg[idx+2:])
+	}
+	return msg, ""
+}
+
+func normalizeErrorKey(message string) string {
+	return strings.ToLower(strings.TrimSpace(message))
+}

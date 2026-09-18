@@ -1,0 +1,489 @@
+import { useEffect, useState } from "react";
+import { Button, Checkbox, Input, Progress, Radio } from "antd";
+import { LeftOutlined, RightOutlined } from "@ant-design/icons";
+import { useTranslation } from "react-i18next";
+import "./index.scss";
+
+export interface AskQuestion {
+  text: string;
+  type: "boolean" | "single" | "multiple" | "text";
+  choices?: string[];
+  allow_other?: boolean;
+}
+
+export interface AskPending {
+  ask_id: string;
+  questions: AskQuestion[];
+  /** Optional group title shown at the top of the card */
+  title?: string;
+  /** Translation key used when the producer supplies a fixed application title. */
+  title_i18n_key?: string;
+  /** Optional subtitle / description shown below the title */
+  description?: string;
+  mail_draft?: import("@/modules/chat/components/MailDraftCard").MailDraftPreview;
+  mail_drafts?: import("@/modules/chat/components/MailDraftCard").MailDraftPreview[];
+}
+
+export interface AskAnsweredQuestion {
+  text: string;
+  type: string;
+  choices: string[]; // original choice list (from AskQuestion.choices)
+  custom_choices: string[]; // user-edited choice labels
+  answer: AnswerState | null;
+}
+
+export interface AskAnswersStructured {
+  ask_id: string;
+  questions: AskAnsweredQuestion[];
+}
+
+export interface AskSubmitPayload {
+  /** Formatted text for display in the user message bubble. */
+  text: string;
+  /** Full structured answers, forwarded to the backend as ask_answers_structured. */
+  structured: AskAnswersStructured;
+}
+
+interface AskCardProps {
+  askPending: AskPending;
+  /** Called with a payload containing the formatted text and full structured answers. */
+  onSubmit: (payload: AskSubmitPayload) => void;
+  disabled?: boolean;
+  /** Cached answers to pre-populate (index → serialized answer) */
+  savedAnswers?: Record<number, AnswerState>;
+  /** Called whenever an answer changes, for external caching */
+  onAnswerChange?: (index: number, ans: AnswerState) => void;
+}
+
+export type AnswerState =
+  | { type: "boolean"; value: string | null }
+  | { type: "single"; value: string | null; otherText: string }
+  | { type: "multiple"; value: string[]; otherText: string }
+  | { type: "text"; value: string };
+
+// Must match algorithm/lazymind/chat/engine/tools/ask_user.py::_OTHER_OPTION.
+const OTHER_OPTION = "__ask_user_other__";
+
+function initAnswer(q: AskQuestion): AnswerState {
+  switch (q.type) {
+    case "boolean":
+      return { type: "boolean", value: null };
+    case "single":
+      return { type: "single", value: null, otherText: "" };
+    case "multiple":
+      return { type: "multiple", value: [], otherText: "" };
+    default:
+      return { type: "text", value: "" };
+  }
+}
+
+function isAnswered(ans: AnswerState, otherOption: string): boolean {
+  switch (ans.type) {
+    case "boolean":
+      return ans.value !== null;
+    case "single":
+      if (!ans.value) return false;
+      return ans.value !== otherOption || ans.otherText.trim().length > 0;
+    case "multiple":
+      if (ans.value.length === 0) return false;
+      if (ans.value.includes(otherOption))
+        return ans.otherText.trim().length > 0;
+      return true;
+    case "text":
+      return ans.value.trim().length > 0;
+  }
+}
+
+function formatAnswer(
+  q: AskQuestion,
+  ans: AnswerState,
+  choices: string[],
+  otherOption: string,
+  answerSeparator: string,
+  unansweredLabel: string,
+): string {
+  if (!isAnswered(ans, otherOption)) {
+    return `${q.text}: ${unansweredLabel}`;
+  }
+  switch (ans.type) {
+    case "boolean":
+      return `${q.text}: ${ans.value ?? ""}`;
+    case "single": {
+      const raw = ans.value ?? "";
+      // Resolve the original choice index to get the (possibly edited) label.
+      const origChoices = q.choices ?? [];
+      const origIdx = origChoices.indexOf(raw);
+      const label = origIdx >= 0 ? (choices[origIdx] ?? raw) : raw;
+      const val = raw === otherOption ? ans.otherText.trim() : label;
+      return `${q.text}: ${val}`;
+    }
+    case "multiple": {
+      const origChoices = q.choices ?? [];
+      const parts = ans.value.map((v) => {
+        if (v === otherOption) return ans.otherText.trim();
+        const origIdx = origChoices.indexOf(v);
+        return origIdx >= 0 ? (choices[origIdx] ?? v) : v;
+      });
+      return `${q.text}: ${parts.join(answerSeparator)}`;
+    }
+    case "text":
+      return `${q.text}: ${ans.value.trim()}`;
+  }
+}
+
+function ChoiceLabel({ value }: { value: string }) {
+  return <span className="ask-wizard__choice-label">{value}</span>;
+}
+
+export default function AskCard({
+  askPending,
+  onSubmit,
+  disabled = false,
+  savedAnswers,
+  onAnswerChange,
+}: AskCardProps) {
+  const { t } = useTranslation();
+  const otherOption = OTHER_OPTION;
+  const otherOptionLabel = t("chat.askCardOtherOption");
+  const displayChoice = (value: string) => {
+    if (value === OTHER_OPTION) return otherOptionLabel;
+    if (value === "__ask_user_yes__") return t("common.yes");
+    if (value === "__ask_user_no__") return t("common.no");
+    return value;
+  };
+  const answerSeparator = t("chat.askCardAnswerSeparator");
+  const {
+    questions,
+    title,
+    title_i18n_key: titleI18nKey,
+    description,
+  } = askPending;
+  const displayTitle = title || (titleI18nKey ? t(titleI18nKey) : "");
+  const total = questions.length;
+
+  const [answers, setAnswers] = useState<AnswerState[]>(() =>
+    questions.map((q, i) => savedAnswers?.[i] ?? initAnswer(q)),
+  );
+  const [currentIndex, setCurrentIndex] = useState(0);
+  const [submitted, setSubmitted] = useState(false);
+  const isReadOnly = disabled || submitted;
+
+  // Preserve the structured payload shape expected by the backend.
+  const [customChoices] = useState<Record<number, string[]>>(() =>
+    Object.fromEntries(questions.map((q, i) => [i, [...(q.choices ?? [])]])),
+  );
+
+  useEffect(() => {
+    setAnswers((prev) =>
+      questions.map((q, i) => savedAnswers?.[i] ?? prev[i] ?? initAnswer(q)),
+    );
+  }, [askPending.ask_id, savedAnswers]);
+
+  const currentQ = questions[currentIndex]!;
+  const currentAns = answers[currentIndex]!;
+  const currentChoices = customChoices[currentIndex] ?? currentQ.choices ?? [];
+
+  const progressPercent = Math.round(
+    (answers.filter((answer) => isAnswered(answer, otherOption)).length /
+      total) *
+      100,
+  );
+
+  const updateAnswer = (
+    idx: number,
+    next: AnswerState,
+    autoAdvance = false,
+  ) => {
+    setAnswers((prev) => {
+      const updated = prev.map((a, i) => (i === idx ? next : a));
+      onAnswerChange?.(idx, next);
+      return updated;
+    });
+    if (autoAdvance && idx < total - 1) {
+      setTimeout(() => setCurrentIndex(idx + 1), 180);
+    }
+  };
+
+  const handleSubmit = () => {
+    if (isReadOnly) return;
+    const lines = questions.map((q, i) =>
+      formatAnswer(
+        q,
+        answers[i]!,
+        customChoices[i] ?? q.choices ?? [],
+        otherOption,
+        answerSeparator,
+        t("chat.askCardUnanswered"),
+      ),
+    );
+    const structured: AskAnswersStructured = {
+      ask_id: askPending.ask_id,
+      questions: questions.map((q, i) => ({
+        text: q.text,
+        type: q.type,
+        choices: q.choices ?? [],
+        custom_choices: customChoices[i] ?? q.choices ?? [],
+        answer: isAnswered(answers[i]!, otherOption) ? answers[i]! : null,
+      })),
+    };
+    setSubmitted(true);
+    onSubmit({ text: lines.join("\n"), structured });
+  };
+
+  const goTo = (idx: number) => {
+    if (idx >= 0 && idx < total) setCurrentIndex(idx);
+  };
+
+  const canGoNext = currentIndex < total - 1;
+  const canGoPrev = currentIndex > 0;
+
+  return (
+    <div
+      className={`ask-wizard${isReadOnly ? " ask-wizard--disabled" : ""}`}
+      aria-label={t("chat.askCardAria")}
+    >
+      {/* Header */}
+      <div className="ask-wizard__header">
+        <div className="ask-wizard__header-top">
+          <div className="ask-wizard__title-area">
+            {displayTitle && (
+              <h3 className="ask-wizard__title">{displayTitle}</h3>
+            )}
+            {description && (
+              <p className="ask-wizard__description">{description}</p>
+            )}
+          </div>
+          <div className="ask-wizard__meta">
+            <span className="ask-wizard__count">
+              {currentIndex + 1} / {total}
+            </span>
+          </div>
+        </div>
+        <Progress
+          percent={progressPercent}
+          showInfo={false}
+          size={["100%", 3]}
+          className="ask-wizard__progress"
+          strokeColor="#4e6ef2"
+          trailColor="#e4e9f5"
+        />
+        <div className="ask-wizard__progress-label">
+          {progressPercent}% {t("chat.askCardCompleted")}
+        </div>
+      </div>
+
+      {/* Question body */}
+      <div className="ask-wizard__body">
+        <div className="ask-wizard__question-label">
+          <span className="ask-wizard__index-badge">{currentIndex + 1}</span>
+          <span className="ask-wizard__question-text">{currentQ.text}</span>
+        </div>
+
+        <div className="ask-wizard__answer-area">
+          {currentQ.type === "boolean" && (
+            <div className="ask-wizard__boolean-buttons">
+              {(currentChoices.length > 0
+                ? currentChoices
+                : [t("common.yes"), t("common.no")]
+              ).map((c, ci) => (
+                <Button
+                  key={ci}
+                  type={
+                    currentAns.type === "boolean" &&
+                    currentAns.value === (currentQ.choices?.[ci] ?? c)
+                      ? "primary"
+                      : "default"
+                  }
+                  disabled={isReadOnly}
+                  onClick={() =>
+                    updateAnswer(
+                      currentIndex,
+                      { type: "boolean", value: currentQ.choices?.[ci] ?? c },
+                      true,
+                    )
+                  }
+                  className="ask-wizard__bool-btn"
+                >
+                  {displayChoice(c)}
+                </Button>
+              ))}
+            </div>
+          )}
+
+          {currentQ.type === "single" && (
+            <div className="ask-wizard__choices">
+              <Radio.Group
+                value={currentAns.type === "single" ? currentAns.value : null}
+                onChange={(e) => {
+                  const chosen = e.target.value as string;
+                  updateAnswer(
+                    currentIndex,
+                    {
+                      type: "single",
+                      value: chosen,
+                      otherText:
+                        currentAns.type === "single"
+                          ? currentAns.otherText
+                          : "",
+                    },
+                    chosen !== otherOption,
+                  );
+                }}
+                disabled={isReadOnly}
+              >
+                {(currentQ.choices ?? []).map((origVal, ci) => (
+                  <Radio
+                    key={ci}
+                    value={origVal}
+                    className="ask-wizard__choice"
+                  >
+                    <ChoiceLabel
+                      value={displayChoice(currentChoices[ci] ?? origVal)}
+                    />
+                  </Radio>
+                ))}
+              </Radio.Group>
+              {currentAns.type === "single" &&
+                currentAns.value === otherOption && (
+                  <Input
+                    value={currentAns.otherText}
+                    onChange={(e) =>
+                      updateAnswer(currentIndex, {
+                        type: "single",
+                        value: otherOption,
+                        otherText: e.target.value,
+                      })
+                    }
+                    disabled={isReadOnly}
+                    placeholder={t("chat.askCardOtherPlaceholder")}
+                    className="ask-wizard__other-input"
+                  />
+                )}
+            </div>
+          )}
+
+          {currentQ.type === "multiple" && (
+            <div className="ask-wizard__choices">
+              <Checkbox.Group
+                value={currentAns.type === "multiple" ? currentAns.value : []}
+                onChange={(vals) =>
+                  updateAnswer(currentIndex, {
+                    type: "multiple",
+                    value: vals as string[],
+                    otherText:
+                      currentAns.type === "multiple"
+                        ? currentAns.otherText
+                        : "",
+                  })
+                }
+                disabled={isReadOnly}
+              >
+                {(currentQ.choices ?? []).map((origVal, ci) => (
+                  <Checkbox
+                    key={ci}
+                    value={origVal}
+                    className="ask-wizard__choice"
+                  >
+                    <ChoiceLabel
+                      value={displayChoice(currentChoices[ci] ?? origVal)}
+                    />
+                  </Checkbox>
+                ))}
+              </Checkbox.Group>
+              {currentAns.type === "multiple" &&
+                currentAns.value.includes(otherOption) && (
+                  <Input
+                    value={
+                      currentAns.type === "multiple" ? currentAns.otherText : ""
+                    }
+                    onChange={(e) =>
+                      updateAnswer(currentIndex, {
+                        type: "multiple",
+                        value:
+                          currentAns.type === "multiple"
+                            ? currentAns.value
+                            : [],
+                        otherText: e.target.value,
+                      })
+                    }
+                    disabled={isReadOnly}
+                    placeholder={t("chat.askCardOtherPlaceholder")}
+                    className="ask-wizard__other-input"
+                  />
+                )}
+            </div>
+          )}
+
+          {currentQ.type === "text" && (
+            <Input.TextArea
+              value={currentAns.type === "text" ? currentAns.value : ""}
+              onChange={(e) =>
+                updateAnswer(currentIndex, {
+                  type: "text",
+                  value: e.target.value,
+                })
+              }
+              disabled={isReadOnly}
+              placeholder={t("chat.askCardInputPlaceholder")}
+              className="ask-wizard__text-input"
+              autoSize={{ minRows: 2, maxRows: 5 }}
+            />
+          )}
+        </div>
+      </div>
+
+      {/* Navigation + quick jump */}
+      <div className="ask-wizard__footer">
+        <div className="ask-wizard__nav-buttons">
+          <Button
+            icon={<LeftOutlined />}
+            disabled={!canGoPrev}
+            onClick={() => goTo(currentIndex - 1)}
+            className="ask-wizard__nav-btn"
+          >
+            {t("chat.askCardPrev")}
+          </Button>
+          {canGoNext ? (
+            <Button
+              type="primary"
+              onClick={() => goTo(currentIndex + 1)}
+              className="ask-wizard__nav-btn"
+            >
+              {t("chat.askCardNext")}
+              <RightOutlined />
+            </Button>
+          ) : (
+            !isReadOnly && (
+              <Button
+                type="primary"
+                onClick={handleSubmit}
+                className="ask-wizard__submit-btn"
+              >
+                {t("chat.askCardSubmit")}
+              </Button>
+            )
+          )}
+        </div>
+
+        {/* Quick-jump sidebar */}
+        <div className="ask-wizard__jump-list">
+          {questions.map((_, idx) => (
+            <button
+              key={idx}
+              type="button"
+              className={`ask-wizard__jump-item${idx === currentIndex ? " is-current" : ""}${isAnswered(answers[idx]!, otherOption) ? " is-done" : ""}`}
+              onClick={() => goTo(idx)}
+              aria-label={`Go to question ${idx + 1}`}
+            >
+              {idx + 1}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {!isReadOnly && (
+        <p className="ask-wizard__hint">{t("chat.askCardAutoSaveHint")}</p>
+      )}
+    </div>
+  );
+}

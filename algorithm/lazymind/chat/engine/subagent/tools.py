@@ -1,0 +1,1523 @@
+from __future__ import annotations
+
+import json
+import os
+from typing import Any, Dict, List, Literal, Optional
+from urllib.parse import urlparse
+
+from lazyllm.tools.agent import ToolExecutionError
+from typing_extensions import NotRequired, TypedDict
+from lazymind.chat.engine.attachment_reader import (
+    is_chat_attachment_file,
+    is_chat_image_file,
+    is_chat_text_file,
+    parse_attachment_content,
+)
+from lazymind.chat.engine.tools.local_file.attachment_edit import (
+    AttachmentEditDraft,
+)
+
+from lazymind.chat.service.utils.static_file_url import (
+    local_path_from_static_file_url,
+    resolve_local_image_path,
+)
+
+from .context import get_context, require_context, LARGE_ARTIFACT_THRESHOLD
+
+# Valid artifact content types.
+_CONTENT_TYPES = {'text', 'json', 'image', 'file', 'file_list'}
+
+UPLOAD_MARKER = '/var/lib/lazymind/uploads/'
+SUBAGENT_MARKER = '/data/subagent/'
+
+
+class ArtifactSaveItem(TypedDict):
+    """One save_artifacts entry exposed as a structured model-facing schema."""
+
+    key: str
+    value: Any
+    content_type: NotRequired[Literal['text', 'json', 'image', 'file', 'file_list']]
+    source_tool: NotRequired[str]
+    sort_order: NotRequired[int]
+    caption: NotRequired[str]
+
+
+def _materialize_local_path(path: str) -> str:
+    """Resolve Docker-canonical upload paths onto the real LAZYMIND_UPLOAD_ROOT.
+
+    Docker stores/returns ``/var/lib/lazymind/uploads/...``. Local runtime keeps
+    the same relative layout under ``~/.local/share/LazyMind/data/core/uploads``.
+    Remap before exists checks, signing, and vision tools so local works without
+    a ``/var/lib/lazymind/uploads`` mount.
+    """
+    raw = str(path or '').strip()
+    if not raw:
+        return raw
+    if raw.lower().startswith(('http://', 'https://')):
+        return raw
+    resolved = resolve_local_image_path(raw) or local_path_from_static_file_url(raw)
+    if resolved and (resolved == raw or os.path.exists(resolved) or not os.path.exists(raw)):
+        return resolved
+    return raw
+
+
+def _sign_static_file_url(path: str) -> Optional[str]:
+    """Ask Go core to sign a local upload path. Returns None on any failure."""
+    raw = str(path or '').strip()
+    if not raw or raw.lower().startswith(('http://', 'https://')):
+        return None
+    if raw.startswith('/static-files/'):
+        return raw
+    try:
+        import httpx
+        from lazymind.config import config as _cfg
+        core_url = str(_cfg['core_api_url']).rstrip('/')
+        resp = httpx.post(
+            f'{core_url}/static-files:sign',
+            json={'paths': [raw]},
+            timeout=3.0,
+        )
+        if resp.status_code != 200:
+            return None
+        payload = resp.json()
+        data = payload.get('data') if isinstance(payload.get('data'), dict) else payload
+        urls = (data or {}).get('urls') or {}
+        signed = urls.get(raw)
+        return str(signed).strip() if signed else None
+    except Exception:
+        return None
+
+
+def _is_valid_image_ref(path: str) -> bool:
+    """Return True when *path* looks like a real image URL or filesystem reference."""
+    p = (path or '').strip()
+    if not p:
+        return False
+    if p.startswith(('http://', 'https://', '/static-files/', '/api/core/static-files/', 'data:image/')):
+        return True
+    if p.startswith('/data/subagent/') or SUBAGENT_MARKER in p:
+        return True
+    if p.startswith(UPLOAD_MARKER) or p.startswith('/var/lib/lazymind/uploads/'):
+        return True
+    if os.path.isabs(p) and os.path.isfile(p):
+        return True
+    return False
+
+
+def _build_artifact_value(value: Any, content_type: str):
+    """Build the artifact value dict and return (value_dict, actual_content_type).
+
+    actual_content_type is 'file' when the content is offloaded to the workspace
+    filesystem (large text/json), so the DB content_type column correctly reflects
+    the storage form.  The value dict then carries {"type": "<original_type>", "path": ...}
+    so readers can recover the true render type via value["type"].
+    """
+    ctx = require_context()
+    if content_type == 'text':
+        if isinstance(value, dict) and 'text' in value:
+            value = value['text']
+        text = str(value)
+        if len(text.encode('utf-8', errors='replace')) > LARGE_ARTIFACT_THRESHOLD:
+            abs_path = ctx.write_large_content(text, hint='artifact_text')
+            return {'type': 'text', 'path': abs_path, 'size': os.path.getsize(abs_path)}, 'file'
+        return {'text': text}, 'text'
+    if content_type == 'json':
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                pass
+        serialized = json.dumps(value, ensure_ascii=False, default=str)
+        if len(serialized.encode('utf-8', errors='replace')) > LARGE_ARTIFACT_THRESHOLD:
+            abs_path = ctx.write_large_content(serialized, hint='artifact_json')
+            return {'type': 'json', 'path': abs_path, 'size': os.path.getsize(abs_path)}, 'file'
+        return {'data': value}, 'json'
+    if content_type == 'image':
+        image_metadata: Dict[str, Any] = {}
+        if isinstance(value, dict):
+            image_metadata = value
+            src = str(
+                value.get('path') or value.get('image_url') or value.get('url') or ''
+            ).strip()
+        else:
+            src = str(value).strip()
+
+        def image_value(path: str) -> Dict[str, Any]:
+            built = {'path': path}
+            embedded_caption = image_metadata.get('caption')
+            if embedded_caption is not None:
+                built['caption'] = str(embedded_caption)
+            return built
+
+        if src.startswith('/static-files/'):
+            return image_value(src), 'image'
+        if not src.lower().startswith(('http://', 'https://')):
+            src = _materialize_local_path(src)
+        if not _is_valid_image_ref(src):
+            raise ToolExecutionError(
+                f'Invalid image reference {src!r}: expected http(s) URL, /static-files/ path, '
+                'or an existing absolute file path — placeholder text is not allowed.'
+            )
+        # '/static-files/...' (possibly with query) is a signed URL path, not a local
+        # filesystem path. Keep it as URL text instead of copying from disk.
+        if src.startswith('/static-files/'):
+            return image_value(src), 'image'
+        if os.path.isabs(src):
+            # Copy into workspace; keep absolute path so Go core can sign a URL for it.
+            dst_rel = ctx.copy_into_workspace(src)
+            dst_abs = os.path.join(ctx.workspace_path, dst_rel)
+            return image_value(dst_abs), 'image'
+        return image_value(src), 'image'
+    if content_type == 'file':
+        # Models commonly reuse the normalized artifact shape returned by read tools.
+        # Accept that shape as well as the documented plain path so a batch save does
+        # not write earlier text outputs and then fail on ``{"path": ...}``.
+        if isinstance(value, dict):
+            source = str(value.get('path') or '').strip()
+        else:
+            source = str(value).strip()
+        if not source:
+            raise ToolExecutionError('File artifact path must not be empty.')
+        if os.path.isabs(source):
+            source = os.path.realpath(source)
+            if not os.path.isfile(source):
+                raise ToolExecutionError(f'File artifact does not exist: {source}')
+            rel = ctx.copy_into_workspace(source)
+            full = os.path.realpath(os.path.join(ctx.workspace_path, rel))
+        else:
+            full = os.path.realpath(os.path.join(ctx.workspace_path, source))
+            workspace = os.path.realpath(ctx.workspace_path)
+            if os.path.commonpath([workspace, full]) != workspace:
+                raise ToolExecutionError(
+                    'Relative file artifact path must stay inside the task workspace.'
+                )
+            if not os.path.isfile(full):
+                raise ToolExecutionError(f'File artifact does not exist in task workspace: {source}')
+        size = os.path.getsize(full)
+        return {'filename': os.path.basename(full), 'path': full, 'size': size}, 'file'
+    if content_type == 'file_list':
+        items = value if isinstance(value, list) else [value]
+        paths: List[str] = []
+        for item in items:
+            p = str(item).strip()
+            if not p:
+                continue
+            if os.path.isabs(p):
+                source = os.path.realpath(p)
+                if not os.path.isfile(source):
+                    raise ToolExecutionError(f'File-list artifact does not exist: {source}')
+                rel = ctx.copy_into_workspace(source)
+                paths.append(os.path.realpath(os.path.join(ctx.workspace_path, rel)))
+                continue
+            resolved = os.path.realpath(os.path.join(ctx.workspace_path, p))
+            workspace = os.path.realpath(ctx.workspace_path)
+            if os.path.commonpath([workspace, resolved]) != workspace:
+                raise ToolExecutionError(
+                    'Relative file-list artifact path must stay inside the task workspace.'
+                )
+            if not os.path.isfile(resolved):
+                raise ToolExecutionError(f'File-list artifact does not exist in task workspace: {p}')
+            paths.append(resolved)
+        if not paths:
+            raise ToolExecutionError(
+                'File-list artifact must contain at least one existing file.'
+            )
+        return {'paths': paths}, 'file_list'
+    return {'text': str(value)}, 'text'
+
+
+def _validate_declared_artifact_type(
+    ctx: Any,
+    key: str,
+    content_type: str,
+) -> Optional[str]:
+    declared = (ctx.params or {}).get('output_slot_types') or {}
+    declared_type = (
+        str(declared.get(key) or '').strip().lower()
+        if isinstance(declared, dict) else ''
+    )
+    actual_type = str(content_type or '').strip().lower()
+    if not declared_type:
+        return None
+    allowed_types = {'file', 'file_list'} if declared_type == 'file' else {declared_type}
+    if actual_type not in allowed_types:
+        allowed = ' or '.join(f'content_type="{value}"' for value in sorted(allowed_types))
+        suffix = (
+            ' Save the exact path returned by the producing tool instead of copying '
+            'its contents.' if declared_type == 'file' else ''
+        )
+        return (
+            f'Artifact {key!r} is declared as a {declared_type} slot and must be saved '
+            f'with {allowed}.{suffix}'
+        )
+    return None
+
+
+def _save_artifact(key: str, value: Any, content_type: str = 'text',
+                   source_tool: Optional[str] = None,
+                   sort_order: Optional[int] = None,
+                   caption: Optional[str] = None,
+                   *, internal_publish: bool = False,
+                   publisher_list_index: Optional[int] = None) -> Dict[str, Any]:
+    """Save one output artifact produced by this SubAgent.
+
+    File-type values must be local absolute paths; the framework copies them into the
+    workspace and stores a normalized absolute path. The same key may be saved multiple times
+    (each call appends a row with an incremented seq), which is how variable-count outputs
+    such as per-image generation are streamed to the frontend.
+
+    ## sort_order: append vs. overwrite
+
+    For list-cardinality slots (e.g. a list of reference images):
+
+    - **Omit sort_order** (or pass None): append a brand-new item at the end of the list.
+      Use this for normal full runs or when adding new content.
+
+    - **Pass sort_order=N** (1-based display position): overwrite the item currently
+      shown at position N in the UI. The existing item is replaced; nothing else changes.
+      Use this whenever the user's instruction targets a specific item, for example:
+        - "重新收集第二张图" → sort_order=2
+        - "替换第三张参考图" → sort_order=3
+        - "第一张和第三张都重新生成" → save two entries with sort_order=1 and sort_order=3
+      Do NOT pass list_index directly — always use sort_order (1-based visual position).
+
+    For single-cardinality slots the sort_order parameter is ignored (single slots
+    always overwrite the one existing value).
+
+    ## IMPORTANT: obey the user's stated intent
+    If the objective or runtime_instruction says "overwrite item N", "replace the Nth",
+    or similar, you MUST pass sort_order=N. Omitting sort_order in that case appends
+    a new item and leaves the original untouched, which is wrong.
+
+    Args:
+        key (str): Artifact key. Must be one of the declared output_slots.
+        value (Any): The artifact value. For text: a string. For json: a dict/list.
+            For image: a path/URL string or an object containing path/image_url/url and
+            optional caption. For file: a local absolute path. For file_list: a list of
+            absolute paths.
+        content_type (str): One of text, json, image, file, file_list. Default text.
+        source_tool (str): Optional name of the tool that produced this artifact,
+            e.g. 'web_search', 'wikipedia', 'image_generation'. Used for display only.
+        sort_order (int): Optional. 1-based display position within a list slot.
+            **1 = first item, 2 = second item, etc.**
+            Omit (or pass None) to append; pass N to overwrite position N.
+            If N is out of range, the artifact is appended and a warning is returned.
+            See the sort_order section above for full guidance.
+        caption (str): Optional human-readable description for image/file artifacts.
+            Stored in sub_agent_artifacts.caption and used in artifact_summary.
+
+    Returns:
+        A confirmation that the artifact was saved.
+    """
+    ctx = require_context()
+    policy = (ctx.params or {}).get('workflow_runtime') or {}
+    publisher_owned_slots = {
+        str(slot).strip()
+        for slot in (policy.get('publisher_owned_slots') or [])
+        if str(slot).strip()
+    } if isinstance(policy, dict) else set()
+    if key in publisher_owned_slots and not internal_publish:
+        raise ToolExecutionError(
+            f'Workflow slot {key!r} is publisher-owned. Use the package-declared '
+            'publisher tool; it writes the correct existing list_index and revision '
+            'automatically. Do not save this slot directly.',
+        )
+    if ctx.output_slots and key not in ctx.output_slots:
+        raise ToolExecutionError(
+            f'Artifact key {key!r} is not declared for this step. '
+            f'Allowed keys: {", ".join(ctx.output_slots)}',
+        )
+    if content_type not in _CONTENT_TYPES:
+        raise ToolExecutionError(
+            f'Unsupported content_type {content_type!r}; choose from {sorted(_CONTENT_TYPES)}.'
+        )
+    ct = content_type
+    contract_error = _validate_declared_artifact_type(ctx, key, ct)
+    if contract_error:
+        raise ToolExecutionError(contract_error)
+    built, actual_ct = _build_artifact_value(value, ct)
+    if source_tool:
+        built['_source_tool'] = str(source_tool)
+    # A package publisher may already have resolved the durable list index from
+    # one consistent order snapshot. This avoids races when it emits several
+    # ordered artifacts in one tool call before Core has processed the earlier
+    # events. Model-facing callers must continue to use sort_order.
+    if publisher_list_index is not None:
+        if not internal_publish:
+            raise ToolExecutionError(
+                'publisher_list_index is reserved for package publisher tools.',
+            )
+        if int(publisher_list_index) < 0:
+            raise ToolExecutionError('publisher_list_index must be >= 0.')
+        built['list_index'] = int(publisher_list_index)
+
+    # Translate sort_order → list_index via Go core API.
+    out_of_range_warning: Optional[str] = None
+    if sort_order is not None and publisher_list_index is None:
+        list_index, resolve_err = _resolve_list_index_from_sort_order(key, sort_order)
+        if list_index is not None:
+            built['list_index'] = list_index
+        elif resolve_err:
+            out_of_range_warning = resolve_err
+    if caption is not None:
+        built['caption'] = str(caption)
+    seq = ctx.next_artifact_seq(key)
+    ctx.record_local_artifact(key, actual_ct, built, seq)
+    ctx.emit({
+        'type': 'artifact',
+        'slot': key,
+        'content_type': actual_ct,
+        'seq': seq,
+        'value': built,
+    })
+    # Write draft so patch_artifact can operate on the latest committed content.
+    # list_index is embedded in built when sort_order resolved successfully.
+    _write_artifact_draft(ctx, key, ct, actual_ct, built, built.get('list_index'))
+    msg = f"Artifact '{key}' saved."
+    if out_of_range_warning:
+        msg += f' WARNING: {out_of_range_warning}'
+    return {'status': 'ok', 'message': msg}
+
+
+def save_artifacts(artifacts: List[ArtifactSaveItem]) -> Dict[str, Any]:
+    """Save one or more output artifacts in one tool call.
+
+    Always pass a list, including when saving a single artifact. Every item MUST
+    contain ``key`` and ``value``. The payload field is named ``value`` — never
+    ``content`` or ``data``. Optional fields are content_type, source_tool,
+    sort_order, and caption. Keeping all writes in one model turn prevents a step
+    with many outputs from exhausting the ReAct tool-turn budget.
+
+    Correct example::
+
+        {"artifacts": [{"key": "result", "value": "Final output",
+                        "content_type": "text", "caption": "Result"}]}
+    """
+    if not isinstance(artifacts, list) or not artifacts:
+        raise ToolExecutionError('artifacts must be a non-empty list.')
+    if len(artifacts) > 50:
+        raise ToolExecutionError('At most 50 artifacts may be saved at once.')
+
+    results: List[Dict[str, Any]] = []
+    for index, item in enumerate(artifacts):
+        if not isinstance(item, dict):
+            raise ToolExecutionError(f'artifacts[{index}] must be an object.')
+        if 'key' not in item or 'value' not in item:
+            if 'key' in item and 'content' in item and 'value' not in item:
+                raise ToolExecutionError(
+                    f'artifacts[{index}] uses content, but the payload field must be named value. '
+                    'Use: {"artifacts":[{"key":"<output key>","value":"<actual content>"}]}',
+                )
+            raise ToolExecutionError(
+                f'artifacts[{index}] requires key and value. '
+                'Use: {"artifacts":[{"key":"<output key>","value":"<actual content>"}]}',
+            )
+        saved = _save_artifact(
+            key=str(item['key']),
+            value=item['value'],
+            content_type=str(item.get('content_type') or 'text'),
+            source_tool=item.get('source_tool'),
+            sort_order=item.get('sort_order'),
+            caption=item.get('caption'),
+        )
+        results.append(saved)
+    return {
+        'status': 'ok',
+        'saved_count': len(results),
+        'results': results,
+    }
+
+
+def _write_artifact_draft(
+    ctx: Any, key: str, original_type: str, actual_ct: str,
+    built: Dict[str, Any], list_index: Optional[int],
+) -> None:
+    """Persist the just-saved artifact content as a draft file for future patch_artifact calls.
+
+    Only text and json artifacts are drafted (images/files are not patchable).
+    For large artifacts the content lives in a workspace file; we read it back
+    and write it to the draft directory so patches operate on plain text.
+    """
+    if original_type not in ('text', 'json'):
+        return
+    try:
+        if actual_ct == 'file':
+            # Large artifact: content stored in workspace/large/*.txt
+            rel_path = built.get('path', '')
+            if not rel_path:
+                return
+            abs_path = os.path.join(ctx.workspace_path, rel_path)
+            if not os.path.exists(abs_path):
+                return
+            with open(abs_path, 'r', encoding='utf-8') as fh:
+                content = fh.read()
+        elif original_type == 'text':
+            content = built.get('text', '')
+        else:  # json, DB-inline
+            content = json.dumps(built.get('data', ''), ensure_ascii=False)
+        ctx.write_draft(key, original_type, content, list_index, pending_commit=False)
+    except Exception:
+        pass  # draft write failure is non-fatal
+
+
+def _resolve_list_index_from_sort_order(
+    slot: str, sort_order: int
+) -> tuple[Optional[int], Optional[str]]:
+    """Translate sort_order → list_index for a list-slot artifact.
+
+    Returns (list_index, None) on success, or (None, error_message) when sort_order
+    is out of range. Returns (None, None) on technical errors or non-list slots
+    (caller should silently append in those cases).
+    """
+    try:
+        import lazyllm
+        cfg = {}
+        try:
+            cfg = lazyllm.globals.get('agentic_config') or {}
+        except Exception:
+            pass
+        session_id: str = cfg.get('workflow_session_id', '')
+        if not session_id:
+            return None, None
+        order_response = _workflow_client().get_slot_order(session_id, slot).result
+        raw_order = (
+            order_response.get('order_list')
+            if isinstance(order_response, dict) else None
+        )
+        order = [int(value) for value in (raw_order or [])]
+        if not order:
+            # No durable list order means this is either a single-cardinality
+            # slot or the first append into an empty list.
+            return None, None
+        n = len(order)
+        if sort_order < 1:
+            return None, (
+                f'sort_order must be >= 1 (sort_order is 1-based, where 1 is the first item). '
+                f'Received sort_order={sort_order}. Artifact appended as a new item instead.'
+            )
+        if sort_order > n:
+            return None, (
+                f'sort_order={sort_order} is out of range — the list currently has {n} item(s) '
+                f'(valid range: 1–{n}). Artifact appended as a new item instead. '
+                f'If you intended to overwrite, use a sort_order between 1 and {n}.'
+            )
+        return order[sort_order - 1], None
+    except Exception:
+        return None, None
+
+
+def get_artifact(key: str, sort_order: Optional[int] = None, task_ref: Optional[str] = None,
+                 start_line: Optional[int] = None, end_line: Optional[int] = None) -> Dict[str, Any]:
+    """Read a previously saved artifact by key.
+
+    Args:
+        key (str): The artifact key to read.
+        sort_order (int): Optional. 1-based display position within a list slot.
+            For workflow sessions: resolves via workflow_slot_order → fetches that specific
+            selected revision (human or AI).
+            For ordinary SubAgents: treated as seq, returns the artifact at that position.
+            When omitted, returns all artifacts for this key (or the latest for single slots).
+        task_ref (str): Optional task reference (title / "the Nth" / type name). When omitted,
+            reads the latest artifact with this key from the current task.
+        start_line (int): Optional. 1-based line number to start reading from (inclusive).
+            When specified together with end_line, returns only the selected line range.
+            The response also includes total_lines for the full content.
+        end_line (int): Optional. 1-based line number to stop reading at (inclusive).
+            When omitted but start_line is given, reads to the end of the file.
+
+    Returns:
+        The artifact content (text, file path, or JSON description).
+        When start_line/end_line are given, returns a line-range view with total_lines.
+    """
+    ctx = require_context()
+
+    # Workflow session: resolve sort_order via DB lookup.
+    try:
+        import lazyllm
+        cfg: Dict[str, Any] = {}
+        try:
+            cfg = lazyllm.globals.get('agentic_config') or {}
+        except Exception:
+            pass
+        workflow_session_id: str = cfg.get('workflow_session_id', '')
+    except Exception:
+        workflow_session_id = ''
+
+    if workflow_session_id:
+        local = ctx.local_artifacts(keys=[key])
+        remote_inputs = ctx.params.get('remote_inputs') or {}
+        has_remote_input = key in remote_inputs
+        remote_value = remote_inputs.get(key)
+        remote_type = str((ctx.params.get('remote_input_types') or {}).get(key) or '').lower()
+        direct_value = key in set(ctx.params.get('remote_input_value_slots') or [])
+        if local:
+            artifacts = local
+            if sort_order is not None:
+                artifacts = artifacts[sort_order - 1:sort_order] if sort_order > 0 else []
+            result = {
+                'status': 'ok', 'key': key, 'artifacts': artifacts,
+            }
+        elif has_remote_input:
+            remote_values = remote_value if isinstance(remote_value, list) else [remote_value]
+            remote_values = [value for value in remote_values if value is not None and value != '']
+            if sort_order is not None:
+                remote_values = remote_values[sort_order - 1:sort_order] if sort_order > 0 else []
+            if not remote_values:
+                return {
+                    'status': 'empty',
+                    'message': f"No artifact found for key '{key}' at sort_order={sort_order}.",
+                }
+            if direct_value:
+                content_type = remote_type if remote_type in {'json', 'image'} else 'text'
+                artifacts = []
+                for value in remote_values:
+                    if content_type == 'json':
+                        artifact_value = {'data': value}
+                    elif content_type == 'image':
+                        if isinstance(value, dict):
+                            artifact_value = dict(value)
+                            path = (
+                                artifact_value.get('path')
+                                or artifact_value.get('image_url')
+                                or artifact_value.get('url')
+                            )
+                            artifact_value['path'] = str(path or '')
+                        else:
+                            artifact_value = {'path': str(value)}
+                    else:
+                        artifact_value = {'text': str(value)}
+                    artifacts.append({
+                        'slot': key,
+                        'content_type': content_type,
+                        'value': artifact_value,
+                    })
+            else:
+                artifacts = [{
+                    'slot': key, 'content_type': 'file',
+                    'value': {'path': str(path), 'filename': os.path.basename(str(path))},
+                } for path in remote_values]
+            result = {
+                'status': 'ok', 'key': key, 'artifacts': artifacts,
+            }
+        else:
+            result = _get_public_workflow_artifacts(key, workflow_session_id, sort_order)
+    elif sort_order is not None:
+        # Ordinary SubAgent: read from sub_agent_artifacts.
+        rows = ctx.local_artifacts(keys=[key]) or ctx.db.load_artifacts(ctx.task_id, keys=[key])
+        matched = [r for r in rows if r.get('seq') == sort_order]
+        if matched:
+            result = {'status': 'ok', 'key': key, 'artifacts': matched}
+        else:
+            return {
+                'status': 'empty',
+                'message': f"No artifact found for key '{key}' at sort_order={sort_order}.",
+            }
+    else:
+        rows = ctx.local_artifacts(keys=[key]) or ctx.db.load_artifacts(ctx.task_id, keys=[key])
+        if not rows:
+            return {'status': 'empty', 'message': f"No artifact found for key '{key}'."}
+        result = {'status': 'ok', 'key': key, 'artifacts': rows}
+
+    # Apply draft overlay and line-range slicing.
+    if start_line is not None or end_line is not None:
+        return _apply_line_range(ctx, key, result, start_line, end_line)
+    return _apply_draft_overlay(ctx, key, result)
+
+
+def _resolve_artifact_text(
+    ctx: Any, key: str, sort_order: Optional[int] = None
+) -> tuple[Optional[str], str]:
+    """Return *(text_content, original_type)* for the currently authoritative version of *key*.
+
+    Resolution priority:
+    1. Draft file (reflects latest patch_artifact edits in this step).
+    2. Exact revision frozen in the current workflow attempt's input binding.
+    3. Workflow session selected revision via load_slot_artifact_by_sort_order —
+       this is the ONLY path that surfaces human-edited artifacts stored in
+       workflow_human_artifacts; must be checked before sub_agent_artifacts.
+    4. Local in-memory cache (same step, sub_agent_artifacts).
+    5. DB sub_agent_artifacts (previous steps).
+
+    Returns (None, 'text') when no content is found.
+    """
+    # 1. Draft takes priority.
+    draft = ctx.read_draft(key)
+    if draft is not None:
+        return draft[0], draft[1]
+
+    # 2. Workflow session: use the full resolution chain that knows about human edits.
+    try:
+        import lazyllm
+        cfg: Dict[str, Any] = {}
+        try:
+            cfg = lazyllm.globals.get('agentic_config') or {}
+        except Exception:
+            pass
+        workflow_session_id: str = cfg.get('workflow_session_id', '')
+    except Exception:
+        workflow_session_id = ''
+
+    if workflow_session_id:
+        values = _public_workflow_artifacts(workflow_session_id, key)
+        position = (sort_order or 1) - 1
+        if 0 <= position < len(values):
+            value = values[position].get('value') or {}
+            content_type = str(values[position].get('content_type') or 'text')
+            original_type = 'json' if content_type == 'json' else 'text'
+            if content_type == 'file' and isinstance(value, dict):
+                original_type = value.get('type', 'text')
+            return _extract_text_from_value(ctx, value, original_type), original_type
+
+    # 3. Local in-memory cache (same step).
+    rows = ctx.local_artifacts(keys=[key])
+    if not rows:
+        # 4. DB sub_agent_artifacts.
+        rows = ctx.db.load_artifacts(ctx.task_id, keys=[key])
+    if not rows:
+        return None, 'text'
+
+    last_row = rows[-1]
+    value = last_row.get('value') or {}
+    ct = last_row.get('content_type', 'text')
+    original_type = 'json' if ct == 'json' else 'text'
+    if ct == 'file':
+        original_type = value.get('type', 'text')
+    text = _extract_text_from_value(ctx, value, original_type)
+    return text, original_type
+
+
+def _extract_text_from_value(ctx: Any, value: Dict[str, Any], original_type: str) -> Optional[str]:
+    """Extract plain text from an artifact value dict (inline or file-stored)."""
+    if 'text' in value:
+        return value['text']
+    if 'data' in value:
+        return json.dumps(value['data'], ensure_ascii=False)
+    # File-stored large artifact.
+    rel_path = value.get('path', '')
+    if rel_path and ctx.workspace_path:
+        abs_path = os.path.join(ctx.workspace_path, rel_path)
+        if os.path.exists(abs_path):
+            try:
+                with open(abs_path, 'r', encoding='utf-8') as fh:
+                    return fh.read()
+            except OSError:
+                pass
+    return None
+
+
+def _apply_draft_overlay(ctx: Any, key: str, result: Dict[str, Any]) -> Dict[str, Any]:
+    """If a draft exists for *key*, replace the artifact text in *result* with draft content."""
+    draft = ctx.read_draft(key)
+    if draft is None:
+        return result
+    content, original_type = draft
+    artifacts = result.get('artifacts') or []
+    if not artifacts:
+        return result
+    # Replace content in the last artifact entry.
+    last = dict(artifacts[-1])
+    value = dict(last.get('value') or {})
+    if original_type == 'json':
+        try:
+            value['data'] = json.loads(content)
+        except Exception:
+            value['text'] = content
+    else:
+        value['text'] = content
+        value.pop('path', None)
+        value.pop('size', None)
+    last['value'] = value
+    last['_from_draft'] = True
+    new_artifacts = artifacts[:-1] + [last]
+    return dict(result, artifacts=new_artifacts)
+
+
+def _apply_line_range(
+    ctx: Any, key: str, result: Dict[str, Any],
+    start_line: Optional[int], end_line: Optional[int],
+) -> Dict[str, Any]:
+    """Slice the artifact text to the requested line range and return a compact response.
+
+    Bypasses LARGE_TOOL_RESULT_THRESHOLD — callers request a small slice explicitly.
+    Always returns total_lines so the model can plan subsequent reads.
+    """
+    text, _ = _resolve_artifact_text(ctx, key)
+    if text is None:
+        return result  # fall back to unsliced result if we can't read content
+
+    lines = text.splitlines(keepends=True)
+    total = len(lines)
+    sl = max(1, start_line) if start_line is not None else 1
+    el = min(total, end_line) if end_line is not None else total
+    slice_content = ''.join(lines[sl - 1:el])
+    return {
+        'status': 'ok',
+        'key': key,
+        'content': slice_content,
+        'start_line': sl,
+        'end_line': el,
+        'total_lines': total,
+        '_from_draft': ctx.read_draft(key) is not None,
+    }
+
+
+def _workflow_client() -> Any:
+    import httpx
+    import lazyllm
+    from lazymind.config import config
+    from lazymind.workflow_sdk import WorkflowClient
+    cfg = lazyllm.globals.get('agentic_config') or {}
+    return WorkflowClient(
+        str(config['core_api_url']).rstrip('/'), str(cfg.get('user_id') or ''),
+        host='lazymind', transport=httpx,
+        trace_context=lazyllm.get_trace_context,
+    )
+
+
+def _public_workflow_artifacts(session_id: str, key: str = '') -> List[Dict[str, Any]]:
+    response = _workflow_client().list_artifacts(session_id).result
+    artifacts = response.get('artifacts') if isinstance(response, dict) else []
+    values = [dict(item) for item in artifacts if isinstance(item, dict)]
+    if key:
+        values = [item for item in values if item.get('slot') == key]
+    return values
+
+
+def _get_public_workflow_artifacts(
+    key: str, session_id: str, sort_order: Optional[int],
+) -> Dict[str, Any]:
+    """Read Workflow Artifacts only through the public SDK."""
+    artifacts = _public_workflow_artifacts(session_id, key)
+    if sort_order is not None:
+        artifacts = artifacts[sort_order - 1:sort_order] if sort_order > 0 else []
+    if not artifacts:
+        return {
+            'status': 'empty',
+            'message': f"No artifact found for key '{key}' in workflow session {session_id}.",
+        }
+    return {'status': 'ok', 'key': key, 'artifacts': artifacts}
+
+
+def patch_artifact(
+    key: str,
+    patch: str,
+    patch_type: str = 'str_replace',
+    sort_order: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Apply a local patch to a previously saved artifact without committing a new revision.
+
+    Edits are written to a draft file in the workspace and automatically committed as a new
+    revision when normal execution reaches the step boundary. Keep calling patch_artifact for
+    additional targeted edits, or call discard_draft first to abandon all pending edits.
+
+    Use patch_artifact for targeted edits (fix a paragraph, update a field). Use
+    save_artifacts directly when rewriting the whole artifact from scratch.
+
+    To discard all uncommitted edits and revert to the last saved version, call
+    discard_draft(key).
+
+    Args:
+        key (str): The artifact key to patch.
+        patch (str): A JSON-encoded patch payload whose decoded shape depends on patch_type:
+            - str_replace: {"old_str": "exact original text", "new_str": "replacement"}
+            - json_merge:  {"field": "new_value", "obsolete": null}  (RFC 7396; null = delete)
+            - json_patch:  [{"op": "replace", "path": "/items/0/status", "value": "done"}] (RFC 6902)
+        patch_type (str): One of str_replace (default), json_merge, json_patch.
+        sort_order (int): 1-based display position for list-cardinality slots.
+            Required when the slot has list cardinality; omit for single-cardinality slots.
+
+    Returns:
+        Confirmation of success, or an error with instructions for recovery.
+    """
+    ctx = require_context()
+
+    decoded_patch, decode_error = _decode_patch_payload(patch)
+    if decode_error:
+        raise ToolExecutionError(f'Invalid patch payload: {decode_error}')
+
+    # Resolve list_index from sort_order when provided.
+    list_index: Optional[int] = None
+    if sort_order is not None:
+        list_index, resolve_err = _resolve_list_index_from_sort_order(key, sort_order)
+        if resolve_err:
+            raise ToolExecutionError(f'Invalid sort_order: {resolve_err}')
+
+    # Load draft or initialize from latest committed content.
+    draft_result = ctx.read_draft(key, list_index)
+    if draft_result is None:
+        # Auto-initialize draft from latest committed artifact.
+        # Workflow sessions: this path also checks workflow_human_artifacts (human edits).
+        text, original_type = _resolve_artifact_text(ctx, key, sort_order)
+        if text is None:
+            raise ToolExecutionError(
+                (
+                    f"No committed content found for artifact '{key}'. "
+                    'Call save_artifacts first to create the artifact before patching.'
+                )
+            )
+        ctx.write_draft(key, original_type, text, list_index, pending_commit=False)
+        draft_result = (text, original_type)
+
+    content, original_type = draft_result
+
+    if patch_type == 'str_replace':
+        new_content, err = _apply_str_replace(content, decoded_patch)
+    elif patch_type == 'json_merge':
+        new_content, err = _apply_json_merge(content, decoded_patch)
+    elif patch_type == 'json_patch':
+        new_content, err = _apply_json_patch(content, decoded_patch)
+    else:
+        raise ToolExecutionError(
+            f"Unknown patch_type '{patch_type}'. Use str_replace, json_merge, or json_patch."
+        )
+
+    if err:
+        raise ToolExecutionError(f'Patch was rejected: {err}')
+
+    ctx.write_draft(key, original_type, new_content, list_index)
+    lines_changed = abs(new_content.count('\n') - content.count('\n'))
+    return {
+        'status': 'ok',
+        'message': (
+            f"Draft for '{key}' updated ({lines_changed} line(s) changed). "
+            'Keep patching, or call discard_draft to abandon the edits. '
+            'The framework will commit them at the normal step boundary.'
+        ),
+    }
+
+
+def _decode_patch_payload(patch: Any) -> tuple[Any, Optional[str]]:
+    """Normalize the model-facing JSON string while tolerating native internal callers."""
+    if not isinstance(patch, str):
+        return patch, None
+    try:
+        return json.loads(patch), None
+    except json.JSONDecodeError as exc:
+        return None, (
+            'patch must be valid JSON text encoding the object/list documented for patch_type: '
+            f'{exc.msg} at character {exc.pos}.'
+        )
+
+
+def _normalize_text(text: str) -> str:
+    """Normalize punctuation and whitespace for fuzzy matching fallback."""
+    _FULL_HALF = str.maketrans(
+        '\uff0c\u3002\u201c\u201d\u2018\u2019\uff08\uff09\u300a\u300b',
+        ',.""\'\'\u0028\u0029<>',
+    )
+    result = []
+    for line in text.splitlines(keepends=True):
+        normalized = ' '.join(line.translate(_FULL_HALF).split())
+        # Preserve trailing newline if original line had one.
+        if line.endswith('\n'):
+            normalized += '\n'
+        result.append(normalized)
+    return ''.join(result)
+
+
+def _apply_str_replace(content: str, patch: Any) -> tuple[Optional[str], Optional[str]]:
+    """Apply str_replace patch. Returns (new_content, error_message)."""
+    if not isinstance(patch, dict):
+        return None, 'patch must be a dict with old_str and new_str keys.'
+    old_str = patch.get('old_str', '')
+    new_str = patch.get('new_str', '')
+    if not old_str:
+        return None, 'patch.old_str must not be empty.'
+
+    # Layer 1: exact match.
+    count = content.count(old_str)
+    if count == 1:
+        return content.replace(old_str, new_str, 1), None
+    if count > 1:
+        return None, (
+            f'old_str matches {count} locations — it must be unique. '
+            'Expand old_str with more surrounding context to make it unique, then retry.'
+        )
+
+    # Layer 2: normalize both sides and match.
+    norm_content = _normalize_text(content)
+    norm_old = _normalize_text(old_str)
+    if norm_old and norm_content.count(norm_old) == 1:
+        idx = norm_content.find(norm_old)
+        # Map normalized index back to original content character position.
+        # Walk both strings in sync until we reach idx in the normalized version.
+        orig_idx = _map_norm_index_to_orig(content, norm_content, idx)
+        orig_end = _map_norm_index_to_orig(content, norm_content, idx + len(norm_old))
+        return content[:orig_idx] + new_str + content[orig_end:], None
+
+    return None, (
+        'old_str not found in the current draft content. '
+        'Call get_artifact to read the current content, then construct old_str from the actual text.'
+    )
+
+
+def _map_norm_index_to_orig(orig: str, norm: str, norm_idx: int) -> int:
+    """Map a character index in the normalized string back to the original string."""
+    o, n = 0, 0
+    while n < norm_idx and o < len(orig):
+        o += 1
+        n = len(_normalize_text(orig[:o]))
+    return o
+
+
+def _apply_json_merge(content: str, patch: Any) -> tuple[Optional[str], Optional[str]]:
+    """Apply RFC 7396 JSON merge patch."""
+    try:
+        obj = json.loads(content)
+    except ValueError as e:
+        return None, f'Draft content is not valid JSON: {e}'
+    if not isinstance(patch, dict):
+        return None, 'json_merge patch must be a dict.'
+    obj = _json_merge_apply(obj, patch)
+    return json.dumps(obj, ensure_ascii=False, indent=2), None
+
+
+def _json_merge_apply(target: Any, patch: Any) -> Any:
+    if not isinstance(patch, dict):
+        return patch
+    if not isinstance(target, dict):
+        target = {}
+    result = dict(target)
+    for k, v in patch.items():
+        if v is None:
+            result.pop(k, None)
+        else:
+            result[k] = _json_merge_apply(result.get(k), v)
+    return result
+
+
+def _apply_json_patch(content: str, patch: Any) -> tuple[Optional[str], Optional[str]]:
+    """Apply RFC 6902 JSON Patch operations."""
+    try:
+        obj = json.loads(content)
+    except ValueError as e:
+        return None, f'Draft content is not valid JSON: {e}'
+    if not isinstance(patch, list):
+        return None, 'json_patch must be a list of operation objects.'
+    try:
+        obj = _json_patch_apply(obj, patch)
+    except (KeyError, IndexError, TypeError, ValueError) as e:
+        return None, f'json_patch failed: {e}'
+    return json.dumps(obj, ensure_ascii=False, indent=2), None
+
+
+def _json_patch_apply(obj: Any, ops: List[Any]) -> Any:
+    """Minimal RFC 6902 implementation supporting add/remove/replace/move/copy/test."""
+    import copy
+    obj = copy.deepcopy(obj)
+
+    def _get(doc: Any, path: str) -> Any:
+        parts = [p for p in path.split('/')[1:]]
+        cur = doc
+        for p in parts:
+            p = p.replace('~1', '/').replace('~0', '~')
+            cur = cur[int(p)] if isinstance(cur, list) else cur[p]
+        return cur
+
+    def _set(doc: Any, path: str, value: Any) -> None:
+        parts = [p.replace('~1', '/').replace('~0', '~') for p in path.split('/')[1:]]
+        cur = doc
+        for p in parts[:-1]:
+            cur = cur[int(p)] if isinstance(cur, list) else cur[p]
+        last = parts[-1]
+        if isinstance(cur, list):
+            if last == '-':
+                cur.append(value)
+            else:
+                cur[int(last)] = value
+        else:
+            cur[last] = value
+
+    def _remove(doc: Any, path: str) -> None:
+        parts = [p.replace('~1', '/').replace('~0', '~') for p in path.split('/')[1:]]
+        cur = doc
+        for p in parts[:-1]:
+            cur = cur[int(p)] if isinstance(cur, list) else cur[p]
+        last = parts[-1]
+        if isinstance(cur, list):
+            del cur[int(last)]
+        else:
+            del cur[last]
+
+    for op in ops:
+        operation = op.get('op')
+        path = op.get('path', '')
+        if operation == 'replace':
+            _set(obj, path, op['value'])
+        elif operation == 'add':
+            _set(obj, path, op['value'])
+        elif operation == 'remove':
+            _remove(obj, path)
+        elif operation == 'move':
+            val = _get(obj, op['from'])
+            _remove(obj, op['from'])
+            _set(obj, path, val)
+        elif operation == 'copy':
+            _set(obj, path, _get(obj, op['from']))
+        elif operation == 'test':
+            if _get(obj, path) != op['value']:
+                raise ValueError(f'test failed at {path}')
+        else:
+            raise ValueError(f'unsupported op: {operation}')
+    return obj
+
+
+def discard_draft(key: str, sort_order: Optional[int] = None) -> Dict[str, Any]:
+    """Discard all uncommitted patch edits for an artifact and revert to the last saved version.
+
+    Deletes the local draft file. The next read (get_artifact or patch_artifact) will
+    load the last committed revision from the database. No new revision is created and
+    no SSE event is emitted.
+
+    Args:
+        key (str): The artifact key whose draft should be discarded.
+        sort_order (int): 1-based position for list-cardinality slots. Omit for single slots.
+
+    Returns:
+        Confirmation that the draft was discarded (or was already absent).
+    """
+    ctx = require_context()
+    list_index: Optional[int] = None
+    if sort_order is not None:
+        list_index, resolve_err = _resolve_list_index_from_sort_order(key, sort_order)
+        if resolve_err:
+            raise ToolExecutionError(f'Invalid sort_order: {resolve_err}')
+    existed = ctx.read_draft(key, list_index) is not None
+    ctx.delete_draft(key, list_index)
+    msg = (
+        f"Draft for '{key}' discarded. Next read will use the last committed version."
+        if existed else
+        f"No draft found for '{key}' — nothing to discard."
+    )
+    return {'status': 'ok', 'message': msg}
+
+
+def list_artifacts(task_ref: Optional[str] = None) -> Dict[str, Any]:
+    """List Workflow output artifacts produced so far in the current task.
+
+    This does not list user-uploaded attachments. Use find_user_attachment only when
+    the User Attachments context provides an exact filename.
+
+    Args:
+        task_ref (str): Optional task reference; when omitted lists artifacts of the current task.
+
+    Returns:
+        A summary of available artifact keys and their content types.
+    """
+    ctx = require_context()
+    rows = ctx.local_artifacts() or ctx.db.load_artifacts(ctx.task_id)
+    summary: Dict[str, str] = {}
+    for r in rows:
+        summary[r['slot']] = r['content_type']
+    parts = [f'{k} ({v})' for k, v in summary.items()]
+    msg = '可用成果：' + ('、'.join(parts) if parts else '（暂无）')
+    return {'status': 'ok', 'keys': summary, 'message': msg}
+
+
+def list_knowledge_bases() -> Dict[str, Any]:
+    """List knowledge bases accessible to the current user.
+
+    Returns a list of knowledge bases (id / name / type / tags) that can be
+    passed to the kb_search tool.  Use this when you need to discover which
+    knowledge bases exist before performing a search.
+
+    Returns:
+        A list of knowledge base summaries, each with id, name, type, and tags.
+    """
+    import httpx
+    import lazyllm
+    from lazymind.config import config as _cfg
+    # Pick up user_id from agentic_config (injected by Go via X-User-Id).
+    cfg: Dict[str, Any] = {}
+    try:
+        cfg = lazyllm.globals.get('agentic_config') or {}
+    except Exception:
+        pass
+    user_id: str = cfg.get('user_id', '')
+    core_url = str(_cfg['core_api_url']).rstrip('/')
+    headers = {}
+    if user_id:
+        headers['X-User-Id'] = user_id
+    resp = httpx.get(f'{core_url}/kb/list', headers=headers, timeout=5.0)
+    if resp.status_code != 200:
+        raise ToolExecutionError(
+            f'Failed to list knowledge bases: HTTP {resp.status_code}.'
+        )
+    # Go /kb/list returns {"code":0,"data":{"total":N,"list":[{id,name,visibility,...}]}}
+    data = resp.json().get('data') or {}
+    raw_items = data.get('list') or []
+    simplified = [
+        {
+            'id': kb.get('id', ''),
+            'name': kb.get('name', ''),
+            'visibility': kb.get('visibility', ''),
+            'permissions': kb.get('permissions', []),
+        }
+        for kb in raw_items
+    ]
+    return {
+        'status': 'ok',
+        'message': f'Found {len(simplified)} knowledge base(s).',
+        'items': simplified,
+    }
+
+
+def _resolve_attachment(
+    filename: str,
+    turn: Optional[int] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Compatibility wrapper around the shared attachment resolver."""
+    from lazymind.chat.engine.tools.local_file.resolver import resolve_attachment_path
+    return resolve_attachment_path(
+        filename,
+        turn,
+        allow_partial=True,
+        prefer_newest=True,
+    )
+
+
+def read_user_attachment(filename: str, turn: Optional[int] = None) -> Dict[str, Any]:
+    """Compatibility reader for one user-uploaded attachment.
+
+    Prefer grep(target, pattern) and read_file(target, offset, limit) for PDF,
+    text, and Office content. This transition tool delegates those formats to
+    the same resolver. Images still return a vision-model text description.
+
+    Args:
+        filename (str): The filename (basename) or display name of the attachment to read.
+            Must match one of the files listed in the system prompt.
+            For intra-turn duplicates use the deduplicated name (e.g. report-1.pdf).
+        turn (int): Optional. The conversation turn number (1-based seq matching the
+            'Turn N' labels in the system prompt, e.g. Turn 1, Turn 3).
+            Omit to search from the current turn first, then historical turns newest-first.
+
+    Returns:
+        Bounded attachment content and continuation metadata.
+    """
+    matched, err = _resolve_attachment(filename, turn)
+    if err:
+        raise ToolExecutionError(f'Attachment not found: {err}')
+    is_remote = str(matched or '').lower().startswith(('http://', 'https://'))
+    if not is_remote:
+        matched = _materialize_local_path(matched)
+    if not is_remote and not os.path.exists(matched):
+        raise ToolExecutionError(
+            f"Attachment '{os.path.basename(matched)}' was found in the index but is no longer on disk."
+        )
+    if not is_chat_attachment_file(matched):
+        raise ToolExecutionError(
+            (
+                f"Unsupported file type '{os.path.splitext(matched)[1].lower() or '(no extension)'}'. "
+                'Supported: images, Office/PDF documents, and common plain-text files.'
+            )
+        )
+    try:
+        if is_chat_image_file(matched):
+            import lazyllm
+            cfg: Dict[str, Any] = lazyllm.globals.get('agentic_config') or {}
+            content = parse_attachment_content(
+                matched,
+                priority=int(cfg.get('priority') or 0),
+            )
+            return {
+                'status': 'ok',
+                'filename': os.path.basename(matched),
+                'path': matched,
+                'kind': 'image',
+                'content': content,
+            }
+        from lazymind.chat.engine.tools.local_file.workspace import read_file
+        payload = read_file(matched, turn=turn)
+    except Exception as e:
+        raise ToolExecutionError(
+            f"Could not parse '{os.path.basename(matched)}': {e}"
+        ) from e
+
+    return {
+        'status': 'ok',
+        'filename': os.path.basename(matched),
+        'path': matched,
+        'kind': 'text' if is_chat_text_file(matched) else 'document',
+        'content': payload.get('text', ''),
+        'offset': payload.get('offset'),
+        'end_line': payload.get('end_line'),
+        'total_lines': payload.get('total_lines'),
+        'eof': payload.get('eof'),
+        'next_offset': payload.get('next_offset'),
+        'footer': payload.get('footer'),
+    }
+
+
+def _publish_attachment_edit(draft: AttachmentEditDraft) -> Dict[str, Any]:
+    """Publish through the owning Agent's artifact channel."""
+    ctx = get_context()
+    if ctx is None:
+        return draft.publish()
+    artifact_key = ctx.output_slots[0] if ctx.output_slots else 'edited_attachment'
+    _save_artifact(
+        artifact_key,
+        draft.draft_path,
+        content_type='file',
+        source_tool='string_replace',
+        caption=f'Edited copy of {draft.filename}',
+    )
+    return {
+        'artifact_key': artifact_key,
+        'filename': draft.filename,
+        'message': f"Saved edited attachment '{draft.filename}' as SubAgent artifact '{artifact_key}'.",
+    }
+
+
+def string_replace(
+    filename: str,
+    old_string: Optional[str] = None,
+    new_string: Optional[str] = None,
+    expected_replacements: int = 1,
+    turn: Optional[int] = None,
+    mode: Literal['literal', 'regex'] = 'literal',
+    regex_flags: str = 'MULTILINE',
+    action: Literal['preview', 'apply', 'undo'] = 'preview',
+    preview_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Preview, apply, or undo a safe text replacement in an uploaded attachment.
+
+    Always call action='preview' first, inspect matches and diff, then call action='apply'
+    with the returned preview_id. Literal mode supports multiline text and treats LF/CRLF
+    as equivalent. Regex mode supports controlled flags and still requires an exact expected
+    match count. Applied edits update one downloadable artifact; action='undo' reverts one step.
+
+    Args:
+        filename: Attachment filename or display name shown in the conversation.
+        old_string: Literal text or regex pattern. Required only for preview.
+        new_string: Replacement text. Regex mode supports Python-style backreferences.
+        expected_replacements: Required match count, 1-100. A mismatch never changes the draft.
+        turn: Optional attachment turn number; omit to search newest attachments first.
+        mode: 'literal' (default) or 'regex'.
+        regex_flags: Comma-separated IGNORECASE, MULTILINE, and/or DOTALL for regex mode.
+        action: 'preview' (default), 'apply', or 'undo'.
+        preview_id: Required for apply; copy it exactly from a successful preview result.
+
+    Returns:
+        Preview diff and match locations, applied artifact metadata, or undo result.
+    """
+    matched, err = _resolve_attachment(filename, turn)
+    if err:
+        raise ToolExecutionError(f'Attachment not found: {err}')
+    if not os.path.isfile(matched):
+        raise ToolExecutionError(
+            f"Attachment '{os.path.basename(matched)}' was found in the index but is no longer on disk."
+        )
+    if not is_chat_text_file(matched):
+        raise ToolExecutionError(
+            'string_replace supports uploaded plain-text/code/config files only'
+        )
+    normalized_action = str(action or 'preview').strip().lower()
+    try:
+        draft = AttachmentEditDraft.for_current_conversation(matched)
+    except RuntimeError as exc:
+        raise ToolExecutionError(f'Conversation context is required: {exc}') from exc
+    if normalized_action == 'preview':
+        if old_string is None or new_string is None:
+            raise ToolExecutionError('old_string and new_string are required for preview')
+        try:
+            preview = draft.create_preview(
+                old_string,
+                new_string,
+                expected_replacements,
+                mode,
+                regex_flags,
+            )
+        except ValueError as exc:
+            raise ToolExecutionError(str(exc)) from exc
+        return {
+            'status': 'preview',
+            'action': 'preview',
+            'source_filename': os.path.basename(matched),
+            **preview,
+            'requires_apply': True,
+            'message': (
+                'Preview only; no file was changed. Verify every match and the diff, then call '
+                "string_replace with action='apply' and this preview_id."
+            ),
+        }
+    if normalized_action == 'apply':
+        if not preview_id:
+            raise ToolExecutionError('preview_id is required for apply; run preview first')
+        had_previous_edit = os.path.isfile(draft.draft_path)
+        try:
+            preview, content, revision = draft.apply_preview(preview_id)
+        except ValueError as exc:
+            raise ToolExecutionError(str(exc)) from exc
+        artifact = _publish_attachment_edit(draft)
+        return {
+            'status': 'ok',
+            'action': 'apply',
+            'source_filename': os.path.basename(matched),
+            **artifact,
+            'replacements': preview['replacements'],
+            'matches': preview['matches'],
+            'diff': preview['diff'],
+            'mode': preview['mode'],
+            'bytes': len(content),
+            'revision': revision,
+            'undo_available': True,
+            'original_unchanged': True,
+            'continues_previous_edit': had_previous_edit,
+        }
+    if normalized_action == 'undo':
+        try:
+            content, diff, revision = draft.undo()
+        except ValueError as exc:
+            raise ToolExecutionError(str(exc)) from exc
+        artifact = _publish_attachment_edit(draft)
+        return {
+            'status': 'ok',
+            'action': 'undo',
+            'source_filename': os.path.basename(matched),
+            **artifact,
+            'diff': diff,
+            'bytes': len(content),
+            'revision': revision,
+            'undo_available': revision > 0,
+            'original_unchanged': True,
+            'message': 'Reverted the most recent applied edit and updated the download artifact.',
+        }
+    raise ToolExecutionError("action must be 'preview', 'apply', or 'undo'")
+
+
+def find_user_attachment(filename: str, turn: Optional[int] = None) -> Dict[str, Any]:
+    """Return path/url of a user-uploaded attachment without parsing it.
+
+    Prefer this over read_user_attachment when you only need the file location: image
+    editing, workflows, vision_extractor, or passing an image path to other tools.
+    Does not run OCR or vision description (fast).
+
+    Args:
+        filename (str): The filename (basename) or display name of the attachment to locate.
+            For intra-turn duplicates use the deduplicated name (e.g. report-1.pdf).
+        turn (int): Optional. The conversation turn number. Same semantics as
+            read_user_attachment: 1-based for historical turns, or omit to search
+            current turn first then historical turns newest-first.
+
+    Returns:
+        A dict with 'url' (signed HTTP URL from Go, preferred) and 'path' (local absolute path,
+        fallback). Pass 'url' to other tools when available.
+    """
+    matched, err = _resolve_attachment(filename, turn)
+    if err:
+        raise ToolExecutionError(f'Attachment not found: {err}')
+    is_remote = str(matched or '').lower().startswith(('http://', 'https://'))
+    if not is_remote:
+        matched = _materialize_local_path(matched)
+    if not is_remote and not os.path.exists(matched):
+        raise ToolExecutionError(
+            f"Attachment '{os.path.basename(matched)}' was found in the index but is no longer on disk."
+        )
+
+    signed_url = None if is_remote else _sign_static_file_url(matched)
+
+    display_name = os.path.basename(urlparse(matched).path) if is_remote else os.path.basename(matched)
+    result: Dict[str, Any] = {
+        'status': 'ok',
+        'filename': display_name or matched,
+        'path': matched,
+    }
+    if signed_url:
+        result['url'] = signed_url
+    else:
+        result['url'] = matched
+        if not is_remote:
+            result['message'] = 'Signed URL unavailable; use the local path instead.'
+    if str(matched).split('?', 1)[0].lower().endswith('.pdf'):
+        try:
+            from lazymind.chat.engine.tools.local_file.store import FileResourceStore, workspace_for_request
+            store = FileResourceStore(workspace_for_request())
+            manifest = store.find_by_source_path(matched) or store.find_by_display_name(
+                result['filename']
+            )
+            if manifest:
+                result['file_id'] = manifest.get('file_id')
+        except Exception:
+            pass
+    return result
+
+
+def find_artifact(slot: str, sort_order: Optional[int] = None) -> Dict[str, Any]:
+    """Return the accessible URL or local path of a workflow artifact.
+
+    Analogous to find_user_attachment but for workflow step outputs.
+    Reads session_id and workflow_id from agentic_config (same as save_artifacts / get_artifact).
+
+    Args:
+        slot (str): The slot id to look up (e.g. 'image_output').
+        sort_order (int): Optional 1-based display position for list-slot artifacts.
+            Omit for single-slot artifacts.
+
+    Returns:
+        A dict with 'url' (signed HTTP URL, preferred) and 'path' (local absolute path,
+        fallback). Pass 'url' to image tools when available.
+    """
+    import lazyllm
+    try:
+        cfg: Dict[str, Any] = lazyllm.globals.get('agentic_config') or {}
+    except Exception:
+        cfg = {}
+
+    session_id: str = cfg.get('workflow_session_id', '')
+    if not session_id:
+        raise ToolExecutionError(
+            'No active workflow session was found in agentic_config; workflow_session is required.'
+        )
+
+    ctx = get_context()
+    if ctx is None:
+        raise ToolExecutionError(
+            'find_artifact requires an active SubAgent context.'
+        )
+    result_dict = get_artifact(slot, sort_order=sort_order)
+
+    if result_dict.get('status') != 'ok':
+        return result_dict
+
+    artifacts = result_dict.get('artifacts') or []
+    if not artifacts:
+        raise ToolExecutionError(f"No artifact found for slot '{slot}'.")
+
+    # Use the first (or only) artifact to resolve the path.
+    artifact = artifacts[0]
+    value = artifact.get('value') or {}
+    if isinstance(value, str):
+        try:
+            import json as _json
+            value = _json.loads(value)
+        except Exception:
+            value = {}
+
+    signed_url: Optional[str] = None
+    if isinstance(value.get('url'), str) and value.get('url'):
+        signed_url = value['url']
+
+    path: Optional[str] = value.get('path') or value.get('url')
+    if not path or not isinstance(path, str):
+        raise ToolExecutionError(f"Artifact '{slot}' has no resolvable path.")
+
+    if not path.lower().startswith(('http://', 'https://', '/static-files/')):
+        path = _materialize_local_path(path)
+
+    # Re-sign local paths when the slots API did not already provide a URL.
+    if not signed_url:
+        signed_url = _sign_static_file_url(path)
+
+    out: Dict[str, Any] = {
+        'status': 'ok',
+        'slot': slot,
+        'path': path,
+    }
+    if sort_order is not None:
+        out['sort_order'] = sort_order
+    if signed_url:
+        out['url'] = signed_url
+    else:
+        out['url'] = path
+        out['message'] = 'Signed URL unavailable; use the local path instead.'
+    return out

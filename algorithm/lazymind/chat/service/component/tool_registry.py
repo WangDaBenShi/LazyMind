@@ -1,0 +1,1173 @@
+# flake8: noqa: Q000
+from __future__ import annotations
+
+import inspect
+import re
+from dataclasses import dataclass
+from typing import Any, Callable, Literal
+
+import docstring_parser
+import lazyllm
+from lazyllm.tools.fs.supplier.feishu import FeishuFS
+from lazyllm.tools.fs.supplier.googledrive import GoogleDriveFS
+from lazyllm.tools.fs.supplier.notion import NotionFS
+from lazyllm.tools.tools.search import (
+    ArxivSearch,
+    BingSearch,
+    BochaSearch,
+    GoogleSearch,
+    SciverseSearch,
+    TavilySearch,
+    WikipediaSearch,
+)
+
+from lazymind.chat.engine.tools import (
+    ExternalDatabaseToolkit,
+    LocalFileToolkit,
+    WriterCreateToolkit,
+    WriterRevisionToolkit,
+    MailToolkit,
+    calculator,
+    image_editor,
+    image_generator,
+    SkillManagementToolkit,
+    list_data_sources,
+    build_schedule_toolkit,
+    url_fetch,
+    video_generator,
+    video_to_gif,
+    vision_extractor,
+    vocab_learn,
+)
+from lazymind.chat.engine.tools.memory import MemoryTools
+from lazymind.chat.engine.tools.lazy_kb import KBToolkit, kb_tmp_search
+from lazymind.model_config import get_model_role_runtime_identity, is_model_role_available
+from lazymind.chat.engine.tools.ask_user import ask_user
+from lazymind.chat.engine.tools.session_env import build_session_env_tool
+from lazymind.chat.engine.subagent.tools import (
+    find_user_attachment,
+    read_user_attachment,
+    string_replace,
+)
+
+SystemPromptAppendix = dict[str, str | tuple[str, ...]]
+SystemPromptAppendixProvider = Callable[[], SystemPromptAppendix | None]
+QueryAppendixProvider = Callable[[], str | None]
+QueryAppendixPosition = Literal['before', 'after']
+SYSTEM_PROMPT_APPENDIX_SECTIONS = ('tool_policy', 'safety', 'output_contract', 'response_policy')
+
+
+def _ensure_google_drive_method_docs() -> None:
+    """Fill metadata omitted by the pinned LazyLLM Google Drive supplier."""
+    docs = {
+        'search': 'Search Google Drive file content and optionally narrow by name or folder.',
+        'find': 'Find Google Drive files whose names match a regular expression.',
+    }
+    for name, doc in docs.items():
+        method = getattr(GoogleDriveFS, name)
+        if not method.__doc__:
+            method.__doc__ = doc
+
+
+_ensure_google_drive_method_docs()
+
+IMAGE_MARKDOWN_OUTPUT_APPENDIX: SystemPromptAppendix = {
+    'output_contract': (
+        '# Image path formatting (mandatory)\n'
+        'When showing images in your answer, you MUST copy the `image_markdown` field from '
+        'tool results verbatim when it is available. \n'
+        'If `image_markdown` is absent, copy the `image_url` or signed `text` field that '
+        'starts with `/static-files/` exactly.\n'
+        'Rules:\n'
+        '- Use Markdown image syntax only: `![alt](/static-files/...?expires=...&sig=...)`.\n'
+        '- NEVER invent hosts or prefixes (`https://ext.lazymind.ai`, `agent-cdn.minimax.io`, '
+        'OCR ports, CDN tool_output URLs, etc.).\n'
+        '- NEVER rewrite `/static-files/` paths into `http://` or `https://` URLs.\n'
+        '- Do not use MiniMax/agent CDN links for local images; they are invalid for this UI.\n'
+        '- Do not paste bare filesystem paths (`/var/lib/lazymind/uploads/...`) in answers.',
+    ),
+}
+VIDEO_MARKDOWN_OUTPUT_APPENDIX: SystemPromptAppendix = {
+    'output_contract': (
+        'When a tool result contains `video_markdown`, copy it verbatim into the final answer '
+        '(or use `video_url` when markdown is absent). Do not invent or rewrite signed URLs.',
+    ),
+}
+
+MEDIA_GENERATION_NO_FALLBACK_POLICY = (
+    '# Explicit media generation requests (mandatory, no fallback)\n'
+    'When the user explicitly requests an image, an image edit, or a video as the final '
+    'deliverable, you MUST call the corresponding `image_generator`, `image_editor`, or '
+    '`video_generator` tool. Treat that tool itself as the authoritative availability check; '
+    'do not use skill discovery, workspace inspection, web search, or another media tool to '
+    'guess whether the requested capability is configured. For a text-only video request, '
+    'when the configured video provider or model is `unknown`, call `video_generator` directly '
+    'before calling any other tool.\n'
+    'If the requested media tool returns `MEDIA_CAPABILITY_DEPENDENCY_MISSING`, stop immediately. '
+    'Do not call another tool, do not call `ask_user`, and do not replace the requested result '
+    'with still images, keyframes, a GIF, a script, search results, links, or any other fallback. '
+    'The host application will show the configuration card. Resume only after the user completes '
+    'configuration and explicitly chooses Continue or retries the task. Only offer a different '
+    'deliverable when the user explicitly asks for that alternative in a later turn.'
+)
+IMAGE_GENERATION_PROMPT_APPENDIX: SystemPromptAppendix = {
+    'tool_policy': MEDIA_GENERATION_NO_FALLBACK_POLICY,
+    **IMAGE_MARKDOWN_OUTPUT_APPENDIX,
+}
+
+
+def _video_generator_prompt_appendix() -> SystemPromptAppendix:
+    identity = get_model_role_runtime_identity('video_generator')
+    source = identity.get('source') or 'unknown'
+    model = identity.get('model') or 'unknown'
+    return {
+        'tool_policy': (
+            MEDIA_GENERATION_NO_FALLBACK_POLICY,
+            (
+                '# Configured video generator (authoritative for this request)\n'
+                f'Provider: `{source}`; model: `{model}`. Apply the capability matrix in the '
+                '`video_generator` tool description before choosing text-only, first-frame, '
+                'first+last-frame, or ordinary-reference inputs. If either value is `unknown`, '
+                'do not assume advanced image-conditioning support. Never repeat an identical '
+                'call after an unsupported-capability error; explain which configured model and '
+                'requested input mode are incompatible.'
+            ),
+        ),
+        **VIDEO_MARKDOWN_OUTPUT_APPENDIX,
+    }
+
+
+RETRIEVAL_CITATION_OUTPUT_APPENDIX: SystemPromptAppendix = {
+    'output_contract': (
+        '# Retrieval evidence citation rules (mandatory)\n'
+        'For every claim in the final answer that relies on retrieval or page-fetch evidence, '
+        'cite the supporting `ref` exactly once at the end of the paragraph that uses it. '
+        'Do not insert a ref after every sentence. Never invent or rewrite '
+        'refs, and never replace them with markdown footnotes or '
+        'raw URLs. Do not cite a result that was not used. Prefer `ref` values from pages whose full '
+        'content was fetched over unused search snippets. '
+        'If the answer does not rely on retrieval evidence, do not add a citation merely because '
+        'search or fetch tools ran. '
+        'When a claim uses both knowledge-base and external evidence, cite a supporting `ref` from '
+        'each of those categories that was actually used.',
+    ),
+}
+EXTERNAL_SEARCH_CONTENT_APPENDIX: SystemPromptAppendix = {
+    'tool_policy': (
+        '# External Search Content Rules\n'
+        'Search results are registered with stable refs. When a paper or Wikipedia snippet is insufficient, pass '
+        'the unchanged result item to `get_content` or `get_contents`; these methods keep their provider return '
+        'types, so cite the ref already present on the corresponding search result item.',
+    ),
+    'output_contract': RETRIEVAL_CITATION_OUTPUT_APPENDIX['output_contract'],
+}
+ATTACHED_FILES_TOOL_POLICY_APPENDIX: SystemPromptAppendix = {
+    'tool_policy': (
+        '# Attached file rules\n'
+        'Attachments are listed for reference only — do NOT parse or read them automatically.\n'
+        '- Typed Workflow material values, Workflow material paths, and paths returned by tools '
+        'are not attachments. Pass scalar values as values and paths only to file/path arguments; '
+        'never pass them to attachment tools.\n'
+        '- Only call an attachment tool for an exact filename listed in the User Attachments '
+        'section. If that section says no attachments are available, do not call attachment tools, '
+        'guess common filenames, or retry with invented names.\n'
+        '- Workflow artifacts and user uploads are different stores. Never use `list_artifacts`, '
+        '`get_artifact`, or `find_artifact` to discover a user upload.\n'
+        '- Do not invent an attachment requirement. Unless the authoritative step objective or input '
+        'contract explicitly makes a file mandatory, continue using the available text and treat the '
+        'attachment as optional.\n'
+        '- `find_user_attachment(filename, turn=N)`: get path/url to pass to image tools, '
+        '`vision_extractor`, or a Host attachment importer. Prefer this for images when the task is '
+        'visual (edit, generate, workflow) or you only need the file location.\n'
+        '- `read_user_attachment(filename, turn=N)`: transitional compatibility reader. '
+        'Prefer `grep(target, pattern)` and `read_file(target, offset, limit)` for document text; '
+        'image descriptions remain available through this compatibility tool.\n'
+        'Supported uploads: images, pdf/doc/docx/pptx, and common plain-text/code/config files.\n'
+        '- Default to the current turn (marked 当前轮次) when the user says '
+        '"this image / 这张图 / 这个文件" without naming a turn.\n'
+        '- For uploaded whitelist documents, prefer `kb_tmp_search` then `read_file`. '
+        'For knowledge-base questions about indexed documents, use `kb_*` tools.',
+    ),
+}
+ATTACHMENT_EDIT_TOOL_POLICY_APPENDIX: SystemPromptAppendix = {
+    'tool_policy': (
+        '- `string_replace`: safe transactional editing for plain-text attachments. You MUST first '
+        "call it with `action='preview'`, inspect every item in `matches` and the complete bounded "
+        "`diff`, and only then call `action='apply'` with the returned `preview_id`. Never apply when "
+        'the match locations or diff include unintended text. Literal mode supports multiline text '
+        'and treats LF/CRLF as equivalent. For patterns use `mode=regex`; DOTALL is opt-in via '
+        '`regex_flags`. `expected_replacements` is always enforced. Use `action=undo` to revert the '
+        'last applied edit. Repeated applies update one download artifact and continue from the current '
+        'draft; the original upload stays unchanged. Do not simulate edits with '
+        'read_user_attachment + save_chat_artifact.',
+    ),
+}
+ASK_USER_TOOL_POLICY_APPENDIX: SystemPromptAppendix = {
+    'tool_policy': (
+        '# User-response channel contract (mandatory)\n'
+        'When `ask_user` is available, every user-facing question or request for a reply MUST be an '
+        'actual `ask_user` function-tool call. Never put such a question or request in assistant prose. '
+        'If the user explicitly asks you to question or interview them, follow that instruction by '
+        'calling `ask_user`. This contract controls only the response channel; decide what and how much '
+        'to ask from the user’s request and the conversation.',
+    ),
+}
+ASK_USER_QUERY_APPENDIX = (
+    'ATTENTION — `ask_user` is registered for this turn. If you ask the user any question, request '
+    'their opinion, or invite any reply, you MUST make an actual `ask_user` function-tool call; NEVER '
+    'write that request as assistant prose. This rule applies to every kind of user-facing question or '
+    'reply request, including clarification, confirmation, opinion, open-ended questions, and optional '
+    'follow-ups. Exception: after you have already given the substantive answer to the user request, '
+    'do NOT call `ask_user` merely to offer optional next steps or say what the user can ask for next; '
+    'write that brief follow-up in assistant prose instead.'
+)
+SESSION_ENV_TOOL_POLICY_APPENDIX: SystemPromptAppendix = {
+    'tool_policy': (
+        '# Session environment for skills (this conversation only)\n'
+        '`set_session_env` stores variables for THIS conversation only. Other conversations, '
+        'including a newly opened chat, cannot read them.\n'
+        'When a skill or `run_script` fails, use `missing_env` in the tool result when present '
+        'as the names to collect. If `missing_env` is absent, infer from stderr/stdout. Always '
+        'attempt the skill first; do not wait for credentials before the first run.\n'
+        'When a skill or `run_script` fails because an API key, token, or environment variable '
+        'is missing:\n'
+        '1. If this turn already includes the name and value (including a proactive `NAME=value` '
+        'or `NAME: value`), call `set_session_env` then immediately retry the same skill/`run_script`.\n'
+        '2. Otherwise, if `ask_user` is available, call it once with `type=text` asking only for '
+        'the missing variable(s). Name the exact env var in the question text. State that it applies '
+        'only to this conversation. Never ask for credentials in assistant prose.\n'
+        '3. After the user answers, call `set_session_env` then immediately retry. Do not ask the '
+        'user to restart the service or start a new chat.\n'
+        'The user may also proactively ask you to set a variable. Call `set_session_env` then continue '
+        'the original task.\n'
+        'Never echo secret values in the final answer.'
+    ),
+}
+SESSION_ENV_QUERY_APPENDIX = (
+    'ATTENTION — if this turn supplies an environment variable name and value (an `ask_user` '
+    'credential answer, a proactive `NAME=value` / `NAME: value`, or an explicit request to '
+    'configure a key), call `set_session_env` first for each provided variable, then immediately '
+    'retry the interrupted skill/`run_script` and continue the original task. Do not ask the user '
+    'to restart. These values apply only to this conversation. Never echo the secret value.'
+)
+KNOWLEDGE_SEARCH_TOOL_POLICY_APPENDIX: SystemPromptAppendix = {
+    'tool_policy': (
+        "# Selected Knowledge Base Rules (CRITICAL — follow strictly)\n"
+        "In Chinese, ‘资料库’ is an alias of ‘知识库’; both mean knowledge base. "
+        "The user selected or @mentioned one or more knowledge bases in this request. "
+        "This is an explicit instruction to search them, not merely permission to do so. "
+        "Concrete methods such as `KBToolkit_kb_search` and `KBToolkit_kb_keyword_search` "
+        "are available, so call the appropriate search method directly. "
+        "Your first substantive action for the turn MUST be one of those searches. Do not answer "
+        "from memory, announce that you could search later, ask whether you should search, or start "
+        "a workflow before searching. Use the knowledge-base search method FIRST for every retrieval "
+        "need — no exceptions. Do not skip it because you think the web might have "
+        "better information, or because the topic seems general, popular, or common "
+        "knowledge. The knowledge base is your primary evidence source.\n\n"
+        "Only after the knowledge-base search returns zero results or explicitly irrelevant results "
+        "may you fall back to provider-specific search tools. "
+        "You MUST NOT use any non-knowledge-base retrieval tool before trying knowledge-base tools.\n\n"
+        "**Keyword search vs semantic search — which one to use:**\n"
+        "When the user mentions a specific document name (e.g., 'xxx.pdf', 'report.docx', "
+        "'slides.pptx') and asks about particular terms, phrases, or content within that "
+        "document, prefer `kb_keyword_search` with `target=<document name>`, "
+        "`target_type='file_name'`, and `keyword=<specific terms>`. This is faster and more precise "
+        "for document-scoped exact matching.\n"
+        "For `keyword`, extract the core term(s) the user is asking about (e.g., a single "
+        "word or short phrase like 'file1' or 'Redis timeout'), not the entire query "
+        "sentence. If the first attempt returns zero results, try a shorter or alternative "
+        "keyword before considering fallback.\n"
+        "When the keyword search returns results, answer directly from them — do not "
+        "follow up with semantic search unless the returned content is clearly irrelevant "
+        "or empty.\n"
+        "Use semantic search only for open-ended queries where no specific document "
+        "is named. If keyword search returns zero results after trying alternative "
+        "keywords, fall back to semantic search.\n\n"
+        "When the user gives a concrete URL or asks you to inspect a specific page, "
+        "still try the knowledge-base search first; use `url_fetch` only when the knowledge base has "
+        "no relevant result.\n\n"
+        "For papers, research topics, arXiv ids, abstracts, or author-related questions, "
+        "still try the knowledge-base search first; after knowledge-base evidence is unavailable or "
+        "insufficient, prefer `AcademicSearchToolkit` over general web search tools.\n"
+    ),
+}
+DOCUMENT_PREVIEW_CHAT_TOOL_POLICY_APPENDIX: SystemPromptAppendix = {
+    'tool_policy': (
+        '# Document Preview Chat Rules\n'
+        'This conversation is embedded in a knowledge-base document preview. The knowledge-base '
+        'filter identifies the open document; unlike an explicit knowledge-base selection in the '
+        'main Chat, it does not require a search on every turn. When the user selected text, for a '
+        'request that directly transforms, '
+        'translates, explains, defines, summarizes, or rewrites that selection, use the supplied '
+        'Selected text and Surrounding passage directly. Do not call a knowledge-base search tool '
+        'for such a request. The selected text is the operation target; the surrounding passage is '
+        'context only. Search the selected document only when the user explicitly asks for other '
+        'occurrences, broader document context, verification against the document, or information '
+        'that is not present in the supplied passage.'
+    ),
+}
+WEB_SEARCH_TOOL_POLICY_APPENDIX: SystemPromptAppendix = {
+    'tool_policy': (
+        '# Web Search Tool Rules\n'
+        'Use the injected current user date as the time reference; never guess the current year. '
+        'Unless the user specifies a time range, historical period, cutoff date, or version, '
+        'prefer the latest information that remains valid as of that date. Explicit user time '
+        'and version requirements take precedence. Choose a time range appropriate to the topic; '
+        'do not impose a fixed recent window or mechanically append today to every query. '
+        'Use only time-filter parameters supported by the available search tool; when useful, '
+        'include a year or date range in the query. Stable knowledge may use older authoritative '
+        'sources that remain valid. Distinguish publication dates, event dates, and applicable '
+        'versions; verify important facts in the page body rather than treating a recent repost '
+        'as a new event. If a default recent search provides insufficient evidence, gradually '
+        'widen the range without crossing explicit user time boundaries. When freshness cannot '
+        'be verified, state the evidence cutoff or uncertainty.\n'
+        'When using `web_search`, the `query` must represent one search intent. '
+        'If the user asks to search multiple unrelated keywords or topics, call '
+        '`web_search` separately for each keyword/topic. Do not combine unrelated '
+        'terms into one `query` with spaces, commas, punctuation, or list-like text.\n'
+        'A search snippet may support a lightweight claim. For important facts or page details that the snippet '
+        'does not contain, call `url_fetch` with that result URL and cite the returned ref. For Tavily image tasks, '
+        'use `include_images=True`; use `include_raw_content=True` only when the extra page text is needed.',
+    ),
+    'output_contract': RETRIEVAL_CITATION_OUTPUT_APPENDIX['output_contract'],
+}
+URL_FETCH_TOOL_POLICY_APPENDIX: SystemPromptAppendix = {
+    'tool_policy': (
+        '# Web Page Fetch Rules\n'
+        'Use only a URL supplied by the user or returned by a tool. To follow a fetched page link, call '
+        '`url_fetch(url=...)` again using the exact `target_url`; never invent or rewrite the URL. To inspect multiple '
+        'pages, issue multiple url_fetch calls in the same tool-call turn so they can execute concurrently. '
+        'Listed links are navigation candidates, not read or citable sources. '
+        'When `content_truncated=true`, treat the page text as incomplete and do not conclude that omitted content '
+        'is absent. When the URL is a PDF, url_fetch ingests it as a file resource and returns file_id; '
+        'read the document with grep then read_file(offset, limit), never from url_fetch page text.',
+    ),
+    'output_contract': RETRIEVAL_CITATION_OUTPUT_APPENDIX['output_contract'],
+}
+MEMORY_TOOLS_POLICY_APPENDIX: SystemPromptAppendix = {
+    'tool_policy': (
+        '# Conversation history versus persistent memory\n'
+        'Conversation history is already included in the model messages and is the authoritative '
+        'source for earlier turns in the current chat. Resolve short follow-ups and omitted subjects '
+        'from that history. Persistent memory (soul / profile / preference index) is injected when '
+        'available; use `MemoryTools_read_memory` when the exact current YAML document must be '
+        'checked, and use `MemoryTools_read_memory_reference` only for preference reference details '
+        'that are not covered by the injected summaries. Batch all Soul changes into one '
+        '`MemoryTools_soul_editor` call and all Profile changes into one '
+        '`MemoryTools_profile_editor` call; never emit parallel calls to either editor. Use '
+        '`MemoryTools_preference_editor` conservatively: do not save fragmented remarks, one-off '
+        'requests, temporary task details, or casual statements. Objective user facts belong in '
+        'Profile when a matching field exists, not in Preference.',
+        'Call `MemoryTools_episode_create` only when the user explicitly asks to record, remember, '
+        'or save a historical event. Do not call it merely because information seems useful. '
+        'use_memory=false does not disable explicit Episode creation. Never claim that information '
+        'was saved unless `MemoryTools_episode_create` or a structured memory editor '
+        '(`soul_editor` / `profile_editor` / `preference_editor`) succeeded in the current turn. '
+        'If `MemoryTools_preference_editor` reports `preference_organizing`, say that the requested '
+        'preference change was not saved because maintenance is in progress. Never claim or imply '
+        'that the write was queued, retried, evicted, or replaced automatically.',
+    ),
+}
+CLOUD_DOCUMENT_TOOL_POLICY_APPENDIX: SystemPromptAppendix = {
+    'tool_policy': (
+        '# Cloud document link rules\n'
+        'When the user provides a Feishu/Lark document URL, use the Feishu file-system tools '
+        'to resolve the link and read the document before summarizing or analyzing it.\n'
+        'When the user provides a Notion URL (`notion.so`, `notion.site`, `notion.com`, or '
+        '`app.notion.com`), use the Notion file-system tools first. Prefer resolving the '
+        'link, then reading with references when the task asks for analysis, summary, or '
+        'linked-page context. Do not fall back to generic URL fetching for private Notion '
+        'pages unless Notion tools are unavailable or unauthorized.\n'
+        'When the user provides a Google Drive or Google Workspace document URL '
+        '(`drive.google.com` or `docs.google.com`), use the Google Drive file-system tools '
+        'instead of generic URL fetching.',
+    ),
+}
+MAIL_TOOL_POLICY_APPENDIX: SystemPromptAppendix = {
+    'tool_policy': (
+        '# Mailbox rules\n'
+        'Use MailToolkit for every NetEase, Tencent, and Gmail account whose chat switch is on. '
+        'Multiple mailboxes can be enabled at once. Search with keyword/from/to/subject/time '
+        'filters (optionally mailbox=email or provider), then read a message or thread '
+        'before citing it. Search hits include mailbox/provider; pass mailbox when reading '
+        'or composing if more than one account is enabled. Attachments can be read into '
+        'the conversation as task input. '
+        'compose_draft creates a preview and never sends. If the user did not name a '
+        'sending mailbox and more than one account is enabled, compose_draft shows a '
+        'mailbox picker of connected chat-enabled accounts; after mail_mailbox_confirm, '
+        'call update_draft with that mailbox so the send preview appears. '
+        'Use update_draft to change an '
+        'existing unsent draft (this increments revision). send_draft may run only after '
+        'the user confirms that preview in this turn (`mail_draft_confirm_id` plus the '
+        'matching `mail_draft_confirm_revision`). '
+        'Do not call ask_user to collect send authorization; the draft card is the only '
+        'confirmation UI. Never send mail automatically, never forward, and never delete, '
+        'archive, or mark messages. If authorization expired, tell the user to reconnect at '
+        '资源库 → 云文档 → 邮箱连接.',
+    ),
+}
+
+
+@dataclass
+class ToolConfig:
+    name: str
+    label: str
+    description: str
+    tool: Any
+    module: str
+    label_en: str = ''
+    description_en: str = ''
+    model_role: str | None = None
+    capability_id: str = ''
+    equivalence_scope: str = 'infrastructure'
+    provider_id: str = ''
+    product_id: str = ''
+    input_schema: dict[str, Any] | None = None
+    output_schema: dict[str, Any] | None = None
+    required_config: list[str] | None = None
+    appendix_system_prompt: SystemPromptAppendix | SystemPromptAppendixProvider | None = None
+    appendix_query: str | QueryAppendixProvider | None = None
+    appendix_query_position: QueryAppendixPosition = 'after'
+
+    def __post_init__(self) -> None:
+        if not callable(self.appendix_system_prompt):
+            self._validate_appendix(self.appendix_system_prompt)
+        if self.appendix_query is not None and not (
+            isinstance(self.appendix_query, str) or callable(self.appendix_query)
+        ):
+            raise TypeError('appendix_query must be a string, callable, or None')
+        if self.appendix_query_position not in ('before', 'after'):
+            raise ValueError('appendix_query_position must be "before" or "after"')
+
+    @staticmethod
+    def _validate_appendix(appendix: SystemPromptAppendix | None) -> None:
+        for section, values in (appendix or {}).items():
+            if section not in SYSTEM_PROMPT_APPENDIX_SECTIONS:
+                raise ValueError(
+                    f'unsupported appendix_system_prompt section {section!r}; '
+                    f'expected one of {SYSTEM_PROMPT_APPENDIX_SECTIONS}'
+                )
+            entries = (values,) if isinstance(values, str) else values
+            if not isinstance(entries, tuple) or not all(isinstance(item, str) for item in entries):
+                raise TypeError(
+                    'appendix_system_prompt values must be a string or tuple of strings'
+                )
+
+
+_WEB_SEARCH_ENGINE_INSTANCES: list = [
+    GoogleSearch(),
+    BingSearch(),
+    BochaSearch(),
+    TavilySearch(),
+]
+
+_ACADEMIC_SEARCH_ENGINE_INSTANCES: list = [
+    SciverseSearch(),
+    ArxivSearch(skip_auth=True),
+]
+
+
+class WikipediaToolkit(WikipediaSearch):
+    """Search stable encyclopedic background and named entries in Wikipedia.
+
+    Use this for established concepts, people, places, organizations, and historical topics.
+    It is not a general web search engine and should not be used for current events, recent product
+    information, recommendations, industry developments, or broad open-web research.
+    """
+
+
+_CLOUD_FILE_TOOLKIT = {
+    'name': 'CloudFileToolkit',
+    'desc': (
+        'Authenticated cloud files and documents. Use this Toolkit for Feishu/Lark '
+        'Wiki or Docs links (including *.feishu.cn/wiki/*), Notion links, Google Drive '
+        'and Google Workspace document links, and paths '
+        'inside connected cloud services; do not send those URLs to url_fetch. '
+        'Expand this Toolkit, choose the supplier that owns the URL or path, then '
+        'expand that supplier Toolkit and select its resolve, read, search, browse, '
+        'or write tool. For a Feishu Wiki URL, keep the complete URL as the locator: '
+        'the token after /wiki/ identifies a wiki node and is not a space_id or document_id.'
+    ),
+    'tools': [
+        FeishuFS(space_id='dynamic', dynamic_auth=True),
+        NotionFS(dynamic_auth=True),
+        GoogleDriveFS(dynamic_auth=True),
+    ],
+    'lazy': True,
+    'auto_activate': [
+        r'https?://[^\s/]+\.(?:feishu\.(?:cn|com)|larksuite\.com)(?:[/:?#]|$)',
+        r'https?://(?:[^\s/]+\.)?notion\.(?:so|site|com)(?:[/:?#]|$)',
+        r'https?://(?:drive|docs)\.google\.com(?:[/:?#]|$)',
+        r'飞书|(?<!\w)feishu(?!\w)',
+        r'谷歌云端硬盘|谷歌(?:文档|表格|幻灯片)|Google\s*云端硬盘',
+        r'(?<!\w)google\s+(?:drive|docs|sheets|slides)(?!\w)',
+    ],
+}
+
+
+def _temp_kb_key_source() -> Any:
+    agentic_config = lazyllm.globals.get('agentic_config') or {}
+    return agentic_config.get('files')
+
+
+def _kb_prompt_appendix() -> SystemPromptAppendix:
+    appendix: SystemPromptAppendix = {
+        'output_contract': (
+            *IMAGE_MARKDOWN_OUTPUT_APPENDIX['output_contract'],
+            *RETRIEVAL_CITATION_OUTPUT_APPENDIX['output_contract'],
+        ),
+    }
+    agentic_config = lazyllm.globals.get('agentic_config') or {}
+    if (agentic_config.get('filters') or {}).get('kb_id'):
+        policy = (
+            DOCUMENT_PREVIEW_CHAT_TOOL_POLICY_APPENDIX
+            if agentic_config.get('document_preview_chat')
+            else KNOWLEDGE_SEARCH_TOOL_POLICY_APPENDIX
+        )
+        appendix['tool_policy'] = policy['tool_policy']
+    return appendix
+
+
+SKILL_TOOL_CONFIG = ToolConfig(
+    name='skill',
+    label='技能工具',
+    description='利用已安装的技能进行查询、读文件、执行脚本',
+    tool=None,
+    module='personalization',
+    label_en='Skills',
+    description_en='Use installed skills to search, read files, and run scripts.',
+)
+
+ASK_USER_TOOL_CONFIG = ToolConfig(
+    name='ask_user',
+    label='向用户提问',
+    description='通过结构化交互卡片向用户澄清或确认信息',
+    tool=ask_user,
+    module='interaction',
+    appendix_system_prompt=ASK_USER_TOOL_POLICY_APPENDIX,
+    appendix_query=ASK_USER_QUERY_APPENDIX,
+)
+
+
+def build_session_env_tool_config(
+    conversation_env_store: dict[str, dict[str, str]],
+    conversation_id: str,
+) -> ToolConfig:
+    return ToolConfig(
+        name='set_session_env',
+        label='会话环境变量',
+        description='为当前对话临时配置 skill 脚本所需环境变量，并立即对 run_script 生效',
+        tool=build_session_env_tool(conversation_env_store, conversation_id),
+        module='execution',
+        label_en='Session Environment',
+        description_en='Temporarily configure environment variables for skill scripts in this conversation.',
+        appendix_system_prompt=SESSION_ENV_TOOL_POLICY_APPENDIX,
+        appendix_query=SESSION_ENV_QUERY_APPENDIX,
+    )
+
+USER_ATTACHMENT_TOOL_CONFIGS = (
+    ToolConfig(
+        name='read_user_attachment',
+        label='读取用户附件',
+        description='按需提取用户附件内容',
+        tool=read_user_attachment,
+        module='attachment',
+        appendix_system_prompt=ATTACHED_FILES_TOOL_POLICY_APPENDIX,
+    ),
+    ToolConfig(
+        name='find_user_attachment',
+        label='查找用户附件',
+        description='查找用户附件路径而不解析内容',
+        tool=find_user_attachment,
+        module='attachment',
+        appendix_system_prompt={
+            'tool_policy': ATTACHED_FILES_TOOL_POLICY_APPENDIX['tool_policy'],
+            'output_contract': IMAGE_MARKDOWN_OUTPUT_APPENDIX['output_contract'],
+        },
+    ),
+)
+
+ATTACHMENT_EDIT_TOOL_CONFIG = ToolConfig(
+    name='string_replace',
+    label='替换附件文本',
+    description='预览、提交或撤销纯文本附件的多行/正则局部替换，并维护单一下载副本',
+    tool=string_replace,
+    module='attachment',
+    appendix_system_prompt=ATTACHMENT_EDIT_TOOL_POLICY_APPENDIX,
+)
+
+DEFAULT_TOOLS: list[ToolConfig] = [
+    ToolConfig(
+        name='kb',
+        label='知识库',
+        description='发现知识库、查询文档与统计，并进行语义、关键词和上下文检索',
+        tool=KBToolkit(), module='retrieval',
+        label_en='Knowledge Base',
+        description_en='Discover knowledge bases, inspect documents and statistics, and retrieve their content.',
+        capability_id='knowledge_base_search',
+        input_schema={'query': 'string'}, output_schema={'results': 'list'}, required_config=['knowledge_base'],
+        appendix_system_prompt=_kb_prompt_appendix,
+    ),
+    ToolConfig(
+        name='temp_kb',
+        label='临时文件检索',
+        description='从用户上传的临时文件中搜索相关内容',
+        tool=(
+            kb_tmp_search,
+            _temp_kb_key_source,
+        ), module='retrieval',
+        label_en='Temporary File Search',
+        description_en='Search relevant content in temporary files uploaded by the user.',
+        appendix_system_prompt={
+            'output_contract': RETRIEVAL_CITATION_OUTPUT_APPENDIX['output_contract'],
+        },
+    ),
+    ToolConfig(
+        name='data_sources', label='数据源查询',
+        description='仅查询已配置的数据源提供方；不用于查询可用工具或通用能力',
+        tool=list_data_sources, module='data', label_en='Data Sources',
+        description_en=(
+            'List configured data-source providers only; not a catalog of '
+            'available tools or general capabilities.'
+        ),
+    ),
+    ToolConfig(
+        name='external_db',
+        label='外部数据库查询',
+        description='只读查看已配置外部数据库 schema，并执行只读 SELECT/WITH 查询',
+        tool=ExternalDatabaseToolkit(), module='data',
+        label_en='External Database Query',
+        description_en='Inspect configured external database schemas and run read-only SELECT or WITH queries.',
+    ),
+    ToolConfig(
+        name='writer_create', label='AI 写作',
+        description='基于统一 Writer IR 从资料画像和大纲构建章节草稿与最终成稿',
+        tool=WriterCreateToolkit(), module='content', label_en='AI Writing',
+        description_en='Create structured long-form writing with the unified Writer IR.',
+        capability_id='writer.create',
+    ),
+    ToolConfig(
+        name='writer_revision', label='AI 修订', description='基于 Writer IR 结构化定位、规划和修改已有文档',
+        tool=WriterRevisionToolkit(), module='content', label_en='AI Revision',
+        description_en='Revise WriterDocument artifacts through a validated patch workflow.',
+        capability_id='writer.revise',
+    ),
+    ToolConfig(
+        name='calculator',
+        label='科学计算器',
+        description='安全地执行数学表达式计算',
+        tool=calculator, module='utility',
+        label_en='Scientific Calculator',
+        description_en='Safely evaluate mathematical expressions.',
+    ),
+    ToolConfig(
+        name='wikipedia',
+        label='Wikipedia 搜索',
+        description='查询 Wikipedia 中稳定的百科背景和明确词条；不用于新闻、时效信息或开放网页搜索',
+        tool=WikipediaToolkit(skip_auth=True), module='retrieval',
+        label_en='Wikipedia Search',
+        description_en=(
+            'Look up stable encyclopedic background and named Wikipedia entries; not for news, '
+            'current information, or open-web search.'
+        ),
+        appendix_system_prompt=EXTERNAL_SEARCH_CONTENT_APPENDIX,
+    ),
+    ToolConfig(
+        name='web_search',
+        label='网页搜索',
+        description='使用搜索引擎检索互联网内容，自动选择可用的搜索服务',
+        tool={
+            'name': 'WebSearchToolkit',
+            'desc': (
+                'Search the open web for current information, news, products, companies, '
+                'recommendations, industry developments, and broad research using the first '
+                'available provider. Each search query must represent '
+                'one search intent; issue separate calls for unrelated topics. Use url_fetch on a '
+                'result URL when its snippet is insufficient.'
+            ),
+            'pick_first_valid': True,
+            'tools': _WEB_SEARCH_ENGINE_INSTANCES,
+        },
+        module='retrieval',
+        label_en='Web Search',
+        description_en=(
+            'Search the open internet for current information and broad research using the first '
+            'available search provider.'
+        ),
+        capability_id='web_search',
+        equivalence_scope='provider_bound',
+        input_schema={'query': 'string'}, output_schema={'results': 'list'}, required_config=['search_provider'],
+        appendix_system_prompt=WEB_SEARCH_TOOL_POLICY_APPENDIX,
+    ),
+    ToolConfig(
+        name='academic_search',
+        label='学术搜索',
+        description='搜索学术论文和科学文献，自动选择可用的学术搜索服务',
+        tool={
+            'name': 'AcademicSearchToolkit',
+            'desc': (
+                'Search papers, authors, abstracts, and scholarly metadata with the first available '
+                'provider. Use this instead of general web search for academic questions, and fetch '
+                'content only after identifying the relevant paper.'
+            ),
+            'pick_first_valid': True,
+            'tools': _ACADEMIC_SEARCH_ENGINE_INSTANCES,
+        },
+        module='retrieval',
+        label_en='Academic Search',
+        description_en='Search academic papers and scientific literature using the first available provider.',
+        capability_id='academic_search',
+        equivalence_scope='provider_bound',
+        input_schema={'query': 'string'}, output_schema={'papers': 'list'}, required_config=['academic_search_provider'],
+        appendix_system_prompt=EXTERNAL_SEARCH_CONTENT_APPENDIX,
+    ),
+    ToolConfig(
+        name='url_fetch',
+        label='网页抓取',
+        description='获取并解析公开网页的可读内容',
+        tool=url_fetch, module='retrieval',
+        label_en='Web Page Fetch',
+        description_en='Fetch and parse readable content from public web pages.',
+        appendix_system_prompt=URL_FETCH_TOOL_POLICY_APPENDIX,
+    ),
+    ToolConfig(
+        name='multimodal',
+        label='多模态识别',
+        description='从图片中提取文字描述',
+        tool=vision_extractor, module='content',
+        label_en='Multimodal Recognition',
+        description_en='Extract text descriptions from images.',
+        model_role='vlm',
+    ),
+    ToolConfig(
+        name='image_generator',
+        label='文生图',
+        description='根据文字描述生成图片',
+        tool=image_generator, module='content',
+        label_en='Image Generation',
+        description_en='Generate images from text descriptions.',
+        model_role='image_generator',
+        capability_id='image_generation',
+        input_schema={'prompt': 'string'}, output_schema={'image': 'file'}, required_config=['image_generator_model'],
+        appendix_system_prompt=IMAGE_GENERATION_PROMPT_APPENDIX,
+    ),
+    ToolConfig(
+        name='image_editor',
+        label='图编辑',
+        description='根据文字指令编辑参考图片',
+        tool=image_editor, module='content',
+        label_en='Image Editing',
+        description_en='Edit reference images using text instructions.',
+        model_role='image_editor',
+        capability_id='image_editing',
+        appendix_system_prompt=IMAGE_GENERATION_PROMPT_APPENDIX,
+    ),
+    ToolConfig(
+        name='video_generator',
+        label='文生视频',
+        label_en='Video Generator',
+        description='根据已配置模型的能力生成视频，支持情况可能包括纯文本、首帧、首尾帧或多参考图；同轮多次调用并行，视频侧最多同时3路',
+        description_en=(
+            'Generate video using the configured model capability: text-only, first frame, '
+            'first/last frames, or multiple references when supported.'
+        ),
+        tool=video_generator, module='content',
+        model_role='video_generator',
+        capability_id='video_generation',
+        input_schema={'prompt': 'string'}, output_schema={'video': 'file'},
+        required_config=['video_generator_model'],
+        appendix_system_prompt=_video_generator_prompt_appendix,
+    ),
+    ToolConfig(
+        name='video_to_gif',
+        label='视频转GIF',
+        label_en='GIF Converter',
+        description='将本地视频转换为 GIF 动图；同轮多次调用并行，GIF 侧最多同时3路',
+        description_en='Convert local videos to GIF animations.',
+        tool=video_to_gif, module='content',
+        capability_id='video_to_gif',
+        input_schema={'url': 'string'}, output_schema={'image': 'file'},
+        appendix_system_prompt=IMAGE_MARKDOWN_OUTPUT_APPENDIX,
+    ),
+    ToolConfig(
+        name='vocab_learn',
+        label='词汇学习',
+        description='学习用户专属的词汇映射和同义词',
+        tool=vocab_learn, module='personalization',
+        label_en='Vocabulary Learning',
+        description_en='Learn user-specific vocabulary mappings and synonyms.',
+    ),
+    ToolConfig(
+        name='memory',
+        label='记忆',
+        description='读取跨会话记忆，编辑 soul/profile/preference，并记录不可变历史事件',
+        tool=MemoryTools(), module='personalization',
+        label_en='Memory',
+        description_en=(
+            'Read cross-conversation memory, edit soul/profile/preference, '
+            'and record immutable historical events.'
+        ),
+        appendix_system_prompt=MEMORY_TOOLS_POLICY_APPENDIX,
+    ),
+    ToolConfig(
+        name='skill_editor',
+        label='技能编辑',
+        description='创建、修改和删除技能',
+        tool=SkillManagementToolkit(), module='personalization',
+        label_en='Skill Editing',
+        description_en='Create, update, and delete skills.',
+    ),
+    ToolConfig(
+        name='local_fs',
+        label='本地文件',
+        description='在配置的本地路径内进行 glob 匹配、grep 搜索、文件读取和精确文本替换',
+        tool=LocalFileToolkit(), module='data',
+        label_en='Local Files',
+        description_en='Glob, grep, read, and perform exact text replacements within configured local paths.',
+    ),
+    ToolConfig(
+        name='cloud_files', label='云文件', description='浏览、搜索和管理已连接的云文件系统',
+        tool=_CLOUD_FILE_TOOLKIT,
+        module='data', label_en='Cloud Files',
+        description_en='Read and manage authenticated Feishu Wiki, Feishu Docs, Notion, and other cloud files.',
+        appendix_system_prompt=CLOUD_DOCUMENT_TOOL_POLICY_APPENDIX,
+    ),
+    ToolConfig(
+        name='mail',
+        label='邮箱',
+        description='检索、阅读和引用已开启的网易 / 腾讯 / Gmail 邮件，并在用户确认后发送草稿',
+        tool=MailToolkit(),
+        module='data',
+        label_en='Mail',
+        description_en='Search, read, and cite enabled NetEase, Tencent, and Gmail mailboxes, and send drafts after confirmation.',
+        appendix_system_prompt=MAIL_TOOL_POLICY_APPENDIX,
+    ),
+    ToolConfig(
+        name='schedule', label='定时任务', description='创建、查询、修改、取消和立即触发定时任务',
+        tool=build_schedule_toolkit(), module='execution', label_en='Schedules',
+        description_en='Create, inspect, update, cancel, and trigger recurring schedules.',
+    ),
+]
+
+
+def _tool_summary(tool: Any) -> str:
+    try:
+        doc = inspect.getdoc(tool)
+        return docstring_parser.parse(doc).short_description if doc else ''
+    except Exception:
+        return ''
+
+
+def _extract_methods(instance: Any) -> list[dict]:
+    if isinstance(instance, dict):
+        return _extract_group_methods(instance.get('tools', []))
+    public_apis = getattr(instance, '__public_apis__', None)
+    if public_apis is not None:
+        methods = []
+        for method_name in public_apis:
+            resolved_name = instance.__class__.__name__ if method_name == '__call__' else method_name
+            method = getattr(instance, method_name, None)
+            methods.append({'name': resolved_name, 'summary': _tool_summary(method) if method else ''})
+        return methods
+
+    if callable(instance):
+        name = getattr(instance, '__name__', '')
+        return [{'name': name, 'summary': _tool_summary(instance)}]
+
+    return []
+
+
+def _extract_group_methods(instances: list) -> list[dict]:
+    methods = []
+    for inst in instances:
+        target = getattr(inst, 'provider', inst)
+        methods.append({
+            'name': target.__class__.__name__,
+            'summary': _tool_summary(target),
+            'active': _instance_is_active(target),
+        })
+    return methods
+
+
+_SKILL_METHODS = [
+    {'name': 'get_skill', 'summary': 'Get the full usage for a skill (SKILL.md).'},
+    {'name': 'read_reference', 'summary': 'Read a reference file within a skill directory.'},
+    {'name': 'run_script', 'summary': 'Run a script within a skill directory.'},
+]
+
+
+def _instance_is_active(instance: Any) -> bool:
+    instance = getattr(instance, 'provider', instance)
+    key_source = getattr(instance, '__key_source__', None)
+    if key_source is None:
+        return True
+    return _key_source_is_active(key_source)
+
+
+def _key_source_is_active(key_source: Callable[[], Any]) -> bool:
+    try:
+        return bool(key_source())
+    except Exception:
+        return False
+
+
+def _registration_target(tool: Any) -> Any:
+    if isinstance(tool, tuple) and len(tool) == 2:
+        return tool[0]
+    return tool
+
+
+def _registration_key_source(tool: Any) -> Callable[[], Any] | None:
+    if isinstance(tool, tuple) and len(tool) == 2 and callable(tool[1]):
+        return tool[1]
+    return None
+
+
+def tool_is_active(cfg: ToolConfig) -> bool:
+    if cfg.model_role and not is_model_role_available(cfg.model_role):
+        return False
+    key_source = _registration_key_source(cfg.tool)
+    if key_source and not _key_source_is_active(key_source):
+        return False
+    target = _registration_target(cfg.tool)
+    if target is None:
+        return True
+    if isinstance(target, dict):
+        return any(_instance_is_active(inst) for inst in target.get('tools', []))
+    return _instance_is_active(target)
+
+
+def normalize_tool_locale(locale: str | None) -> str:
+    for part in (locale or '').split(','):
+        tag = part.split(';', 1)[0].strip().lower()
+        if tag == 'zh' or tag.startswith('zh-'):
+            return 'zh-CN'
+        if tag == 'en' or tag.startswith('en-'):
+            return 'en-US'
+    return 'zh-CN'
+
+
+def get_all_tool_groups(locale: str | None = None) -> list[dict]:
+    use_english = normalize_tool_locale(locale) == 'en-US'
+    result = []
+    for cfg in DEFAULT_TOOLS:
+        result.append({
+            'name': cfg.name,
+            'label': cfg.label_en or cfg.label if use_english else cfg.label,
+            'description': cfg.description_en or cfg.description if use_english else cfg.description,
+            'methods': _extract_methods(_registration_target(cfg.tool)),
+            'can_disable': True,
+            'active': tool_is_active(cfg),
+            'module': cfg.module,
+            'capability_id': cfg.capability_id or cfg.name,
+            'equivalence_scope': cfg.equivalence_scope,
+            'provider_id': cfg.provider_id,
+            'product_id': cfg.product_id,
+            'input_schema': cfg.input_schema or {},
+            'output_schema': cfg.output_schema or {},
+            'required_config': cfg.required_config or [],
+        })
+    result.append({
+        'name': SKILL_TOOL_CONFIG.name,
+        'label': SKILL_TOOL_CONFIG.label_en or SKILL_TOOL_CONFIG.label if use_english else SKILL_TOOL_CONFIG.label,
+        'description': (
+            SKILL_TOOL_CONFIG.description_en or SKILL_TOOL_CONFIG.description
+            if use_english else SKILL_TOOL_CONFIG.description
+        ),
+        'methods': _SKILL_METHODS,
+        'can_disable': False,
+        'active': True,
+        'module': SKILL_TOOL_CONFIG.module,
+    })
+    return result
+
+
+_CAPABILITY_DENY_CUES = re.compile(
+    r'不要(?:使用|调用|查询|检索|搜索|启用|用)?|别(?:再)?(?:使用|调用|查询|检索|搜索|用)|'
+    r'不想(?:使用|调用|用)|不(?:使用|用)|无需|不能(?:用|使用)|'
+    r'禁止(?:使用|调用)|避免使用|排除|忽略|跳过|do\s+not\s+use|'
+    r'don[’\']t\s+use|never\s+use|without|exclude|ignore|avoid', re.I,
+)
+_CAPABILITY_ALLOW_CUES = re.compile(
+    r'可以(?:用|使用)|可(?:用|使用)|请(?:用|使用)|优先使用|允许使用|使用|调用|启用|'
+    r'can\s+use|may\s+use|please\s+use|use|enable', re.I,
+)
+_TOOL_CAPABILITY_TERMS: dict[str, tuple[str, ...]] = {
+    'kb': ('知识库', '资料库', 'knowledge base'),
+    'image_generator': (
+        '生成图片', '生成一张', '生成照片', '画一张', '绘图', '文生图',
+        'generate an image', 'generate a photo', 'create an image', 'draw a',
+    ),
+    'image_editor': (
+        '编辑图片', '修改图片', '改图', '图片编辑',
+        'edit an image', 'edit the image', 'modify the image',
+    ),
+    'video_generator': (
+        '生成视频', '文生视频', '做一个视频',
+        'generate a video', 'create a video',
+    ),
+}
+_TOOL_CAPABILITY_REQUEST_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
+    'video_generator': (
+        re.compile(
+            r'(?:生成|制作|创建|产出|帮我(?:生成|制作|创建|做)|'
+            r'给我(?:生成|制作|创建|做)|做一个|做一段).{0,48}(?:视频|短片|动画)',
+            re.I,
+        ),
+        re.compile(
+            r'\b(?:generate|create|make|produce)\b.{0,64}'
+            r'\b(?:video|clip|animation)\b',
+            re.I,
+        ),
+    ),
+}
+
+_ON_DEMAND_MODEL_TOOLS = frozenset({
+    'image_generator',
+    'image_editor',
+    'video_generator',
+})
+
+
+def _capability_matches(
+    query: str,
+    terms: tuple[str, ...],
+    patterns: tuple[re.Pattern[str], ...] = (),
+) -> list[tuple[int, int]]:
+    lowered = query.lower()
+    matches = [
+        match.span()
+        for term in terms
+        for match in re.finditer(re.escape(term.lower()), lowered)
+    ]
+    matches.extend(match.span() for pattern in patterns for match in pattern.finditer(query))
+    return matches
+
+
+def _capability_is_mentioned(
+    query: str,
+    terms: tuple[str, ...],
+    patterns: tuple[re.Pattern[str], ...] = (),
+) -> bool:
+    return bool(_capability_matches(query, terms, patterns))
+
+
+def _capability_is_denied(
+    query: str,
+    terms: tuple[str, ...],
+    patterns: tuple[re.Pattern[str], ...] = (),
+) -> bool:
+    """Return true only when every locally qualified occurrence is denied."""
+    decisions = []
+    for start, _end in _capability_matches(query, terms, patterns):
+        prefix = query[max(0, start - 40):start]
+        prefix = re.split(r'[，,。；;！？!?\n]|但是|不过|然而|但', prefix)[-1]
+        denies = list(_CAPABILITY_DENY_CUES.finditer(prefix))
+        allows = list(_CAPABILITY_ALLOW_CUES.finditer(prefix))
+        if denies or allows:
+            decisions.append(
+                bool(denies) and (not allows or denies[-1].end() >= allows[-1].end())
+            )
+    return bool(decisions) and all(decisions)
+
+
+def filter_tools(
+    configs: list[ToolConfig],
+    available_tools: list[str] | None = None,
+    user_query: str = '',
+) -> list[ToolConfig]:
+    result = []
+    for cfg in configs:
+        if available_tools is not None and cfg.name not in available_tools:
+            continue
+        terms = _TOOL_CAPABILITY_TERMS.get(cfg.name)
+        patterns = _TOOL_CAPABILITY_REQUEST_PATTERNS.get(cfg.name, ())
+        if terms and user_query and _capability_is_denied(user_query, terms, patterns):
+            continue
+        if not tool_is_active(cfg):
+            if not (
+                cfg.name in _ON_DEMAND_MODEL_TOOLS
+                and terms
+                and _capability_is_mentioned(user_query, terms, patterns)
+            ):
+                continue
+        result.append(cfg)
+    return result
+
+
+def apply_tool_supersession(tools: list[Any]) -> list[Any]:
+    """Hide lower-level tools replaced by an exposed orchestration tool.
+
+    A tool may declare ``__supersedes_tools__`` as an iterable of public tool
+    names.  Name matching also accepts the underscore-normalised form used by
+    MCP adapters.  Keeping this contract on the replacing tool avoids routing
+    policy that is coupled to any particular feature in ChatService.
+    """
+    superseded: set[str] = set()
+    for tool in tools:
+        for name in getattr(tool, '__supersedes_tools__', ()) or ():
+            normalized = str(name or '').strip()
+            if normalized:
+                superseded.add(normalized)
+                superseded.add(normalized.replace('.', '_'))
+    if not superseded:
+        return tools
+    return [
+        tool for tool in tools
+        if str(getattr(tool, '__name__', '') or '') not in superseded
+        or bool(getattr(tool, '__supersedes_tools__', ()))
+    ]
+
+
+def collect_system_prompt_appendices(
+    configs: list[ToolConfig],
+    extra_appendices: tuple[SystemPromptAppendix, ...] = (),
+) -> dict[str, list[str]]:
+    """Collect active tool prompt appendices with stable per-section deduplication."""
+    collected: dict[str, list[str]] = {}
+    seen: dict[str, set[str]] = {}
+    appendices = []
+    for cfg in configs:
+        provider = cfg.appendix_system_prompt
+        appendix = provider() if callable(provider) else provider
+        if appendix:
+            ToolConfig._validate_appendix(appendix)
+            appendices.append(appendix)
+    appendices.extend(extra_appendices)
+    for appendix in appendices:
+        for section, values in appendix.items():
+            entries = (values,) if isinstance(values, str) else values
+            for content in entries:
+                original = content.strip()
+                if not original:
+                    continue
+                dedupe_key = ' '.join(original.split())
+                section_seen = seen.setdefault(section, set())
+                if dedupe_key in section_seen:
+                    continue
+                section_seen.add(dedupe_key)
+                collected.setdefault(section, []).append(original)
+    return collected
+
+
+def collect_query_appendices(
+    configs: list[ToolConfig],
+    position: QueryAppendixPosition = 'after',
+) -> list[str]:
+    """Collect current-turn tool instructions without adding them to chat history."""
+    collected = []
+    seen = set()
+    for cfg in configs:
+        if cfg.appendix_query_position != position:
+            continue
+        provider = cfg.appendix_query
+        content = provider() if callable(provider) else provider
+        original = str(content or '').strip()
+        if not original:
+            continue
+        dedupe_key = ' '.join(original.split())
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        collected.append(original)
+    return collected

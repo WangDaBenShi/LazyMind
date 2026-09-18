@@ -1,0 +1,1604 @@
+package workflow
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"gopkg.in/yaml.v3"
+	"gorm.io/gorm"
+
+	"lazymind/core/algo"
+	"lazymind/core/asyncjob"
+	"lazymind/core/common/orm"
+	"lazymind/core/modelconfig"
+	"lazymind/core/store"
+	"lazymind/core/workflow/graphengine"
+)
+
+type generatedWorkflowSkeleton struct {
+	ID    string `yaml:"id"`
+	Name  string `yaml:"name"`
+	Slots []struct {
+		ID string `yaml:"id"`
+	} `yaml:"slots"`
+	Steps []struct {
+		ID    string `yaml:"id"`
+		Label string `yaml:"label"`
+	} `yaml:"steps"`
+}
+
+type workflowStepTabCandidate struct {
+	ID      string
+	Label   string
+	Outputs []string
+}
+
+func repairDiagnosticsPayload(items []repairDiagnostic) []map[string]any {
+	payload := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		encoded, _ := json.Marshal(item)
+		var diagnostic map[string]any
+		_ = json.Unmarshal(encoded, &diagnostic)
+		payload = append(payload, diagnostic)
+	}
+	return payload
+}
+
+const workflowDraftGenerateJobType = "workflow_draft_generate"
+const workflowDraftRepairJobType = "workflow_draft_repair"
+
+const (
+	generateStatusGenerating   = "generating"
+	generateStatusBriefDone    = "brief_done"
+	generateStatusSkeletonDone = "skeleton_done"
+	generateStatusStateDone    = "state_done"
+	generateStatusDone         = "done"
+	generateStatusFailed       = "failed"
+	generateStatusRepairing    = "repairing"
+	generateStatusAnalyzing    = "analyzing"
+	generateStatusNeedsConfirm = "needs_confirmation"
+	generateStatusRejected     = "rejected"
+)
+
+const (
+	generateErrInvalidPayload = "invalid_payload"
+	generateErrDraftNotFound  = "draft_not_found"
+	generateErrAlgoFailed     = "algo_failed"
+	generateErrSaveFailed     = "save_failed"
+	generateErrCanceled       = "generation_canceled"
+)
+
+var errWorkflowDraftGenerationCanceled = errors.New("workflow draft generation canceled")
+
+const (
+	generatePhaseDesignBrief     = "design_brief"
+	generatePhaseSkeleton        = "skeleton"
+	generatePhaseStateMachine    = "state_machine"
+	generatePhaseScenarioScripts = "scenario_scripts"
+)
+
+type workflowDraftGeneratePayload struct {
+	DraftID               string            `json:"draft_id"`
+	Name                  string            `json:"name"`
+	Description           string            `json:"description,omitempty"`
+	StartPhase            string            `json:"start_phase,omitempty"`
+	SkillContent          string            `json:"skill_content,omitempty"`
+	SkillPackage          map[string]any    `json:"skill_package,omitempty"`
+	SourceSkillRevisionID string            `json:"source_skill_revision_id,omitempty"`
+	SelectedCandidateJSON string            `json:"selected_candidate_json,omitempty"`
+	ReusableScripts       map[string]string `json:"reusable_scripts,omitempty"`
+	UserID                string            `json:"user_id"`
+}
+
+type workflowDraftRepairPayload struct {
+	DraftID      string           `json:"draft_id"`
+	UserID       string           `json:"user_id"`
+	Target       string           `json:"target"`      // 'statemachine' | 'ui' | 'scenario'
+	RepairHint   string           `json:"repair_hint"` // optional
+	Warnings     []string         `json:"warnings,omitempty"`
+	Diagnostics  []map[string]any `json:"diagnostics,omitempty"`
+	PrevStatus   string           `json:"prev_status"`
+	LLMConfig    map[string]any   `json:"llm_config,omitempty"`
+	DraftVersion int              `json:"draft_version"`
+	Mode         string           `json:"mode,omitempty"`
+	RepairRunID  string           `json:"repair_run_id,omitempty"`
+}
+
+// RegisterWorkflowDraftGenerateJob registers the async job handler.
+// Call this once at startup (e.g. from main.go).
+func RegisterWorkflowDraftGenerateJob() {
+	asyncjob.Register(workflowDraftGenerateJobType, handleWorkflowDraftGenerateJob)
+	asyncjob.Register(workflowDraftRepairJobType, handleWorkflowDraftRepairJob)
+}
+
+func handleWorkflowDraftGenerateJob(ctx context.Context, job asyncjob.Job, reporter asyncjob.Reporter) (asyncjob.Result, error) {
+	var payload workflowDraftGeneratePayload
+	if err := json.Unmarshal(job.PayloadJSON, &payload); err != nil {
+		return asyncjob.Result{ErrorCode: generateErrInvalidPayload}, fmt.Errorf("decode payload: %w", err)
+	}
+
+	db := store.DB()
+	if db == nil {
+		return asyncjob.Result{ErrorCode: generateErrDraftNotFound}, fmt.Errorf("store not initialised")
+	}
+	var draft orm.WorkflowDraft
+	if err := db.WithContext(ctx).Where("id = ? AND created_by = ? AND deleted_at IS NULL", payload.DraftID, payload.UserID).First(&draft).Error; err != nil {
+		return asyncjob.Result{ErrorCode: generateErrDraftNotFound}, fmt.Errorf("draft not found: %w", err)
+	}
+	if err := ensureGenerateJobActive(ctx, db, job); err != nil {
+		return asyncjob.Result{ErrorCode: generateErrCanceled}, err
+	}
+
+	progressTotal := int64(4)
+	if strings.TrimSpace(draft.GenerateStatus) == generateStatusDone {
+		reportGenerateProgress(reporter, progressTotal, progressTotal)
+		return asyncjob.Result{}, nil
+	}
+
+	startPhase := normalizeGenerateStartPhase(payload.StartPhase)
+	if job.AttemptCount > 1 {
+		startPhase = bestGenerateResumePhase(draft, startPhase)
+	}
+	if err := validateGenerateResumePoint(draft, startPhase); err != nil {
+		_ = markGenerateFailedForAttempt(db, payload.DraftID, job, fmt.Sprintf("resume point invalid: %s", err))
+		return asyncjob.Result{ErrorCode: "generation_resume_invalid"}, fmt.Errorf("resume point invalid: %w", err)
+	}
+	llmConfig, err := modelconfig.LoadLLMConfig(ctx, db, payload.UserID)
+	if err != nil {
+		llmConfig = map[string]any{}
+	}
+
+	progress := generateProgressBase(startPhase)
+	if startPhase == generatePhaseDesignBrief && len(payload.SkillPackage) > 0 && payload.SelectedCandidateJSON == "" {
+		progressTotal = 5
+	}
+	reportGenerateProgress(reporter, progress, progressTotal)
+
+	if startPhase == generatePhaseDesignBrief && len(payload.SkillPackage) > 0 && payload.SelectedCandidateJSON == "" {
+		analysisResp, analysisErr := algo.AnalyzeSkill(ctx, algo.AnalyzeSkillRequest{Name: draft.Name, SkillPackage: payload.SkillPackage, LLMConfig: llmConfig})
+		if analysisErr != nil {
+			_ = markGenerateFailedForAttempt(db, payload.DraftID, job, fmt.Sprintf("phase-1 analysis: %s", analysisErr))
+			return asyncjob.Result{ErrorCode: generateErrAlgoFailed}, analysisErr
+		}
+		if err := ensureGenerateJobActive(ctx, db, job); err != nil {
+			return asyncjob.Result{ErrorCode: generateErrCanceled}, err
+		}
+		analysisResp.ToolMappings = reconcileDetectedCapabilityMappings(analysisResp.ToolMappings, detectSkillCapabilityRequirementsFromSnapshot(workflowSourceSkillSnapshot{Files: skillPackageFiles(payload.SkillPackage)}))
+		analysisID := uuid.NewString()
+		candidatesJSON, _ := json.Marshal(analysisResp.Candidates)
+		coverageJSON, _ := json.Marshal(analysisResp.Coverage)
+		toolsJSON, _ := json.Marshal(analysisResp.ToolMappings)
+		scriptsJSON, _ := json.Marshal(analysisResp.Scripts)
+		packageJSON, _ := json.Marshal(manifestOnlySkillPackage(payload.SkillPackage))
+		now := time.Now().UTC()
+		analysis := orm.WorkflowGenerationAnalysis{ID: analysisID, DraftID: draft.ID, UserID: payload.UserID, SourceType: "skill", SourceSkillID: draft.SourceSkillID, SourceSkillRevisionID: payload.SourceSkillRevisionID, SourceSkillRevisionNo: draft.SourceSkillRevisionNo, SourceSkillTreeHash: draft.SourceSkillTreeHash, Status: analysisResp.Verdict, VerdictCode: analysisResp.VerdictCode, VerdictMessage: analysisResp.Message, CandidatesJSON: string(candidatesJSON), CoverageReportJSON: string(coverageJSON), ToolMappingReportJSON: string(toolsJSON), ScriptReportJSON: string(scriptsJSON), SourcePackageJSON: string(packageJSON), CreatedAt: now, UpdatedAt: now}
+		if analysisResp.Verdict == "generatable" && len(analysisResp.Candidates) > 0 {
+			selected, _ := json.Marshal(map[string]any{"candidate": analysisResp.Candidates[0], "tool_mappings": analysisResp.ToolMappings, "scripts": analysisResp.Scripts})
+			payload.SelectedCandidateJSON = string(selected)
+			if id, ok := analysisResp.Candidates[0]["id"].(string); ok {
+				analysis.SelectedCandidateID = id
+			}
+		}
+		payload.ReusableScripts = reusableSkillScripts(payload.SkillPackage, analysisResp.Scripts)
+		if err := db.WithContext(ctx).Create(&analysis).Error; err != nil {
+			return asyncjob.Result{ErrorCode: generateErrSaveFailed}, err
+		}
+		status := generateStatusAnalyzing
+		switch analysisResp.Verdict {
+		case "needs_confirmation":
+			status = generateStatusNeedsConfirm
+		case "rejected":
+			status = generateStatusRejected
+		default:
+			status = generateStatusGenerating
+		}
+		analysisUpdates := map[string]any{"source_analysis_id": analysisID, "generate_status": status, "generate_error": analysisResp.Message, "updated_at": now}
+		if warning := ignoredScriptWarning(analysisResp.Scripts); warning != "" {
+			analysisUpdates["generate_warning"] = warning
+		}
+		if err := saveGeneratedDraftUpdates(ctx, db, draft.ID, job, analysisUpdates); err != nil {
+			if errors.Is(err, errWorkflowDraftGenerationCanceled) {
+				return asyncjob.Result{ErrorCode: generateErrCanceled}, err
+			}
+			return asyncjob.Result{ErrorCode: generateErrSaveFailed}, err
+		}
+		draft.SourceAnalysisID = analysisID
+		if status == generateStatusNeedsConfirm || status == generateStatusRejected {
+			return asyncjob.Result{}, nil
+		}
+		progress = 1
+		reportGenerateProgress(reporter, progress, progressTotal)
+	}
+
+	// ── Phase 0: Design Brief ────────────────────────────────────────────────
+	// Generate a design brief (Markdown) that describes slots, steps, and flow.
+	// Subsequent phases receive this brief as an authoritative reference so that
+	// slot IDs remain consistent across phases.
+	// On failure we fall back gracefully (brief stays empty) so existing drafts are unaffected.
+	designBrief := draft.DesignBriefContent
+	if shouldRunGeneratePhase(startPhase, generatePhaseDesignBrief) {
+		briefResp, briefErr := algo.DesignBrief(ctx, algo.DesignBriefRequest{
+			Name:             draft.Name,
+			Description:      payload.Description,
+			SkillContent:     payload.SkillContent,
+			SkillPackage:     payload.SkillPackage,
+			WorkflowAnalysis: payload.SelectedCandidateJSON,
+			LLMConfig:        llmConfig,
+		})
+		if err := ensureGenerateJobActive(ctx, db, job); err != nil {
+			return asyncjob.Result{ErrorCode: generateErrCanceled}, err
+		}
+		if briefErr != nil {
+			// Non-fatal: log and continue without a brief.
+			if err := saveGeneratedDraftUpdates(ctx, db, payload.DraftID, job, map[string]any{
+				"generate_warning": fmt.Sprintf("phase0 design_brief: %s", briefErr),
+				"updated_at":       time.Now().UTC(),
+			}); errors.Is(err, errWorkflowDraftGenerationCanceled) {
+				return asyncjob.Result{ErrorCode: generateErrCanceled}, err
+			}
+		} else {
+			designBrief = briefResp.DesignBrief
+			if err := saveGeneratedDraftUpdates(ctx, db, payload.DraftID, job, map[string]any{
+				"design_brief_content": designBrief,
+				"generate_status":      generateStatusBriefDone,
+				"updated_at":           time.Now().UTC(),
+			}); err != nil {
+				if errors.Is(err, errWorkflowDraftGenerationCanceled) {
+					return asyncjob.Result{ErrorCode: generateErrCanceled}, err
+				}
+				return asyncjob.Result{ErrorCode: generateErrSaveFailed}, fmt.Errorf("save design_brief: %w", err)
+			}
+		}
+		progress++
+		reportGenerateProgress(reporter, progress, progressTotal)
+	}
+	// ── Phase 1: Skeleton ────────────────────────────────────────────────────
+	skeletonResp := &algo.GenerateSkeletonResponse{WorkflowYAML: draft.WorkflowYAMLContent}
+	if shouldRunGeneratePhase(startPhase, generatePhaseSkeleton) {
+		var err error
+		skeletonResp, err = algo.GenerateSkeleton(ctx, algo.GenerateSkeletonRequest{
+			Name:             draft.Name,
+			Description:      payload.Description,
+			SkillContent:     payload.SkillContent,
+			SkillPackage:     payload.SkillPackage,
+			WorkflowAnalysis: payload.SelectedCandidateJSON,
+			DesignBrief:      designBrief,
+			LLMConfig:        llmConfig,
+		})
+		if cancelErr := ensureGenerateJobActive(ctx, db, job); cancelErr != nil {
+			return asyncjob.Result{ErrorCode: generateErrCanceled}, cancelErr
+		}
+		if err != nil {
+			_ = markGenerateFailedForAttempt(db, payload.DraftID, job, fmt.Sprintf("phase1 skeleton: %s", err))
+			return asyncjob.Result{ErrorCode: generateErrAlgoFailed}, fmt.Errorf("phase1 skeleton: %w", err)
+		}
+		if err := validateGeneratedWorkflowSkeleton(skeletonResp.WorkflowYAML); err != nil {
+			repaired, repairErr := repairGeneratedSkeleton(ctx, skeletonResp.WorkflowYAML, designBrief, llmConfig)
+			if cancelErr := ensureGenerateJobActive(ctx, db, job); cancelErr != nil {
+				return asyncjob.Result{ErrorCode: generateErrCanceled}, cancelErr
+			}
+			if repairErr == nil {
+				skeletonResp.WorkflowYAML = repaired
+				err = validateGeneratedWorkflowSkeleton(skeletonResp.WorkflowYAML)
+			}
+			if err != nil {
+				_ = markGenerateFailedForAttempt(db, payload.DraftID, job, fmt.Sprintf("phase1 skeleton invalid: %s", err))
+				return asyncjob.Result{ErrorCode: "generation_skeleton_invalid"}, fmt.Errorf("phase1 skeleton invalid: %w", err)
+			}
+		}
+		skeletonUpdates := map[string]any{
+			"generate_status": generateStatusSkeletonDone,
+			"updated_at":      time.Now().UTC(),
+		}
+		setWorkflowYAMLUpdate(skeletonUpdates, skeletonResp.WorkflowYAML)
+		if err := saveGeneratedDraftUpdates(ctx, db, payload.DraftID, job, skeletonUpdates); err != nil {
+			if errors.Is(err, errWorkflowDraftGenerationCanceled) {
+				return asyncjob.Result{ErrorCode: generateErrCanceled}, err
+			}
+			return asyncjob.Result{ErrorCode: generateErrSaveFailed}, fmt.Errorf("save skeleton: %w", err)
+		}
+		progress++
+		reportGenerateProgress(reporter, progress, progressTotal)
+	}
+
+	// ── Phase 2: State Machine ───────────────────────────────────────────────
+	stateResp := &algo.GenerateStateMachineResponse{StateYAML: draft.StateYAMLContent}
+	if shouldRunGeneratePhase(startPhase, generatePhaseStateMachine) {
+		var err error
+		stateResp, err = algo.GenerateStateMachine(ctx, algo.GenerateStateMachineRequest{
+			Name:             draft.Name,
+			WorkflowYAML:     skeletonResp.WorkflowYAML,
+			DesignBrief:      designBrief,
+			WorkflowAnalysis: payload.SelectedCandidateJSON,
+			LLMConfig:        llmConfig,
+		})
+		if cancelErr := ensureGenerateJobActive(ctx, db, job); cancelErr != nil {
+			return asyncjob.Result{ErrorCode: generateErrCanceled}, cancelErr
+		}
+		if err != nil {
+			_ = markGenerateFailedForAttempt(db, payload.DraftID, job, fmt.Sprintf("phase2 state_machine: %s", err))
+			return asyncjob.Result{ErrorCode: generateErrAlgoFailed}, fmt.Errorf("phase2 state_machine: %w", err)
+		}
+	}
+	// Use the (possibly slot-repaired) workflow_yaml returned by Phase 2.
+	// Falls back to Phase 1 output when Phase 2 did not modify it.
+	finalWorkflowYAML := skeletonResp.WorkflowYAML
+	if stateResp.WorkflowYAML != "" {
+		finalWorkflowYAML = stateResp.WorkflowYAML
+	}
+	var skillCapabilityMappings map[string]any
+	if mappings := requiredCapabilityMappingsForDraft(db, draft.ID, draft.SourceAnalysisID); mappings != nil {
+		skillCapabilityMappings = mappings
+		var injected []string
+		finalWorkflowYAML, stateResp.StateYAML, injected = injectSkillCapabilitiesIntoWorkflow(finalWorkflowYAML, stateResp.StateYAML, mappings)
+		if len(injected) > 0 {
+			stateResp.Warnings = append(stateResp.Warnings, "已根据 Skill 依赖补齐 Workflow 工具/能力声明: "+strings.Join(injected, ", "))
+		}
+	}
+	if alignedWorkflowYAML, changed, alignErr := alignWorkflowUITabsWithStateSteps(finalWorkflowYAML, stateResp.StateYAML); alignErr == nil && changed {
+		finalWorkflowYAML = alignedWorkflowYAML
+		stateResp.Warnings = append(stateResp.Warnings, "已补齐 Workflow 步骤页签，使界面步骤与实际执行步骤一致")
+	}
+	if err := validateGeneratedWorkflowSkeleton(finalWorkflowYAML); err != nil {
+		_ = markGenerateFailedForAttempt(db, payload.DraftID, job, fmt.Sprintf("phase2 workflow invalid: %s", err))
+		return asyncjob.Result{ErrorCode: "generation_skeleton_invalid"}, fmt.Errorf("phase2 workflow invalid: %w", err)
+	}
+	stateDiagnostics := diagnoseWorkflowWithProfile(finalWorkflowYAML, stateResp.StateYAML, "", "{}", graphengine.ProfileGenerationPhase)
+	if hasDiagnosticErrorsForTarget(stateDiagnostics, "statemachine") {
+		repairResp, repairErr := algo.RepairStateMachine(ctx, algo.RepairStateMachineRequest{
+			WorkflowYAML: finalWorkflowYAML,
+			StateYAML:    stateResp.StateYAML,
+			RepairHint:   "Fix the generated workflow.yaml and scenario/state.yml so the graph compiler has no errors. Return complete final YAML.",
+			Diagnostics:  repairDiagnosticsPayload(stateDiagnostics),
+			Target:       "statemachine",
+			LLMConfig:    llmConfig,
+		})
+		if cancelErr := ensureGenerateJobActive(ctx, db, job); cancelErr != nil {
+			return asyncjob.Result{ErrorCode: generateErrCanceled}, cancelErr
+		}
+		if repairErr == nil {
+			if repairResp.WorkflowYAML != "" {
+				finalWorkflowYAML = repairResp.WorkflowYAML
+			}
+			if repairResp.StateYAML != "" {
+				stateResp.StateYAML = repairResp.StateYAML
+			}
+			if alignedWorkflowYAML, changed, alignErr := alignWorkflowUITabsWithStateSteps(finalWorkflowYAML, stateResp.StateYAML); alignErr == nil && changed {
+				finalWorkflowYAML = alignedWorkflowYAML
+			}
+			stateDiagnostics = diagnoseWorkflowWithProfile(finalWorkflowYAML, stateResp.StateYAML, "", "{}", graphengine.ProfileGenerationPhase)
+		}
+	}
+	if hasDiagnosticErrorsForTarget(stateDiagnostics, "statemachine") {
+		message := "phase2 state_machine validation failed: " + diagnosticsJSON(stateDiagnostics)
+		_ = markGenerateFailedForAttempt(db, payload.DraftID, job, message)
+		return asyncjob.Result{ErrorCode: "generation_state_invalid"}, fmt.Errorf("%s", message)
+	}
+	if shouldRunGeneratePhase(startPhase, generatePhaseStateMachine) {
+		stateUpdates := map[string]any{
+			"state_yaml_content": stateResp.StateYAML,
+			"generate_status":    generateStatusStateDone,
+			"updated_at":         time.Now().UTC(),
+		}
+		setWorkflowYAMLUpdate(stateUpdates, finalWorkflowYAML)
+		if len(stateResp.Warnings) > 0 {
+			stateUpdates["generate_warning"] = strings.Join(stateResp.Warnings, "; ")
+		}
+		if err := saveGeneratedDraftUpdates(ctx, db, payload.DraftID, job, stateUpdates); err != nil {
+			if errors.Is(err, errWorkflowDraftGenerationCanceled) {
+				return asyncjob.Result{ErrorCode: generateErrCanceled}, err
+			}
+			return asyncjob.Result{ErrorCode: generateErrSaveFailed}, fmt.Errorf("save state_machine: %w", err)
+		}
+		progress++
+		reportGenerateProgress(reporter, progress, progressTotal)
+	}
+
+	// ── Phase 3: Scenario + Scripts ──────────────────────────────────────────
+	scenarioResp, err := algo.GenerateScenarioScripts(ctx, algo.GenerateScenarioScriptsRequest{
+		Name:          draft.Name,
+		WorkflowYAML:  finalWorkflowYAML,
+		StateYAML:     stateResp.StateYAML,
+		DesignBrief:   designBrief,
+		SourceScripts: payload.ReusableScripts,
+		LLMConfig:     llmConfig,
+	})
+	if cancelErr := ensureGenerateJobActive(ctx, db, job); cancelErr != nil {
+		return asyncjob.Result{ErrorCode: generateErrCanceled}, cancelErr
+	}
+	if err != nil {
+		message := fmt.Sprintf("phase3 scenario_scripts failed: %s", err)
+		_ = markGenerateFailedForAttempt(db, payload.DraftID, job, message)
+		return asyncjob.Result{ErrorCode: generateErrAlgoFailed}, fmt.Errorf("%s", message)
+	}
+	if err := validateGeneratedScenarioContent(scenarioResp.ScenarioMD, stateResp.StateYAML); err != nil {
+		repaired, repairErr := repairGeneratedScenario(ctx, finalWorkflowYAML, stateResp.StateYAML, scenarioResp.ScenarioMD, err, llmConfig)
+		if cancelErr := ensureGenerateJobActive(ctx, db, job); cancelErr != nil {
+			return asyncjob.Result{ErrorCode: generateErrCanceled}, cancelErr
+		}
+		if repairErr == nil {
+			scenarioResp.ScenarioMD = repaired
+			err = validateGeneratedScenarioContent(scenarioResp.ScenarioMD, stateResp.StateYAML)
+		}
+		if err != nil {
+			message := fmt.Sprintf("phase3 scenario_scripts invalid: %s", err)
+			_ = markGenerateFailedForAttempt(db, payload.DraftID, job, message)
+			return asyncjob.Result{ErrorCode: "generation_scenario_invalid"}, fmt.Errorf("%s", message)
+		}
+	}
+
+	// Encode scripts map as JSON string for storage.
+	scriptsJSON := "{}"
+	finalScripts := map[string]string{}
+	for path, content := range payload.ReusableScripts {
+		finalScripts[path] = content
+	}
+	for path, content := range scenarioResp.Scripts {
+		finalScripts[path] = content
+	}
+	if len(finalScripts) > 0 {
+		if b, jerr := json.Marshal(finalScripts); jerr == nil {
+			scriptsJSON = string(b)
+		}
+	}
+	if withBoundaries, changed := injectExecutionBoundariesIntoStateSteps(stateResp.StateYAML); changed {
+		stateResp.StateYAML = withBoundaries
+	}
+	if skillCapabilityMappings != nil {
+		var injected []string
+		finalWorkflowYAML, stateResp.StateYAML, injected = injectSkillCapabilitiesIntoWorkflow(finalWorkflowYAML, stateResp.StateYAML, skillCapabilityMappings)
+		if len(injected) > 0 {
+			scenarioResp.Warnings = append(scenarioResp.Warnings, "已在最终校验前补齐 Skill 依赖工具/能力声明: "+strings.Join(injected, ", "))
+		}
+	}
+	if alignedWorkflowYAML, changed, alignErr := alignWorkflowUITabsWithStateSteps(finalWorkflowYAML, stateResp.StateYAML); alignErr == nil && changed {
+		finalWorkflowYAML = alignedWorkflowYAML
+	}
+	finalDiagnostics := diagnoseWorkflowWithProfile(finalWorkflowYAML, stateResp.StateYAML, scenarioResp.ScenarioMD, scriptsJSON, graphengine.ProfilePublish)
+	if hasDiagnosticErrors(finalDiagnostics) {
+		var issues []string
+		for _, diagnostic := range finalDiagnostics {
+			if diagnostic.Severity == "error" {
+				issues = append(issues, diagnostic.Path+": "+diagnostic.Message)
+			}
+		}
+		// UI and graph repair use different prompts, but both consume the same
+		// authoritative Go diagnostics and are revalidated with publish rules.
+		for _, target := range []string{"ui", "statemachine"} {
+			if !hasDiagnosticErrorsForTarget(finalDiagnostics, target) {
+				continue
+			}
+			repairResp, repairErr := algo.RepairStateMachine(ctx, algo.RepairStateMachineRequest{
+				WorkflowYAML: finalWorkflowYAML,
+				StateYAML:    stateResp.StateYAML,
+				RepairHint:   "Automatically fix all post-generation validation errors. Preserve intended behavior and return a complete valid result.",
+				Warnings:     issues,
+				Diagnostics:  repairDiagnosticsPayload(finalDiagnostics),
+				Target:       target,
+				LLMConfig:    llmConfig,
+			})
+			if cancelErr := ensureGenerateJobActive(ctx, db, job); cancelErr != nil {
+				return asyncjob.Result{ErrorCode: generateErrCanceled}, cancelErr
+			}
+			if repairErr != nil {
+				continue
+			}
+			if repairResp.StateYAML != "" {
+				stateResp.StateYAML = repairResp.StateYAML
+			}
+			if repairResp.WorkflowYAML != "" {
+				finalWorkflowYAML = repairResp.WorkflowYAML
+			}
+			if withBoundaries, changed := injectExecutionBoundariesIntoStateSteps(stateResp.StateYAML); changed {
+				stateResp.StateYAML = withBoundaries
+			}
+			if skillCapabilityMappings != nil {
+				finalWorkflowYAML, stateResp.StateYAML, _ = injectSkillCapabilitiesIntoWorkflow(finalWorkflowYAML, stateResp.StateYAML, skillCapabilityMappings)
+			}
+			if alignedWorkflowYAML, changed, alignErr := alignWorkflowUITabsWithStateSteps(finalWorkflowYAML, stateResp.StateYAML); alignErr == nil && changed {
+				finalWorkflowYAML = alignedWorkflowYAML
+			}
+			finalDiagnostics = diagnoseWorkflowWithProfile(finalWorkflowYAML, stateResp.StateYAML, scenarioResp.ScenarioMD, scriptsJSON, graphengine.ProfilePublish)
+		}
+	}
+	if hasDiagnosticErrors(finalDiagnostics) {
+		message := "generation validation failed: " + diagnosticsJSON(finalDiagnostics)
+		_ = markGenerateFailedForAttempt(db, payload.DraftID, job, message)
+		return asyncjob.Result{ErrorCode: "generation_coverage_incomplete"}, fmt.Errorf("%s", message)
+	}
+	var diagnosticWarnings []string
+	for _, diagnostic := range finalDiagnostics {
+		if diagnostic.Severity == "warning" {
+			diagnosticWarnings = append(diagnosticWarnings, diagnostic.Message)
+		}
+	}
+	if err := updateWorkflowGenerationScriptAudit(db.WithContext(ctx), payload.DraftID, draft.SourceAnalysisID, "", finalScripts); err != nil {
+		message := fmt.Sprintf("save generated script audit: %s", err)
+		_ = markGenerateFailedForAttempt(db, payload.DraftID, job, message)
+		return asyncjob.Result{ErrorCode: generateErrSaveFailed}, fmt.Errorf("%s", message)
+	}
+
+	finalUpdates := map[string]any{
+		"state_yaml_content": stateResp.StateYAML,
+		"scenario_content":   scenarioResp.ScenarioMD,
+		"scripts_content":    scriptsJSON,
+		"generate_status":    generateStatusDone,
+		"generate_error":     "",
+		"generate_warning":   mergeWarnings(mergeWarnings(currentGenerateWarning(db, payload.DraftID), strings.Join(scenarioResp.Warnings, "; ")), strings.Join(diagnosticWarnings, "; ")),
+		"version":            gorm.Expr("version + 1"),
+		"updated_at":         time.Now().UTC(),
+	}
+	setWorkflowYAMLUpdate(finalUpdates, finalWorkflowYAML)
+	if err := saveGeneratedDraftUpdates(ctx, db, payload.DraftID, job, finalUpdates); err != nil {
+		if errors.Is(err, errWorkflowDraftGenerationCanceled) {
+			return asyncjob.Result{ErrorCode: generateErrCanceled}, err
+		}
+		return asyncjob.Result{ErrorCode: generateErrSaveFailed}, fmt.Errorf("save scenario_scripts: %w", err)
+	}
+	reportGenerateProgress(reporter, progressTotal, progressTotal)
+
+	return asyncjob.Result{}, nil
+}
+
+func reportGenerateProgress(reporter asyncjob.Reporter, current, total int64) {
+	if reporter == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = reporter.SetProgress(ctx, current, total)
+	_ = reporter.Heartbeat(ctx)
+}
+
+func ensureGenerateJobActive(ctx context.Context, db *gorm.DB, job asyncjob.Job) error {
+	if strings.TrimSpace(job.ID) == "" {
+		return nil
+	}
+	var row orm.AsyncJob
+	if err := db.WithContext(ctx).Select("status").Where("id = ?", job.ID).First(&row).Error; err != nil {
+		return err
+	}
+	if row.Status == string(asyncjob.StatusCanceled) {
+		return errWorkflowDraftGenerationCanceled
+	}
+	return nil
+}
+
+func saveGeneratedDraftUpdates(ctx context.Context, db *gorm.DB, draftID string, job asyncjob.Job, updates map[string]any) error {
+	if err := ensureGenerateJobActive(ctx, db, job); err != nil {
+		return err
+	}
+	return db.WithContext(ctx).Model(&orm.WorkflowDraft{}).Where("id = ? AND deleted_at IS NULL", draftID).Updates(updates).Error
+}
+
+func generateProgressBase(startPhase string) int64 {
+	switch startPhase {
+	case generatePhaseSkeleton:
+		return 1
+	case generatePhaseStateMachine:
+		return 2
+	case generatePhaseScenarioScripts:
+		return 3
+	default:
+		return 0
+	}
+}
+
+func bestGenerateResumePhase(draft orm.WorkflowDraft, requested string) string {
+	best := generatePhaseDesignBrief
+	if strings.TrimSpace(draft.DesignBriefContent) != "" {
+		best = generatePhaseSkeleton
+	}
+	if validateGeneratedWorkflowSkeleton(draft.WorkflowYAMLContent) == nil {
+		best = generatePhaseStateMachine
+		diagnostics := diagnoseWorkflowWithProfile(
+			draft.WorkflowYAMLContent,
+			draft.StateYAMLContent,
+			"",
+			"{}",
+			graphengine.ProfileGenerationPhase,
+		)
+		if !hasDiagnosticErrorsForTarget(diagnostics, "statemachine") {
+			best = generatePhaseScenarioScripts
+		}
+	}
+	if requested == "" {
+		return best
+	}
+	if generatePhaseRank(best) > generatePhaseRank(requested) {
+		return best
+	}
+	return requested
+}
+
+func manifestOnlySkillPackage(pkg map[string]any) map[string]any {
+	b, _ := json.Marshal(pkg)
+	var out map[string]any
+	_ = json.Unmarshal(b, &out)
+	if files, ok := out["files"].([]any); ok {
+		for _, raw := range files {
+			if file, ok := raw.(map[string]any); ok {
+				delete(file, "content")
+			}
+		}
+	}
+	return out
+}
+
+func ignoredScriptWarning(report map[string]any) string {
+	var ignored []string
+	for path, raw := range report {
+		item, _ := raw.(map[string]any)
+		if item["classification"] == "unsupported" {
+			reason, _ := item["reason"].(string)
+			ignored = append(ignored, fmt.Sprintf("%s (%s)", path, reason))
+		}
+	}
+	sort.Strings(ignored)
+	if len(ignored) == 0 {
+		return ""
+	}
+	return "已忽略不安全脚本: " + strings.Join(ignored, "; ")
+}
+
+func mergeWarnings(existing, added string) string {
+	existing = strings.TrimSpace(existing)
+	added = strings.TrimSpace(added)
+	if existing == "" {
+		return added
+	}
+	if added == "" {
+		return existing
+	}
+	return existing + "; " + added
+}
+
+func validateGeneratedWorkflowSkeleton(workflowYAML string) error {
+	if strings.TrimSpace(workflowYAML) == "" {
+		return fmt.Errorf("workflow_yaml is empty")
+	}
+	var doc generatedWorkflowSkeleton
+	if err := yaml.Unmarshal([]byte(workflowYAML), &doc); err != nil {
+		return fmt.Errorf("workflow_yaml invalid: %w", err)
+	}
+	if strings.TrimSpace(doc.ID) == "" {
+		return fmt.Errorf("workflow id is required")
+	}
+	if strings.TrimSpace(doc.Name) == "" {
+		return fmt.Errorf("workflow name is required")
+	}
+	if len(doc.Slots) == 0 {
+		return fmt.Errorf("at least one slot is required")
+	}
+	for index, slot := range doc.Slots {
+		if strings.TrimSpace(slot.ID) == "" {
+			return fmt.Errorf("slots[%d].id is required", index)
+		}
+	}
+	if len(doc.Steps) == 0 {
+		return fmt.Errorf("at least one step is required")
+	}
+	for index, step := range doc.Steps {
+		if strings.TrimSpace(step.ID) == "" {
+			return fmt.Errorf("steps[%d].id is required", index)
+		}
+	}
+	return nil
+}
+
+func alignWorkflowUITabsWithStateSteps(workflowYAML, stateYAML string) (string, bool, error) {
+	if strings.TrimSpace(workflowYAML) == "" || strings.TrimSpace(stateYAML) == "" {
+		return workflowYAML, false, nil
+	}
+	var workflowDoc map[string]any
+	if err := yaml.Unmarshal([]byte(workflowYAML), &workflowDoc); err != nil {
+		return workflowYAML, false, err
+	}
+	steps := workflowStepTabCandidates(workflowDoc, stateYAML)
+	if len(steps) <= 1 {
+		return workflowYAML, false, nil
+	}
+	slotDefs := workflowSlotDefsByID(workflowDoc["slots"])
+	fallbackSlots := workflowFallbackUISlots(steps, slotDefs)
+	if len(fallbackSlots) == 0 {
+		return workflowYAML, false, nil
+	}
+	ui := mapValue(workflowDoc["ui"])
+	if ui == nil {
+		ui = map[string]any{}
+	}
+	existingTabs := listValue(ui["tabs"])
+	nextTabs := make([]any, 0, len(steps))
+	usedExisting := map[int]bool{}
+	for _, step := range steps {
+		tab, index := findExistingTabForStep(existingTabs, step, usedExisting)
+		if tab == nil {
+			tab = map[string]any{}
+		} else {
+			usedExisting[index] = true
+		}
+		tab["id"] = step.ID
+		tab["step_id"] = step.ID
+		if strings.TrimSpace(scalarAny(tab["label"])) == "" {
+			tab["label"] = step.Label
+		}
+		if strings.TrimSpace(scalarAny(tab["layout"])) == "" {
+			tab["layout"] = "vertical"
+		}
+		slotIDs := step.Outputs
+		if len(slotIDs) == 0 {
+			slotIDs = materialIDsFromList(tab["slots"])
+		}
+		if len(slotIDs) == 0 {
+			slotIDs = fallbackSlots
+		}
+		tab["slots"] = workflowTabSlotDefs(slotIDs, slotDefs)
+		nextTabs = append(nextTabs, tab)
+	}
+	oldTabsYAML, _ := yaml.Marshal(existingTabs)
+	nextTabsYAML, _ := yaml.Marshal(nextTabs)
+	if string(oldTabsYAML) == string(nextTabsYAML) {
+		return workflowYAML, false, nil
+	}
+	ui["tabs"] = nextTabs
+	workflowDoc["ui"] = ui
+	out, err := yaml.Marshal(workflowDoc)
+	if err != nil {
+		return workflowYAML, false, err
+	}
+	return string(out), true, nil
+}
+
+func workflowStepTabCandidates(workflowDoc map[string]any, stateYAML string) []workflowStepTabCandidate {
+	stateOutputs := stateStepOutputsByID(stateYAML)
+	stepsRaw := listValue(workflowDoc["steps"])
+	steps := make([]workflowStepTabCandidate, 0, len(stepsRaw))
+	for _, raw := range stepsRaw {
+		stepMap := mapValue(raw)
+		if stepMap == nil {
+			continue
+		}
+		id := strings.TrimSpace(scalarAny(stepMap["id"]))
+		if id == "" {
+			continue
+		}
+		label := strings.TrimSpace(scalarAny(stepMap["label"]))
+		if label == "" {
+			label = humanizeWorkflowID(id)
+		}
+		steps = append(steps, workflowStepTabCandidate{
+			ID:      id,
+			Label:   label,
+			Outputs: stateOutputs[id],
+		})
+	}
+	return steps
+}
+
+func stateStepOutputsByID(stateYAML string) map[string][]string {
+	var stateDoc map[string]any
+	if err := yaml.Unmarshal([]byte(stateYAML), &stateDoc); err != nil {
+		return nil
+	}
+	out := map[string][]string{}
+	switch rawSteps := stateDoc["steps"].(type) {
+	case map[string]any:
+		for stepID, raw := range rawSteps {
+			out[stepID] = materialIDsFromList(mapValue(raw)["outputs"])
+		}
+	case []any:
+		for _, raw := range rawSteps {
+			stepMap := mapValue(raw)
+			stepID := strings.TrimSpace(scalarAny(stepMap["id"]))
+			if stepID != "" {
+				out[stepID] = materialIDsFromList(stepMap["outputs"])
+			}
+		}
+	}
+	return out
+}
+
+func workflowSlotDefsByID(raw any) map[string]map[string]any {
+	out := map[string]map[string]any{}
+	for _, item := range listValue(raw) {
+		slotMap := mapValue(item)
+		if slotMap == nil {
+			continue
+		}
+		id := strings.TrimSpace(scalarAny(slotMap["id"]))
+		if id == "" {
+			continue
+		}
+		copyMap := map[string]any{}
+		for key, value := range slotMap {
+			copyMap[key] = value
+		}
+		if strings.TrimSpace(scalarAny(copyMap["label"])) == "" {
+			copyMap["label"] = humanizeWorkflowID(id)
+		}
+		if strings.TrimSpace(scalarAny(copyMap["type"])) == "" {
+			copyMap["type"] = "text"
+		}
+		out[id] = copyMap
+	}
+	return out
+}
+
+func workflowFallbackUISlots(steps []workflowStepTabCandidate, slotDefs map[string]map[string]any) []string {
+	for i := len(steps) - 1; i >= 0; i-- {
+		if len(steps[i].Outputs) > 0 {
+			return steps[i].Outputs
+		}
+	}
+	keys := make([]string, 0, len(slotDefs))
+	for key := range slotDefs {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func workflowTabSlotDefs(slotIDs []string, slotDefs map[string]map[string]any) []any {
+	seen := map[string]bool{}
+	out := make([]any, 0, len(slotIDs))
+	for _, id := range slotIDs {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		slot := map[string]any{"id": id, "label": humanizeWorkflowID(id), "type": "text"}
+		if def := slotDefs[id]; def != nil {
+			slot = map[string]any{}
+			for key, value := range def {
+				slot[key] = value
+			}
+			slot["id"] = id
+			if strings.TrimSpace(scalarAny(slot["label"])) == "" {
+				slot["label"] = humanizeWorkflowID(id)
+			}
+			if strings.TrimSpace(scalarAny(slot["type"])) == "" {
+				slot["type"] = "text"
+			}
+		}
+		out = append(out, slot)
+	}
+	return out
+}
+
+func findExistingTabForStep(tabs []any, step workflowStepTabCandidate, used map[int]bool) (map[string]any, int) {
+	for i, raw := range tabs {
+		if used[i] {
+			continue
+		}
+		tab := mapValue(raw)
+		if tab == nil {
+			continue
+		}
+		if scalarAny(tab["step_id"]) == step.ID || scalarAny(tab["id"]) == step.ID {
+			return tab, i
+		}
+	}
+	if len(step.Outputs) == 0 {
+		return nil, -1
+	}
+	want := strings.Join(uniqueStrings(step.Outputs), "\x00")
+	for i, raw := range tabs {
+		if used[i] {
+			continue
+		}
+		tab := mapValue(raw)
+		if tab == nil {
+			continue
+		}
+		if strings.Join(uniqueStrings(materialIDsFromList(tab["slots"])), "\x00") == want {
+			return tab, i
+		}
+	}
+	return nil, -1
+}
+
+func materialIDsFromList(raw any) []string {
+	items := listValue(raw)
+	if len(items) == 0 {
+		if text := strings.TrimSpace(scalarAny(raw)); text != "" {
+			return []string{text}
+		}
+		return nil
+	}
+	var out []string
+	for _, item := range items {
+		switch v := item.(type) {
+		case string:
+			if text := strings.TrimSpace(v); text != "" {
+				out = append(out, text)
+			}
+		default:
+			itemMap := mapValue(v)
+			id := strings.TrimSpace(scalarAny(firstNonNilAny(itemMap["material"], itemMap["slot"], itemMap["id"])))
+			if id != "" {
+				out = append(out, id)
+			}
+		}
+	}
+	return uniqueStrings(out)
+}
+
+func mapValue(raw any) map[string]any {
+	if raw == nil {
+		return nil
+	}
+	if out, ok := raw.(map[string]any); ok {
+		return out
+	}
+	data, err := yaml.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	var out map[string]any
+	if yaml.Unmarshal(data, &out) != nil {
+		return nil
+	}
+	return out
+}
+
+func listValue(raw any) []any {
+	if raw == nil {
+		return nil
+	}
+	if out, ok := raw.([]any); ok {
+		return out
+	}
+	data, err := yaml.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	var out []any
+	if yaml.Unmarshal(data, &out) != nil {
+		return nil
+	}
+	return out
+}
+
+func scalarAny(v any) string {
+	if v == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(v))
+}
+
+func firstNonNilAny(values ...any) any {
+	for _, value := range values {
+		if value != nil {
+			return value
+		}
+	}
+	return nil
+}
+
+func uniqueStrings(values []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func humanizeWorkflowID(id string) string {
+	parts := strings.FieldsFunc(id, func(r rune) bool {
+		return r == '_' || r == '-' || r == '.'
+	})
+	for i, part := range parts {
+		if part == "" {
+			continue
+		}
+		parts[i] = strings.ToUpper(part[:1]) + part[1:]
+	}
+	label := strings.Join(parts, " ")
+	if label == "" {
+		return id
+	}
+	return label
+}
+
+func validateGeneratedScenarioContent(scenarioMD, stateYAML string) error {
+	content := strings.TrimSpace(scenarioMD)
+	if content == "" {
+		return fmt.Errorf("scenario.md is empty")
+	}
+	placeholderPatterns := []string{
+		"暂无描述",
+		"待补充",
+		"todo",
+		"tbd",
+		"no description",
+		"placeholder",
+	}
+	lowerContent := strings.ToLower(content)
+	for _, pattern := range placeholderPatterns {
+		if strings.Contains(lowerContent, strings.ToLower(pattern)) {
+			return fmt.Errorf("scenario.md contains placeholder text: %s", pattern)
+		}
+	}
+	var stateDoc struct {
+		Steps map[string]any `yaml:"steps"`
+	}
+	if err := yaml.Unmarshal([]byte(stateYAML), &stateDoc); err != nil {
+		return fmt.Errorf("state_yaml invalid while checking scenario.md: %w", err)
+	}
+	for stepID := range stateDoc.Steps {
+		if strings.TrimSpace(stepID) == "" {
+			continue
+		}
+		index := strings.Index(content, stepID)
+		if index < 0 {
+			return fmt.Errorf("scenario.md does not document step %s", stepID)
+		}
+		after := strings.TrimSpace(content[index+len(stepID):])
+		if after == "" {
+			return fmt.Errorf("scenario.md has no description after step %s", stepID)
+		}
+		nextHeading := strings.Index(after, "\n### ")
+		section := after
+		if nextHeading >= 0 {
+			section = after[:nextHeading]
+		}
+		section = strings.TrimSpace(strings.Trim(section, "()[]#- \t\r\n"))
+		if len([]rune(section)) < 24 {
+			return fmt.Errorf("scenario.md description for step %s is too short", stepID)
+		}
+	}
+	return nil
+}
+
+func repairGeneratedSkeleton(ctx context.Context, workflowYAML, designBrief string, llmConfig map[string]any) (string, error) {
+	resp, err := algo.RepairStateMachine(ctx, algo.RepairStateMachineRequest{
+		WorkflowYAML: workflowYAML,
+		StateYAML:    "initial: __start__\nsteps: {}\ntransitions:\n  __start__:\n    - to: __end__\n",
+		RepairHint:   "Fix workflow.yaml so it has a valid id, name, slots, steps, and ui layout. Return complete workflow_yaml.",
+		Warnings:     []string{designBrief},
+		Target:       "statemachine",
+		LLMConfig:    llmConfig,
+	})
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(resp.WorkflowYAML) == "" {
+		return "", fmt.Errorf("repair returned empty workflow_yaml")
+	}
+	return resp.WorkflowYAML, nil
+}
+
+func repairGeneratedScenario(ctx context.Context, workflowYAML, stateYAML, scenarioMD string, cause error, llmConfig map[string]any) (string, error) {
+	resp, err := algo.RepairStateMachine(ctx, algo.RepairStateMachineRequest{
+		WorkflowYAML: workflowYAML,
+		StateYAML:    stateYAML,
+		ScenarioMD:   scenarioMD,
+		RepairHint:   "Fix or complete scenario.md so every state-machine step is documented with meaningful instructions.",
+		Warnings:     []string{cause.Error()},
+		Target:       "scenario",
+		LLMConfig:    llmConfig,
+	})
+	if err != nil {
+		return "", err
+	}
+	repaired := resp.ScenarioMD
+	if repaired == "" {
+		repaired = resp.StateYAML
+	}
+	if strings.TrimSpace(repaired) == "" {
+		return "", fmt.Errorf("repair returned empty scenario.md")
+	}
+	return repaired, nil
+}
+
+func normalizeGenerateStartPhase(phase string) string {
+	switch strings.TrimSpace(strings.ToLower(phase)) {
+	case "", "brief", "design", "design_brief":
+		return generatePhaseDesignBrief
+	case "workflow", "workflow_yaml", "skeleton":
+		return generatePhaseSkeleton
+	case "state", "state_yaml", "state_machine":
+		return generatePhaseStateMachine
+	case "scenario", "scenario_md", "scripts", "scenario_scripts":
+		return generatePhaseScenarioScripts
+	default:
+		return ""
+	}
+}
+
+func generatePhaseRank(phase string) int {
+	switch phase {
+	case generatePhaseDesignBrief:
+		return 0
+	case generatePhaseSkeleton:
+		return 1
+	case generatePhaseStateMachine:
+		return 2
+	case generatePhaseScenarioScripts:
+		return 3
+	default:
+		return -1
+	}
+}
+
+func shouldRunGeneratePhase(startPhase, phase string) bool {
+	return generatePhaseRank(phase) >= generatePhaseRank(startPhase)
+}
+
+func generateStatusForStartPhase(phase string) string {
+	switch phase {
+	case generatePhaseSkeleton:
+		return generateStatusBriefDone
+	case generatePhaseStateMachine:
+		return generateStatusSkeletonDone
+	case generatePhaseScenarioScripts:
+		return generateStatusStateDone
+	default:
+		return generateStatusGenerating
+	}
+}
+
+func validateGenerateResumePoint(draft orm.WorkflowDraft, startPhase string) error {
+	if startPhase == "" {
+		return fmt.Errorf("invalid start_phase")
+	}
+	switch startPhase {
+	case generatePhaseDesignBrief:
+		return nil
+	case generatePhaseSkeleton:
+		if strings.TrimSpace(draft.DesignBriefContent) == "" {
+			return fmt.Errorf("design brief is not available")
+		}
+		return nil
+	case generatePhaseStateMachine:
+		return validateGeneratedWorkflowSkeleton(draft.WorkflowYAMLContent)
+	case generatePhaseScenarioScripts:
+		if err := validateGeneratedWorkflowSkeleton(draft.WorkflowYAMLContent); err != nil {
+			return err
+		}
+		diagnostics := diagnoseWorkflowWithProfile(
+			draft.WorkflowYAMLContent,
+			draft.StateYAMLContent,
+			"",
+			"{}",
+			graphengine.ProfileGenerationPhase,
+		)
+		if hasDiagnosticErrorsForTarget(diagnostics, "statemachine") {
+			return fmt.Errorf("state machine is not valid")
+		}
+		return nil
+	default:
+		return fmt.Errorf("invalid start_phase")
+	}
+}
+
+func currentGenerateWarning(db *gorm.DB, draftID string) string {
+	var draft orm.WorkflowDraft
+	if db.Select("generate_warning").Where("id = ? AND deleted_at IS NULL", draftID).First(&draft).Error != nil {
+		return ""
+	}
+	return draft.GenerateWarning
+}
+
+func markGenerateFailed(db *gorm.DB, draftID string, errMsg string) error {
+	phase, code, recoverable := classifyGenerationFailure(errMsg)
+	return db.Model(&orm.WorkflowDraft{}).Where("id = ? AND deleted_at IS NULL", draftID).Updates(map[string]any{
+		"generate_status": generateStatusFailed,
+		"generate_error":  generationFailureJSON(phase, code, errMsg, recoverable),
+		"updated_at":      time.Now().UTC(),
+	}).Error
+}
+
+func markGenerateFailedForAttempt(db *gorm.DB, draftID string, job asyncjob.Job, errMsg string) error {
+	if generateJobCanceled(db, job) {
+		return nil
+	}
+	phase, code, recoverable := classifyGenerationFailure(errMsg)
+	if recoverable && generationJobHasAttemptsRemaining(db, job) {
+		status := generateStatusForFailureRetry(db, draftID, phase)
+		return db.Model(&orm.WorkflowDraft{}).Where("id = ? AND deleted_at IS NULL", draftID).Updates(map[string]any{
+			"generate_status":  status,
+			"generate_warning": fmt.Sprintf("可恢复异常，系统正在自动重试：%s", stripGenerationFailureForWarning(errMsg)),
+			"updated_at":       time.Now().UTC(),
+		}).Error
+	}
+	return db.Model(&orm.WorkflowDraft{}).Where("id = ? AND deleted_at IS NULL", draftID).Updates(map[string]any{
+		"generate_status": generateStatusFailed,
+		"generate_error":  generationFailureJSON(phase, code, errMsg, recoverable),
+		"updated_at":      time.Now().UTC(),
+	}).Error
+}
+
+func generateJobCanceled(db *gorm.DB, job asyncjob.Job) bool {
+	var row orm.AsyncJob
+	if strings.TrimSpace(job.ID) == "" || db.Select("status").Where("id = ?", job.ID).First(&row).Error != nil {
+		return false
+	}
+	return row.Status == string(asyncjob.StatusCanceled)
+}
+
+func generationJobHasAttemptsRemaining(db *gorm.DB, job asyncjob.Job) bool {
+	var row orm.AsyncJob
+	if strings.TrimSpace(job.ID) == "" || db.Where("id = ?", job.ID).First(&row).Error != nil {
+		return false
+	}
+	return row.AttemptCount < row.MaxAttempts
+}
+
+func generateStatusForFailureRetry(db *gorm.DB, draftID, phase string) string {
+	var draft orm.WorkflowDraft
+	if db.Select("design_brief_content", "plugin_yaml_content", "state_yaml_content").Where("id = ? AND deleted_at IS NULL", draftID).First(&draft).Error != nil {
+		return generateStatusGenerating
+	}
+	switch phase {
+	case "scenario_scripts", "validation":
+		if err := validateGenerateResumePoint(draft, generatePhaseScenarioScripts); err == nil {
+			return generateStatusStateDone
+		}
+		fallthrough
+	case "state_machine":
+		if err := validateGenerateResumePoint(draft, generatePhaseStateMachine); err == nil {
+			return generateStatusSkeletonDone
+		}
+		fallthrough
+	case "skeleton":
+		if err := validateGenerateResumePoint(draft, generatePhaseSkeleton); err == nil {
+			return generateStatusBriefDone
+		}
+	}
+	return generateStatusGenerating
+}
+
+func stripGenerationFailureForWarning(message string) string {
+	message = stripGenerationFailurePrefix(message)
+	if len([]rune(message)) <= 160 {
+		return message
+	}
+	runes := []rune(message)
+	return string(runes[:160]) + "..."
+}
+
+func stripGenerationFailurePrefix(message string) string {
+	replacements := []string{
+		"phase-1 analysis:",
+		"phase1 analysis:",
+		"phase0 design_brief:",
+		"phase1 skeleton invalid:",
+		"phase1 skeleton:",
+		"phase2 state_machine validation failed:",
+		"phase2 state_machine:",
+		"phase2 workflow invalid:",
+		"phase3 scenario_scripts failed:",
+		"phase3 scenario_scripts invalid:",
+		"generation validation failed:",
+		"resume point invalid:",
+	}
+	trimmed := strings.TrimSpace(message)
+	lower := strings.ToLower(trimmed)
+	for _, prefix := range replacements {
+		if strings.HasPrefix(lower, prefix) {
+			return strings.TrimSpace(trimmed[len(prefix):])
+		}
+	}
+	return trimmed
+}
+
+func classifyGenerationFailure(message string) (string, string, bool) {
+	lower := strings.ToLower(message)
+	switch {
+	case strings.Contains(lower, "resume point"):
+		return "resume", "GENERATION_RESUME_INVALID", false
+	case strings.Contains(lower, "analysis"):
+		return "analysis", "GENERATION_ANALYSIS_FAILED", true
+	case strings.Contains(lower, "design_brief"):
+		return "design_brief", "GENERATION_BRIEF_FAILED", true
+	case strings.Contains(lower, "skeleton"):
+		return "skeleton", "GENERATION_SKELETON_FAILED", true
+	case strings.Contains(lower, "state_machine") || strings.Contains(lower, "state machine"):
+		return "state_machine", "GENERATION_STATE_MACHINE_FAILED", true
+	case strings.Contains(lower, "scenario_scripts") || strings.Contains(lower, "scenario.md"):
+		return "scenario_scripts", "GENERATION_SCENARIO_FAILED", true
+	case strings.Contains(lower, "validation"):
+		return "validation", "GENERATION_VALIDATION_FAILED", true
+	default:
+		return "unknown", "GENERATION_FAILED", true
+	}
+}
+
+func generationFailureJSON(phase, code, message string, recoverable bool) string {
+	suggestions := []string{
+		"可从失败阶段继续生成，系统会复用前面已完成的内容。",
+		"如果已生成 Workflow 草稿，可先打开详情页查看并使用 AI 修复。",
+	}
+	if !recoverable {
+		suggestions = []string{"请先修复 Skill 内容、权限或转换起点后再重新发起转换。"}
+	}
+	body, err := json.Marshal(map[string]any{
+		"phase":       phase,
+		"code":        code,
+		"recoverable": recoverable,
+		"message":     message,
+		"suggestions": suggestions,
+	})
+	if err != nil {
+		return message
+	}
+	return string(body)
+}
+
+func handleWorkflowDraftRepairJob(ctx context.Context, job asyncjob.Job, _ asyncjob.Reporter) (asyncjob.Result, error) {
+	var payload workflowDraftRepairPayload
+	if err := json.Unmarshal(job.PayloadJSON, &payload); err != nil {
+		return asyncjob.Result{ErrorCode: generateErrInvalidPayload}, fmt.Errorf("decode repair payload: %w", err)
+	}
+
+	log.Printf("[repair_job] START draft_id=%s user_id=%s target=%q prev_status=%q warnings=%v hint_len=%d",
+		payload.DraftID, payload.UserID, payload.Target, payload.PrevStatus,
+		payload.Warnings, len(payload.RepairHint))
+
+	db := store.DB()
+	if db == nil {
+		return asyncjob.Result{ErrorCode: generateErrSaveFailed}, fmt.Errorf("db unavailable")
+	}
+	if payload.RepairRunID != "" {
+		_ = db.Model(&orm.WorkflowRepairRun{}).Where("id=?", payload.RepairRunID).Updates(map[string]any{"status": "repairing", "updated_at": time.Now().UTC()}).Error
+	}
+
+	var draft orm.WorkflowDraft
+	if err := db.Where("id = ? AND deleted_at IS NULL", payload.DraftID).First(&draft).Error; err != nil {
+		log.Printf("[repair_job] draft not found draft_id=%s err=%v", payload.DraftID, err)
+		return asyncjob.Result{ErrorCode: generateErrDraftNotFound}, fmt.Errorf("draft not found: %w", err)
+	}
+	if draft.Version != payload.DraftVersion {
+		if payload.RepairRunID != "" {
+			_ = db.Model(&orm.WorkflowRepairRun{}).Where("id=?", payload.RepairRunID).Updates(map[string]any{"status": "stale", "updated_at": time.Now().UTC()}).Error
+		}
+		return asyncjob.Result{ErrorCode: "repair_stale_draft"}, fmt.Errorf("repair stale draft")
+	}
+	log.Printf("[repair_job] draft loaded draft_id=%s workflow_yaml_len=%d state_yaml_len=%d version=%d",
+		payload.DraftID, len(draft.WorkflowYAMLContent), len(draft.StateYAMLContent), draft.Version)
+
+	llmConfig := payload.LLMConfig
+	if llmConfig == nil {
+		if loaded, err := modelconfig.LoadLLMConfig(ctx, db, payload.UserID); err == nil {
+			llmConfig = loaded
+			log.Printf("[repair_job] llm_config loaded from DB for user_id=%s", payload.UserID)
+		} else {
+			llmConfig = map[string]any{}
+			log.Printf("[repair_job] llm_config load failed (using empty), err=%v", err)
+		}
+	} else {
+		log.Printf("[repair_job] llm_config from payload (keys=%d)", len(llmConfig))
+	}
+
+	restoreStatus := func(repairErr string) {
+		updates := map[string]any{
+			"generate_status": payload.PrevStatus,
+			"updated_at":      time.Now().UTC(),
+		}
+		if repairErr != "" {
+			updates["generate_warning"] = "[修复失败] " + repairErr
+		}
+		log.Printf("[repair_job] RESTORE draft_id=%s status=%q warning=%q",
+			payload.DraftID, payload.PrevStatus, updates["generate_warning"])
+		_ = db.Model(&orm.WorkflowDraft{}).Where("id = ? AND deleted_at IS NULL", payload.DraftID).Updates(updates)
+		if payload.RepairRunID != "" {
+			// diagnostics_after_json is written by the validation path with the
+			// structured report. Do not replace it with a generic error string.
+			_ = db.Model(&orm.WorkflowRepairRun{}).Where("id=?", payload.RepairRunID).Updates(map[string]any{"status": "failed", "updated_at": time.Now().UTC()}).Error
+		}
+	}
+
+	if payload.Target == "scripts" || payload.Target == "full" {
+		var scripts map[string]string
+		if json.Unmarshal([]byte(draft.ScriptsContent), &scripts) != nil {
+			scripts = map[string]string{}
+		}
+		workflowYAML, stateYAML, scenarioMD := draft.WorkflowYAMLContent, draft.StateYAMLContent, draft.ScenarioContent
+		var allWarnings []string
+		if payload.Target == "full" {
+			stateResp, callErr := algo.RepairStateMachine(ctx, algo.RepairStateMachineRequest{WorkflowYAML: workflowYAML, StateYAML: stateYAML, RepairHint: payload.RepairHint, Warnings: payload.Warnings, Diagnostics: payload.Diagnostics, Target: "statemachine", LLMConfig: llmConfig})
+			if callErr != nil {
+				restoreStatus(callErr.Error())
+				return asyncjob.Result{ErrorCode: generateErrAlgoFailed}, callErr
+			}
+			stateYAML = stateResp.StateYAML
+			if stateResp.WorkflowYAML != "" {
+				workflowYAML = stateResp.WorkflowYAML
+			}
+			allWarnings = append(allWarnings, stateResp.RemainingWarnings...)
+			scenarioResp, callErr := algo.RepairStateMachine(ctx, algo.RepairStateMachineRequest{WorkflowYAML: workflowYAML, StateYAML: stateYAML, RepairHint: payload.RepairHint, Target: "scenario", LLMConfig: llmConfig})
+			if callErr != nil {
+				restoreStatus(callErr.Error())
+				return asyncjob.Result{ErrorCode: generateErrAlgoFailed}, callErr
+			}
+			scenarioMD = scenarioResp.ScenarioMD
+			if scenarioMD == "" {
+				scenarioMD = scenarioResp.StateYAML
+			}
+		}
+		scriptResp, callErr := algo.RepairStateMachine(ctx, algo.RepairStateMachineRequest{WorkflowYAML: workflowYAML, StateYAML: stateYAML, ScenarioMD: scenarioMD, Scripts: scripts, RepairHint: payload.RepairHint, Target: "scripts", LLMConfig: llmConfig})
+		if callErr != nil {
+			restoreStatus(callErr.Error())
+			return asyncjob.Result{ErrorCode: generateErrAlgoFailed}, callErr
+		}
+		if scriptResp.WorkflowYAML != "" {
+			workflowYAML = scriptResp.WorkflowYAML
+		}
+		if scriptResp.StateYAML != "" {
+			stateYAML = scriptResp.StateYAML
+		}
+		if scriptResp.ScenarioMD != "" {
+			scenarioMD = scriptResp.ScenarioMD
+		}
+		scripts = scriptResp.Scripts
+		allWarnings = append(allWarnings, scriptResp.RemainingWarnings...)
+		scriptsBytes, _ := json.Marshal(scripts)
+		scriptsJSON := string(scriptsBytes)
+		afterDiagnostics := diagnoseWorkflowWithProfile(workflowYAML, stateYAML, scenarioMD, scriptsJSON, graphengine.ProfilePublish)
+		if payload.RepairRunID != "" {
+			_ = db.Model(&orm.WorkflowRepairRun{}).Where("id=?", payload.RepairRunID).Update("diagnostics_after_json", diagnosticsJSON(afterDiagnostics)).Error
+		}
+		if hasDiagnosticErrorsForTarget(afterDiagnostics, "full") {
+			restoreStatus("repair validation failed")
+			return asyncjob.Result{ErrorCode: "repair_validation_failed"}, fmt.Errorf("repair validation failed")
+		}
+		if err := updateWorkflowGenerationScriptAudit(db.WithContext(ctx), draft.ID, draft.SourceAnalysisID, "", scripts); err != nil {
+			restoreStatus("save repaired script audit: " + err.Error())
+			return asyncjob.Result{ErrorCode: generateErrSaveFailed}, fmt.Errorf("save repaired script audit: %w", err)
+		}
+		updates := map[string]any{"state_yaml_content": stateYAML, "scenario_content": scenarioMD, "scripts_content": scriptsJSON, "generate_status": payload.PrevStatus, "generate_warning": mergeWarnings(currentGenerateWarning(db, draft.ID), strings.Join(allWarnings, "; ")), "version": draft.Version + 1, "updated_at": time.Now().UTC()}
+		setWorkflowYAMLUpdate(updates, workflowYAML)
+		result := db.Model(&orm.WorkflowDraft{}).Where("id = ? AND version = ? AND deleted_at IS NULL", draft.ID, payload.DraftVersion).Updates(updates)
+		if result.Error != nil || result.RowsAffected != 1 {
+			if payload.RepairRunID != "" {
+				_ = db.Model(&orm.WorkflowRepairRun{}).Where("id=?", payload.RepairRunID).Update("status", "stale").Error
+			}
+			return asyncjob.Result{ErrorCode: "repair_stale_draft"}, fmt.Errorf("repair stale draft")
+		}
+		if payload.RepairRunID != "" {
+			files := []string{"workflow.yaml", "scenario/state.yml", "scenario/scenario.md", "scripts"}
+			changes, _ := json.Marshal(map[string]any{"files": files})
+			_ = db.Model(&orm.WorkflowRepairRun{}).Where("id=?", payload.RepairRunID).Updates(map[string]any{"status": "succeeded", "changes_json": string(changes), "updated_at": time.Now().UTC()}).Error
+		}
+		return asyncjob.Result{}, nil
+	}
+
+	if payload.Target == "scenario" {
+		scenarioHint := payload.RepairHint
+		if scenarioHint == "" {
+			scenarioHint = "Fix or complete the scenario.md documentation."
+		}
+		log.Printf("[repair_job/scenario] calling algo.RepairStateMachine with target=scenario hint_len=%d", len(scenarioHint))
+		resp, err := algo.RepairStateMachine(ctx, algo.RepairStateMachineRequest{
+			WorkflowYAML: draft.WorkflowYAMLContent,
+			StateYAML:    draft.StateYAMLContent,
+			RepairHint:   scenarioHint,
+			Target:       "scenario",
+			Warnings:     payload.Warnings,
+			LLMConfig:    llmConfig,
+		})
+		if err != nil {
+			log.Printf("[repair_job/scenario] algo error: %v", err)
+			restoreStatus(err.Error())
+			return asyncjob.Result{ErrorCode: generateErrAlgoFailed}, fmt.Errorf("repair scenario: %w", err)
+		}
+		log.Printf("[repair_job/scenario] algo returned scenario_md_len=%d (in state_yaml field)", len(resp.StateYAML))
+		scenarioMD := resp.ScenarioMD
+		if scenarioMD == "" {
+			scenarioMD = resp.StateYAML
+		}
+		if err := validateGeneratedScenarioContent(scenarioMD, draft.StateYAMLContent); err != nil {
+			restoreStatus("repair validation failed: " + err.Error())
+			return asyncjob.Result{ErrorCode: "repair_validation_failed"}, fmt.Errorf("repair validation failed: %w", err)
+		}
+		afterDiagnostics := diagnoseWorkflow(draft.WorkflowYAMLContent, draft.StateYAMLContent, scenarioMD, draft.ScriptsContent)
+		if payload.RepairRunID != "" {
+			_ = db.Model(&orm.WorkflowRepairRun{}).Where("id=?", payload.RepairRunID).Update("diagnostics_after_json", diagnosticsJSON(afterDiagnostics)).Error
+		}
+		if hasDiagnosticErrorsForTarget(afterDiagnostics, "scenario") {
+			restoreStatus("repair validation failed")
+			return asyncjob.Result{ErrorCode: "repair_validation_failed"}, fmt.Errorf("repair validation failed")
+		}
+		updates := map[string]any{
+			"scenario_content": scenarioMD,
+			"generate_status":  payload.PrevStatus,
+			"generate_warning": "", // clear any previous warning on success
+			"version":          draft.Version + 1,
+			"updated_at":       time.Now().UTC(),
+		}
+		result := db.Model(&orm.WorkflowDraft{}).Where("id = ? AND version = ? AND deleted_at IS NULL", draft.ID, payload.DraftVersion).Updates(updates)
+		if result.Error != nil || result.RowsAffected != 1 {
+			if payload.RepairRunID != "" {
+				_ = db.Model(&orm.WorkflowRepairRun{}).Where("id=?", payload.RepairRunID).Updates(map[string]any{"status": "stale", "updated_at": time.Now().UTC()}).Error
+			}
+			log.Printf("[repair_job/scenario] DB save failed: %v", err)
+			return asyncjob.Result{ErrorCode: "repair_stale_draft"}, fmt.Errorf("save repair: stale draft")
+		}
+		if payload.RepairRunID != "" {
+			_ = db.Model(&orm.WorkflowRepairRun{}).Where("id=?", payload.RepairRunID).Updates(map[string]any{"status": "succeeded", "changes_json": `{"files":["scenario/scenario.md"]}`, "updated_at": time.Now().UTC()}).Error
+		}
+		log.Printf("[repair_job/scenario] SUCCESS draft_id=%s new_version=%d", payload.DraftID, draft.Version+1)
+		return asyncjob.Result{}, nil
+	}
+
+	// statemachine / ui target
+	log.Printf("[repair_job/statemachine] calling algo.RepairStateMachine target=%q hint_len=%d warnings=%v",
+		payload.Target, len(payload.RepairHint), payload.Warnings)
+	resp, err := algo.RepairStateMachine(ctx, algo.RepairStateMachineRequest{
+		WorkflowYAML: draft.WorkflowYAMLContent,
+		StateYAML:    draft.StateYAMLContent,
+		RepairHint:   payload.RepairHint,
+		Target:       payload.Target,
+		Warnings:     payload.Warnings,
+		Diagnostics:  payload.Diagnostics,
+		LLMConfig:    llmConfig,
+	})
+	if err != nil {
+		log.Printf("[repair_job/statemachine] algo error: %v", err)
+		restoreStatus(err.Error())
+		return asyncjob.Result{ErrorCode: generateErrAlgoFailed}, fmt.Errorf("repair statemachine: %w", err)
+	}
+	log.Printf("[repair_job/statemachine] algo returned state_yaml_len=%d workflow_yaml_updated=%v remaining_warnings=%v",
+		len(resp.StateYAML), resp.WorkflowYAML != "", resp.RemainingWarnings)
+
+	newWarning := strings.Join(resp.RemainingWarnings, "; ")
+	finalWorkflowYAML := draft.WorkflowYAMLContent
+	if resp.WorkflowYAML != "" {
+		finalWorkflowYAML = resp.WorkflowYAML
+	}
+	profile := graphengine.ProfileEditor
+	if payload.Target == "statemachine" || payload.Target == "full" {
+		profile = graphengine.ProfilePublish
+	}
+	afterDiagnostics := diagnoseWorkflowWithProfile(finalWorkflowYAML, resp.StateYAML, draft.ScenarioContent, draft.ScriptsContent, profile)
+	if payload.RepairRunID != "" {
+		_ = db.Model(&orm.WorkflowRepairRun{}).Where("id=?", payload.RepairRunID).Update("diagnostics_after_json", diagnosticsJSON(afterDiagnostics)).Error
+	}
+	if hasDiagnosticErrorsForTarget(afterDiagnostics, payload.Target) {
+		restoreStatus("repair validation failed")
+		return asyncjob.Result{ErrorCode: "repair_validation_failed"}, fmt.Errorf("repair validation failed")
+	}
+	updates := map[string]any{
+		"state_yaml_content": resp.StateYAML,
+		"generate_warning":   newWarning,
+		"generate_status":    payload.PrevStatus,
+		"version":            draft.Version + 1,
+		"updated_at":         time.Now().UTC(),
+	}
+	if resp.WorkflowYAML != "" {
+		setWorkflowYAMLUpdate(updates, resp.WorkflowYAML)
+	}
+	result := db.Model(&orm.WorkflowDraft{}).Where("id = ? AND version = ? AND deleted_at IS NULL", draft.ID, payload.DraftVersion).Updates(updates)
+	if result.Error != nil || result.RowsAffected != 1 {
+		if payload.RepairRunID != "" {
+			_ = db.Model(&orm.WorkflowRepairRun{}).Where("id=?", payload.RepairRunID).Updates(map[string]any{"status": "stale", "updated_at": time.Now().UTC()}).Error
+		}
+		log.Printf("[repair_job/statemachine] DB save failed: %v", err)
+		return asyncjob.Result{ErrorCode: "repair_stale_draft"}, fmt.Errorf("save repair: stale draft")
+	}
+	if payload.RepairRunID != "" {
+		files := `["scenario/state.yml"]`
+		if resp.WorkflowYAML != "" {
+			files = `["workflow.yaml","scenario/state.yml"]`
+		}
+		_ = db.Model(&orm.WorkflowRepairRun{}).Where("id=?", payload.RepairRunID).Updates(map[string]any{"status": "succeeded", "changes_json": `{"files":` + files + `}`, "updated_at": time.Now().UTC()}).Error
+	}
+	log.Printf("[repair_job/statemachine] SUCCESS draft_id=%s new_version=%d status=%q warning=%q",
+		payload.DraftID, draft.Version+1, payload.PrevStatus, newWarning)
+	return asyncjob.Result{}, nil
+}

@@ -1,0 +1,4775 @@
+package main
+
+import (
+	"fmt"
+	"reflect"
+	"sort"
+	"strings"
+
+	"lazymind/core/agent"
+	"lazymind/core/chat"
+	"lazymind/core/datasource"
+	"lazymind/core/doc"
+	"lazymind/core/evalset"
+	"lazymind/core/mcp"
+	"lazymind/core/modelconfig"
+	"lazymind/core/modelprovider"
+	"lazymind/core/showcase"
+	"lazymind/core/wordgroup"
+)
+
+type schemaSource struct {
+	Type   any
+	Ref    string
+	Inline map[string]any
+}
+
+type openAPIBody struct {
+	Required    bool
+	ContentType string
+	Schema      schemaSource
+}
+
+type openAPIResponse struct {
+	Description string
+	ContentType string
+	Schema      schemaSource
+}
+
+type openAPIOperation struct {
+	Method      string
+	Path        string
+	Summary     string
+	Description string
+	Tags        []string
+	PathParams  any
+	QueryParams any
+	Headers     any
+	RequestBody *openAPIBody
+	Responses   map[int]openAPIResponse
+}
+
+type schemaBuilder struct {
+	components map[string]any
+	seen       map[reflect.Type]string
+}
+
+func newSchemaBuilder() *schemaBuilder {
+	return &schemaBuilder{
+		components: map[string]any{},
+		seen:       map[reflect.Type]string{},
+	}
+}
+
+func operationRegistryOpenAPISpec() map[string]any {
+	builder := newSchemaBuilder()
+	paths := map[string]any{}
+	for _, op := range registeredCoreOperations() {
+		pathItem, _ := paths[op.Path].(map[string]any)
+		if pathItem == nil {
+			pathItem = map[string]any{}
+			paths[op.Path] = pathItem
+		}
+		pathItem[strings.ToLower(op.Method)] = op.toOpenAPI(builder)
+	}
+	return map[string]any{
+		"components": map[string]any{
+			"schemas": builder.components,
+		},
+		"paths": paths,
+	}
+}
+
+func (op openAPIOperation) toOpenAPI(builder *schemaBuilder) map[string]any {
+	result := map[string]any{
+		"summary": op.Summary,
+	}
+	if strings.TrimSpace(op.Description) != "" {
+		result["description"] = op.Description
+	}
+	if len(op.Tags) > 0 {
+		result["tags"] = op.Tags
+	}
+
+	params := make([]map[string]any, 0)
+	params = append(params, buildStructParameters(op.PathParams, "path", builder)...)
+	params = append(params, buildStructParameters(op.QueryParams, "query", builder)...)
+	params = append(params, buildStructParameters(op.Headers, "header", builder)...)
+	if len(params) > 0 {
+		items := make([]any, 0, len(params))
+		for _, item := range params {
+			items = append(items, item)
+		}
+		result["parameters"] = items
+	}
+
+	if op.RequestBody != nil {
+		contentType := op.RequestBody.ContentType
+		if contentType == "" {
+			contentType = "application/json"
+		}
+		result["requestBody"] = map[string]any{
+			"required": op.RequestBody.Required,
+			"content": map[string]any{
+				contentType: map[string]any{
+					"schema": builder.schemaFromSource(op.RequestBody.Schema),
+				},
+			},
+		}
+	}
+
+	responses := map[string]any{}
+	for _, code := range sortedStatusCodes(op.Responses) {
+		resp := op.Responses[code]
+		description := resp.Description
+		if description == "" {
+			description = httpStatusText(code)
+		}
+		contentType := resp.ContentType
+		if contentType == "" {
+			contentType = "application/json"
+		}
+		entry := map[string]any{"description": description}
+		if schema := builder.schemaFromSource(resp.Schema); schema != nil {
+			entry["content"] = map[string]any{
+				contentType: map[string]any{"schema": schema},
+			}
+		}
+		responses[fmt.Sprintf("%d", code)] = entry
+	}
+	if len(responses) == 0 {
+		responses["200"] = map[string]any{"description": "OK"}
+	}
+	result["responses"] = responses
+	return result
+}
+
+func buildStructParameters(v any, location string, builder *schemaBuilder) []map[string]any {
+	if v == nil {
+		return nil
+	}
+	t := reflect.TypeOf(v)
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct {
+		return nil
+	}
+	params := make([]map[string]any, 0)
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		if !field.IsExported() {
+			continue
+		}
+		name, ok := field.Tag.Lookup(location)
+		if !ok || strings.TrimSpace(name) == "" || name == "-" {
+			continue
+		}
+		schema := builder.schemaForType(field.Type)
+		if schema == nil {
+			continue
+		}
+		required := location == "path" || field.Tag.Get("required") == "true"
+		param := map[string]any{
+			"name":     name,
+			"in":       location,
+			"required": required,
+			"schema":   schema,
+		}
+		if values := openAPIEnumValues(field.Tag.Get("enum")); len(values) > 0 {
+			schema["enum"] = values
+		}
+		if description := strings.TrimSpace(field.Tag.Get("desc")); description != "" {
+			param["description"] = description
+		}
+		params = append(params, param)
+	}
+	return params
+}
+
+func openAPIEnumValues(raw string) []any {
+	parts := strings.Split(raw, ",")
+	values := make([]any, 0, len(parts))
+	for _, part := range parts {
+		value := strings.TrimSpace(part)
+		if value != "" {
+			values = append(values, value)
+		}
+	}
+	return values
+}
+
+func (b *schemaBuilder) schemaFromSource(source schemaSource) map[string]any {
+	if source.Inline != nil {
+		return source.Inline
+	}
+	if source.Ref != "" {
+		return refSchema(source.Ref)
+	}
+	if source.Type == nil {
+		return nil
+	}
+	return b.schemaForType(reflect.TypeOf(source.Type))
+}
+
+func (b *schemaBuilder) schemaForType(t reflect.Type) map[string]any {
+	if t == nil {
+		return nil
+	}
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if schema := inlineSpecialSchema(t); schema != nil {
+		return schema
+	}
+	if isPrimitiveKind(t.Kind()) || t.Kind() == reflect.Slice || t.Kind() == reflect.Array || t.Kind() == reflect.Map || t.Kind() == reflect.Interface {
+		return b.inlineSchemaForType(t)
+	}
+	if t.Kind() == reflect.Struct {
+		name := schemaNameForType(t)
+		if existing, ok := b.seen[t]; ok {
+			return refSchema(existing)
+		}
+		b.seen[t] = name
+		b.components[name] = b.inlineSchemaForType(t)
+		return refSchema(name)
+	}
+	return map[string]any{"type": "string"}
+}
+
+func (b *schemaBuilder) inlineSchemaForType(t reflect.Type) map[string]any {
+	if t == nil {
+		return nil
+	}
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if schema := inlineSpecialSchema(t); schema != nil {
+		return schema
+	}
+	switch t.Kind() {
+	case reflect.String:
+		return map[string]any{"type": "string"}
+	case reflect.Bool:
+		return map[string]any{"type": "boolean"}
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		schema := map[string]any{"type": "integer"}
+		if t.Kind() == reflect.Int64 {
+			schema["format"] = "int64"
+		}
+		return schema
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		schema := map[string]any{"type": "integer", "minimum": 0}
+		if t.Kind() == reflect.Uint64 {
+			schema["format"] = "int64"
+		}
+		return schema
+	case reflect.Float32:
+		return map[string]any{"type": "number", "format": "float"}
+	case reflect.Float64:
+		return map[string]any{"type": "number", "format": "double"}
+	case reflect.Slice, reflect.Array:
+		return map[string]any{"type": "array", "items": b.schemaForType(t.Elem())}
+	case reflect.Map:
+		if t.Key().Kind() != reflect.String {
+			return obj()
+		}
+		return map[string]any{"type": "object", "additionalProperties": b.schemaForType(t.Elem())}
+	case reflect.Interface:
+		return obj()
+	case reflect.Struct:
+		properties := map[string]any{}
+		required := make([]string, 0)
+		for i := 0; i < t.NumField(); i++ {
+			field := t.Field(i)
+			if !field.IsExported() {
+				continue
+			}
+			name, omitEmpty, skip := jsonFieldName(field)
+			if skip {
+				continue
+			}
+			propertySchema := b.schemaForType(field.Type)
+			if description := strings.TrimSpace(field.Tag.Get("desc")); description != "" {
+				propertySchema["description"] = description
+			}
+			if values := openAPIEnumValues(field.Tag.Get("enum")); len(values) > 0 {
+				propertySchema["enum"] = values
+			}
+			if field.Tag.Get("nullable") == "true" {
+				propertySchema["nullable"] = true
+			}
+			if field.Tag.Get("freeform") == "true" {
+				propertySchema["additionalProperties"] = true
+			}
+			properties[name] = propertySchema
+			if field.Tag.Get("required") == "true" || (!omitEmpty && !isOptionalField(field.Type)) {
+				required = append(required, name)
+			}
+		}
+		sort.Strings(required)
+		result := map[string]any{"type": "object", "properties": properties}
+		if len(required) > 0 {
+			result["required"] = required
+		}
+		return result
+	default:
+		return map[string]any{"type": "string"}
+	}
+}
+
+func inlineSpecialSchema(t reflect.Type) map[string]any {
+	if t.PkgPath() == "time" && t.Name() == "Time" {
+		return map[string]any{"type": "string", "format": "date-time"}
+	}
+	return nil
+}
+
+func jsonFieldName(field reflect.StructField) (name string, omitEmpty bool, skip bool) {
+	jsonTag := field.Tag.Get("json")
+	if jsonTag == "-" {
+		return "", false, true
+	}
+	if jsonTag == "" {
+		return lowerCamel(field.Name), false, false
+	}
+	parts := strings.Split(jsonTag, ",")
+	name = strings.TrimSpace(parts[0])
+	if name == "" {
+		name = lowerCamel(field.Name)
+	}
+	for _, part := range parts[1:] {
+		if strings.TrimSpace(part) == "omitempty" {
+			omitEmpty = true
+		}
+	}
+	return name, omitEmpty, false
+}
+
+func lowerCamel(v string) string {
+	if v == "" {
+		return v
+	}
+	return strings.ToLower(v[:1]) + v[1:]
+}
+
+func isOptionalField(t reflect.Type) bool {
+	for t.Kind() == reflect.Pointer {
+		return true
+	}
+	switch t.Kind() {
+	case reflect.Map, reflect.Slice, reflect.Interface:
+		return true
+	default:
+		return false
+	}
+}
+
+func isPrimitiveKind(kind reflect.Kind) bool {
+	switch kind {
+	case reflect.String, reflect.Bool,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64:
+		return true
+	default:
+		return false
+	}
+}
+
+func schemaNameForType(t reflect.Type) string {
+	if name := t.Name(); name != "" {
+		return name
+	}
+	return strings.ReplaceAll(t.String(), ".", "_")
+}
+
+func sortedStatusCodes(responses map[int]openAPIResponse) []int {
+	codes := make([]int, 0, len(responses))
+	for code := range responses {
+		codes = append(codes, code)
+	}
+	sort.Ints(codes)
+	return codes
+}
+
+func httpStatusText(code int) string {
+	switch code {
+	case 200:
+		return "OK"
+	case 201:
+		return "Created"
+	case 204:
+		return "No Content"
+	case 400:
+		return "Bad Request"
+	case 401:
+		return "Unauthorized"
+	case 403:
+		return "Forbidden"
+	case 404:
+		return "Not Found"
+	case 500:
+		return "Internal Server Error"
+	default:
+		return "Response"
+	}
+}
+
+type datasetPathParams struct {
+	Dataset string `path:"dataset"`
+}
+
+type documentPathParams struct {
+	Dataset  string `path:"dataset"`
+	Document string `path:"document"`
+}
+
+type databaseConnectionPathParams struct {
+	Connection string `path:"connection"`
+}
+
+type deleteDatabaseConnectionOpenAPIResponse struct {
+	Deleted bool `json:"deleted"`
+}
+
+type taskPathParams struct {
+	Dataset string `path:"dataset"`
+	Task    string `path:"task"`
+}
+
+type uploadPathParams struct {
+	Dataset  string `path:"dataset"`
+	UploadID string `path:"upload_id"`
+}
+
+type exportConversationFilePathParams struct {
+	FileID string `path:"file_id"`
+}
+
+type conversationPathParams struct {
+	Name string `path:"name"`
+}
+
+type conversationModelPathParams struct {
+	ConversationID string `path:"conversation_id"`
+}
+
+type chatModelsQueryParams struct {
+	ConversationID string `query:"conversation_id" desc:"Optional owned conversation whose saved model selection should be restored."`
+}
+
+type chatModelSelectionOpenAPI struct {
+	Mode         string `json:"mode" enum:"fixed,auto"`
+	ModelID      string `json:"model_id,omitempty"`
+	ProviderID   string `json:"provider_id,omitempty"`
+	ProviderName string `json:"provider_name,omitempty"`
+	GroupID      string `json:"group_id,omitempty"`
+	GroupName    string `json:"group_name,omitempty"`
+	ModelName    string `json:"model_name,omitempty"`
+	Source       string `json:"source,omitempty" enum:"own,shared"`
+	Version      int64  `json:"version"`
+	Availability string `json:"availability" enum:"available,unavailable"`
+}
+
+type chatModelListOpenAPIItem struct {
+	ID           string   `json:"id"`
+	Name         string   `json:"name"`
+	GroupID      string   `json:"group_id"`
+	GroupName    string   `json:"group_name"`
+	Source       string   `json:"source" enum:"own,shared"`
+	Capabilities []string `json:"capabilities"`
+	Badges       []string `json:"badges"`
+	Availability string   `json:"availability" enum:"available,unavailable"`
+	Current      bool     `json:"current"`
+	Default      bool     `json:"default"`
+	Shared       bool     `json:"shared"`
+}
+
+type chatModelProviderOpenAPIItem struct {
+	ID     string                     `json:"id"`
+	Name   string                     `json:"name"`
+	Source string                     `json:"source" enum:"own,shared"`
+	Models []chatModelListOpenAPIItem `json:"models"`
+}
+
+type chatModelsOpenAPIResponse struct {
+	Selection           chatModelSelectionOpenAPI      `json:"selection"`
+	DefaultSelection    chatModelSelectionOpenAPI      `json:"default_selection"`
+	Providers           []chatModelProviderOpenAPIItem `json:"providers"`
+	SwitchAllowed       bool                           `json:"switch_allowed"`
+	SwitchBlockedReason string                         `json:"switch_blocked_reason,omitempty" enum:"generating,workflow_running,background_task_running"`
+	AutoAvailable       bool                           `json:"auto_available"`
+}
+
+type patchConversationModelOpenAPIRequest struct {
+	Mode            string `json:"mode" enum:"fixed,auto"`
+	ModelID         string `json:"model_id,omitempty" desc:"Required only when mode is fixed."`
+	ExpectedVersion int64  `json:"expected_version"`
+}
+
+type patchConversationModelOpenAPIResponse struct {
+	Selection chatModelSelectionOpenAPI `json:"selection"`
+}
+
+type sidechatParentPathParams struct {
+	ParentID string `path:"parent_id"`
+}
+
+type sidechatChildPathParams struct {
+	ChildID string `path:"child_id"`
+}
+
+type createSidechatOpenAPIRequest struct {
+	SourceHistoryID string `json:"source_history_id,omitempty"`
+	SourceSeq       *int   `json:"source_seq,omitempty"`
+	SelectedText    string `json:"selected_text,omitempty"`
+	ThinkingDepth   string `json:"thinking_depth,omitempty" enum:"low,medium,high,max"`
+}
+
+type sidechatPublicSourceContextOpenAPI struct {
+	Messages []map[string]any `json:"messages,omitempty"`
+}
+
+type sidechatConversationOpenAPI struct {
+	ID                   string                              `json:"id"`
+	ConversationID       string                              `json:"conversation_id"`
+	DisplayName          string                              `json:"display_name"`
+	ParentConversationID *string                             `json:"parent_conversation_id,omitempty"`
+	RelationType         string                              `json:"relation_type" enum:"sidechat,fork"`
+	SourceHistoryID      *string                             `json:"source_history_id,omitempty"`
+	SourceSeq            *int                                `json:"source_seq,omitempty"`
+	SelectedText         string                              `json:"selected_text,omitempty"`
+	SourceContext        *sidechatPublicSourceContextOpenAPI `json:"source_context,omitempty"`
+	ParentDisplayName    string                              `json:"parent_display_name,omitempty"`
+	SearchConfig         map[string]any                      `json:"search_config,omitempty"`
+	ChatModelMode        *string                             `json:"chat_model_mode,omitempty" enum:"fixed,auto"`
+	ChatModelID          *string                             `json:"chat_model_id,omitempty"`
+	ChatModelVersion     int64                               `json:"chat_model_version"`
+	ThinkingDepth        string                              `json:"thinking_depth,omitempty" enum:"low,medium,high,max"`
+	IsEphemeral          bool                                `json:"is_ephemeral"`
+}
+
+type sidechatConversationOpenAPIResponse struct {
+	Conversation sidechatConversationOpenAPI `json:"conversation"`
+}
+
+type conversationSearchConfigOpenAPIRequest struct {
+	DatasetIDs []string `json:"dataset_ids,omitempty" desc:"Optional. Replace knowledge bases; omit to preserve the current selection."`
+	Creators   []string `json:"creators,omitempty" desc:"Optional. Replace document creator filters; omit to preserve them."`
+	Tags       []string `json:"tags,omitempty" desc:"Optional. Replace document tag filters; omit to preserve them."`
+}
+
+type conversationSearchConfigOpenAPIResponse struct {
+	ConversationID string         `json:"conversation_id"`
+	SearchConfig   map[string]any `json:"search_config"`
+}
+
+type toolPathParams struct {
+	ToolName string `path:"tool_name"`
+}
+
+type toolListQueryParams struct {
+	Keyword  string `query:"keyword"`
+	Page     int32  `query:"page"`
+	PageSize int32  `query:"page_size"`
+}
+
+type localizedCatalogHeaders struct {
+	AcceptLanguage string `header:"Accept-Language" desc:"Optional UI locale. zh and zh-* use zh-CN; en and en-* use en-US. Missing or unsupported values default to zh-CN."`
+}
+
+type mcpServerListQueryParams struct {
+	Keyword  string `query:"keyword"`
+	Page     int32  `query:"page"`
+	PageSize int32  `query:"page_size"`
+}
+
+type mcpServerPathParams struct {
+	ID string `path:"id"`
+}
+
+type mcpDeleteServerOpenAPIResponse struct {
+	ID string `json:"id"`
+}
+
+type toolMethodOpenAPIResponse struct {
+	Name    string `json:"name"`
+	Summary string `json:"summary,omitempty"`
+}
+
+type toolGroupOpenAPIResponse struct {
+	Name        string                      `json:"name"`
+	Label       string                      `json:"label,omitempty"`
+	Description string                      `json:"description,omitempty"`
+	Methods     []toolMethodOpenAPIResponse `json:"methods,omitempty"`
+	CanDisable  bool                        `json:"can_disable"`
+	Active      bool                        `json:"active"`
+	Disabled    bool                        `json:"disabled"`
+}
+
+type toolListOpenAPIResponse struct {
+	ToolGroups []toolGroupOpenAPIResponse `json:"tool_groups"`
+	Page       int32                      `json:"page"`
+	PageSize   int32                      `json:"page_size"`
+	Total      int32                      `json:"total"`
+}
+
+type toolStateOpenAPIResponse struct {
+	Name     string `json:"name"`
+	Disabled bool   `json:"disabled"`
+}
+
+type promptPathParams struct {
+	Name string `path:"name"`
+}
+
+type promptListQueryParams struct {
+	PageSize  int32  `query:"page_size"`
+	PageToken string `query:"page_token"`
+	Keyword   string `query:"keyword"`
+	Category  string `query:"category"`
+	Scope     string `query:"scope"`
+	Sort      string `query:"sort"`
+	Locale    string `query:"locale"`
+}
+
+type showcaseCasePathParams struct {
+	CaseID string `path:"case_id"`
+}
+
+type showcaseListQueryParams struct {
+	Keyword  string `query:"keyword"`
+	Category string `query:"category"`
+}
+
+type promptGetQueryParams struct {
+	Locale string `query:"locale"`
+}
+
+type promptCategoryOpenAPIResponse struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+type promptCategoryListOpenAPIResponse struct {
+	Categories []promptCategoryOpenAPIResponse `json:"categories"`
+}
+
+type promptCategoryCreateOpenAPIRequest struct {
+	Name string `json:"name"`
+}
+
+type promptCreateOpenAPIRequest struct {
+	DisplayName string `json:"display_name"`
+	Content     string `json:"content"`
+	Category    string `json:"category"`
+}
+
+type promptPatchOpenAPIRequest struct {
+	DisplayName string `json:"display_name"`
+	Content     string `json:"content"`
+	Category    string `json:"category"`
+}
+
+type promptPolishOpenAPIRequest struct {
+	Content      string `json:"content"`
+	UserInstruct string `json:"user_instruct"`
+}
+
+type promptPolishOpenAPIResponse struct {
+	Content string `json:"content"`
+}
+
+type promptItemOpenAPIResponse struct {
+	Name        string `json:"name"`
+	ID          string `json:"id"`
+	Content     string `json:"content"`
+	DisplayName string `json:"display_name"`
+	Category    string `json:"category"`
+	Source      string `json:"source"`
+	IsFavorite  bool   `json:"is_favorite"`
+	UsageCount  int64  `json:"usage_count"`
+	LastUsedAt  string `json:"last_used_at,omitempty"`
+	CreatedAt   string `json:"created_at,omitempty"`
+	UpdatedAt   string `json:"updated_at,omitempty"`
+}
+
+type promptFacetOpenAPIResponse struct {
+	Scopes        map[string]int64 `json:"scopes"`
+	Categories    map[string]int64 `json:"categories"`
+	CategoryTotal int64            `json:"category_total"`
+}
+
+type promptListOpenAPIResponse struct {
+	Prompts          []promptItemOpenAPIResponse     `json:"prompts"`
+	CustomCategories []promptCategoryOpenAPIResponse `json:"custom_categories"`
+	NextPageToken    string                          `json:"next_page_token"`
+	Total            int64                           `json:"total"`
+	Facets           promptFacetOpenAPIResponse      `json:"facets"`
+}
+
+type promptStateOpenAPIResponse struct {
+	ID         string `json:"id"`
+	IsFavorite bool   `json:"is_favorite"`
+	UsageCount int64  `json:"usage_count"`
+	LastUsedAt string `json:"last_used_at,omitempty"`
+}
+
+type agentThreadPathParams struct {
+	ThreadID string `path:"thread_id"`
+}
+
+type agentThreadGatePathParams struct {
+	ThreadID string `path:"thread_id"`
+	Step     string `path:"step"`
+	Version  int32  `path:"version"`
+}
+
+type agentThreadGateVersionPathParams struct {
+	ThreadID string `path:"thread_id"`
+	Version  int32  `path:"version"`
+}
+
+type agentThreadTracePathParams struct {
+	ThreadID string `path:"thread_id"`
+	TraceID  string `path:"trace_id"`
+}
+
+type agentThreadTraceCompareQueryParams struct {
+	A string `query:"a" required:"true"`
+	B string `query:"b" required:"true"`
+}
+
+type agentThreadABTestCaseDetailsQueryParams struct {
+	PageSize  int32  `query:"page_size"`
+	PageToken string `query:"page_token"`
+	Keyword   string `query:"keyword"`
+	Outcome   string `query:"outcome"`
+}
+
+type agentThreadEventsQueryParams struct {
+	StepID string `query:"step_id"`
+}
+
+type agentThreadEventTraceQueryParams struct {
+	StepID string `query:"step_id" required:"true"`
+}
+
+type agentThreadListQueryParams struct {
+	PageSize  int32  `query:"page_size"`
+	PageToken string `query:"page_token"`
+}
+
+type agentCandidateListQueryParams struct {
+	ThreadID  string `query:"thread_id" required:"true"`
+	Status    string `query:"status"`
+	PageSize  int32  `query:"page_size"`
+	PageToken string `query:"page_token"`
+}
+
+type agentCandidatePathParams struct {
+	CandidateID string `path:"candidate_id:.*"`
+}
+
+type agentRouterAlgorithmPathParams struct {
+	AlgorithmID string `path:"algorithm_id"`
+}
+
+type agentRouterQueryParams struct {
+	RouterAdminURL string `query:"router_admin_url" desc:"Optional Router admin origin override."`
+	RouterChatURL  string `query:"router_chat_url" desc:"Optional Router chat stream URL override."`
+}
+
+type agentRouterTrafficQueryParams struct {
+	StartTime   string `query:"start_time" required:"true" desc:"Inclusive UTC RFC3339 start time."`
+	EndTime     string `query:"end_time" required:"true" desc:"Exclusive UTC RFC3339 end time."`
+	Granularity string `query:"granularity" required:"true" enum:"hour,day"`
+}
+
+type agentRouterAlgorithmQueryParams struct {
+	ThreadID       string `query:"thread_id" desc:"Filter by owning Evo thread."`
+	AlgorithmID    string `query:"algorithm_id" desc:"Filter by exact algorithm id."`
+	Status         string `query:"status" enum:"all,starting,active,disabled,missing" desc:"Filter by live Router status; defaults to all."`
+	RouterAdminURL string `query:"router_admin_url" desc:"Optional Router admin origin override."`
+	RouterChatURL  string `query:"router_chat_url" desc:"Optional Router chat stream URL override."`
+}
+
+type agentRouterOwnerInput struct {
+	ThreadID     string `json:"thread_id" required:"true" desc:"Owning Evo thread id."`
+	CandidateRef string `json:"candidate_ref,omitempty" desc:"Candidate artifact reference used for audit."`
+}
+
+type agentRouterActionRequest struct {
+	Action           string  `json:"action" required:"true" enum:"healthcheck,start,restart,stop"`
+	WaitReadySeconds float64 `json:"wait_ready_seconds,omitempty" desc:"Start or restart readiness timeout in seconds; default 180, maximum 900."`
+}
+
+type agentRouterABStrategyRequest struct {
+	Weights        map[string]int         `json:"weights,omitempty" nullable:"true" desc:"Algorithm weights. Omit or set null to clear the strategy and return to default routing."`
+	Reason         string                 `json:"reason,omitempty" desc:"Audit reason for the strategy change."`
+	Owner          *agentRouterOwnerInput `json:"owner,omitempty" desc:"Optional Evo owner recorded in the AB audit."`
+	RouterAdminURL string                 `json:"router_admin_url,omitempty" desc:"Optional Router admin origin override."`
+	RouterChatURL  string                 `json:"router_chat_url,omitempty" desc:"Optional Router chat stream URL override."`
+}
+
+type agentRouterInstance struct {
+	Host       string `json:"host"`
+	Port       int32  `json:"port"`
+	Status     string `json:"status"`
+	Failures   int32  `json:"failures"`
+	InstanceID string `json:"instance_id"`
+}
+
+type agentRouterHealth struct {
+	Status           string                `json:"status" enum:"passed,failed,stopped"`
+	AlgorithmStatus  string                `json:"algorithm_status,omitempty" enum:"starting,active,disabled,missing"`
+	HealthyInstances int32                 `json:"healthy_instances"`
+	Instances        []agentRouterInstance `json:"instances" required:"true"`
+}
+
+type agentRouterStrategyView struct {
+	Active  bool           `json:"active"`
+	ID      *int64         `json:"id" required:"true" nullable:"true" desc:"Router strategy id; null when inactive."`
+	Weights map[string]int `json:"weights" required:"true" desc:"Effective routing weights; {default: 100} when AB routing is inactive."`
+}
+
+type agentRouterStatusCounts struct {
+	EvoOwned int32 `json:"evo_owned"`
+	Active   int32 `json:"active"`
+	Healthy  int32 `json:"healthy"`
+}
+
+type agentRouterStatusResponse struct {
+	Status         string                  `json:"status" enum:"ok"`
+	RouterAdminURL string                  `json:"router_admin_url"`
+	Algorithms     agentRouterStatusCounts `json:"algorithms"`
+	ABStrategy     agentRouterStrategyView `json:"ab_strategy"`
+}
+
+type agentRouterAlgorithm struct {
+	AlgorithmID      string  `json:"algorithm_id"`
+	Name             string  `json:"name"`
+	Status           string  `json:"status" enum:"starting,active,disabled,missing"`
+	HealthyInstances int32   `json:"healthy_instances"`
+	InstanceCount    int32   `json:"instance_count"`
+	ThreadID         *string `json:"thread_id" required:"true" nullable:"true"`
+	CreatedAt        *string `json:"created_at" required:"true" nullable:"true"`
+}
+
+type agentRouterAlgorithmListResponse struct {
+	Items []agentRouterAlgorithm `json:"items" required:"true"`
+}
+
+type agentRouterActionResponse struct {
+	Status      string            `json:"status" enum:"passed,failed,stopped"`
+	AlgorithmID string            `json:"algorithm_id"`
+	Action      string            `json:"action" enum:"healthcheck,start,restart,stop"`
+	Healthcheck agentRouterHealth `json:"healthcheck"`
+}
+
+type agentRouterDeleteResponse struct {
+	Status               string   `json:"status" enum:"deleted"`
+	AlgorithmID          string   `json:"algorithm_id"`
+	RouterStatus         string   `json:"router_status" enum:"missing,disabled"`
+	RouterRecordRetained bool     `json:"router_record_retained"`
+	LedgerDeleted        bool     `json:"ledger_deleted"`
+	ArtifactsDeleted     int32    `json:"artifacts_deleted"`
+	Workspace            string   `json:"workspace" enum:"deleted,missing,retained_external,retained_shared"`
+	RetainedHistory      []string `json:"retained_history" required:"true"`
+}
+
+type agentRouterABAudit struct {
+	ThreadID     string `json:"thread_id,omitempty"`
+	CandidateRef string `json:"candidate_ref,omitempty"`
+	Reason       string `json:"reason,omitempty"`
+}
+
+type agentRouterMutationResponse struct {
+	ID         *int64         `json:"id,omitempty"`
+	Status     string         `json:"status,omitempty" enum:"cleared"`
+	Weights    map[string]int `json:"weights,omitempty"`
+	IsActive   *bool          `json:"is_active,omitempty"`
+	Normalized *bool          `json:"normalized,omitempty"`
+}
+
+type agentRouterABStrategyResponse struct {
+	Active         bool                         `json:"active"`
+	ID             *int64                       `json:"id" required:"true" nullable:"true" desc:"Router strategy id; null when inactive."`
+	Weights        map[string]int               `json:"weights" required:"true"`
+	UpdatedBy      agentRouterABAudit           `json:"updated_by"`
+	RouterResponse *agentRouterMutationResponse `json:"router_response,omitempty" desc:"Present after PUT; contains the Router mutation result."`
+}
+
+type agentRouterErrorDetail struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
+}
+
+type agentRouterErrorResponse struct {
+	Detail agentRouterErrorDetail `json:"detail"`
+}
+
+type agentThreadOpenAPIResponse struct {
+	RuntimeStatus  string         `json:"runtime_status,omitempty"`
+	CleanupPending bool           `json:"cleanup_pending,omitempty"`
+	StatusSource   string         `json:"status_source" enum:"live,cached"`
+	ObservedAt     *string        `json:"observed_at,omitempty"`
+	ThreadID       string         `json:"thread_id"`
+	CurrentTaskID  string         `json:"current_task_id,omitempty"`
+	Status         string         `json:"status"`
+	ThreadPayload  map[string]any `json:"thread_payload,omitempty"`
+	CreatedAt      string         `json:"created_at"`
+	UpdatedAt      string         `json:"updated_at"`
+}
+
+type agentThreadListOpenAPIResponse struct {
+	CurrentThreadID string                       `json:"current_thread_id,omitempty"`
+	Threads         []agentThreadOpenAPIResponse `json:"threads"`
+	TotalSize       int64                        `json:"total_size"`
+	NextPageToken   string                       `json:"next_page_token"`
+}
+
+type skillPathParams struct {
+	SkillID string `path:"skill_id"`
+}
+
+type datasetQueryParams struct {
+	PageToken string   `query:"page_token"`
+	PageSize  int32    `query:"page_size"`
+	OrderBy   string   `query:"order_by" enum:"latest_updated,most_used,recent_used" desc:"Sort datasets by latest_updated (default), most_used (per current user usage), or recent_used (latest of last used and content update)."`
+	Keyword   string   `query:"keyword"`
+	Tags      []string `query:"tags"`
+	Source    string   `query:"source" enum:"manual,cloud,official_installed" desc:"Filter datasets by creation source: manual (local upload), cloud (cloud document sync) or official_installed (installed from the knowledge plaza)."`
+}
+
+type createDatasetQueryParams struct {
+	DatasetID string `query:"dataset_id"`
+}
+
+type listDocumentsQueryParams struct {
+	PageToken string `query:"page_token"`
+	PageSize  int32  `query:"page_size"`
+}
+
+type listWordGroupsQueryParams struct {
+	PageToken string `query:"page_token"`
+	PageSize  int32  `query:"page_size"`
+}
+
+type listUserModelProvidersQueryParams struct {
+	Category        string `query:"category"`
+	ExcludeCategory string `query:"exclude_category"`
+	Keyword         string `query:"keyword"`
+}
+
+type checkModelProviderOpenAPIRequest struct {
+	ProviderName string `json:"provider_name"`
+	BaseURL      string `json:"base_url"`
+	APIKey       string `json:"api_key"`
+	DryRun       bool   `json:"dry_run"`
+}
+
+type modelProviderGroupPathParams struct {
+	ModelProviderID string `path:"model_provider_id"`
+}
+
+type modelProviderGroupByIDPathParams struct {
+	ModelProviderID string `path:"model_provider_id"`
+	GroupID         string `path:"group_id"`
+}
+
+type updateModelProviderGroupOpenAPIRequest struct {
+	Name    string `json:"name"`
+	BaseURL string `json:"base_url"`
+	APIKey  string `json:"api_key,omitempty"`
+	Verify  bool   `json:"verify"`
+}
+
+type createModelProviderGroupOpenAPIRequest struct {
+	Name    string `json:"name"`
+	BaseURL string `json:"base_url"`
+	APIKey  string `json:"api_key,omitempty"`
+	Verify  bool   `json:"verify"`
+}
+
+type createModelProviderGroupOpenAPIResponse struct {
+	ID                  string                                `json:"id"`
+	UserModelProviderID string                                `json:"user_model_provider_id"`
+	Name                string                                `json:"name"`
+	BaseURL             string                                `json:"base_url"`
+	IsVerified          bool                                  `json:"is_verified"`
+	Check               *modelprovider.CheckModelProviderData `json:"check,omitempty"`
+}
+
+type deleteModelProviderGroupOpenAPIResponse struct {
+	ID string `json:"id"`
+}
+
+type listRemoteGroupModelsOpenAPIItem struct {
+	ID             string  `json:"id"`
+	Name           string  `json:"name"`
+	ModelType      string  `json:"model_type"`
+	MaxInputTokens *string `json:"max_input_tokens,omitempty"`
+	Added          bool    `json:"added"`
+}
+
+type listRemoteGroupModelsOpenAPIResponse struct {
+	URL    string                             `json:"url"`
+	Models []listRemoteGroupModelsOpenAPIItem `json:"models"`
+}
+
+type addModelProviderGroupModelOpenAPIRequest struct {
+	Name           string  `json:"name"`
+	ModelType      string  `json:"model_type"`
+	MaxInputTokens *string `json:"max_input_tokens,omitempty" desc:"Optional override. When omitted, LLM/VLM windows are resolved from config/model_context_windows.yaml by model name and unknown names fall back to 128K."`
+}
+
+type addModelProviderGroupModelOpenAPIResponse struct {
+	ID                       string  `json:"id"`
+	UserModelProviderID      string  `json:"user_model_provider_id"`
+	UserModelProviderGroupID string  `json:"user_model_provider_group_id"`
+	Name                     string  `json:"name"`
+	ModelType                string  `json:"model_type"`
+	ProviderName             string  `json:"provider_name"`
+	GroupName                string  `json:"group_name"`
+	BaseURL                  string  `json:"base_url"`
+	IsDefault                bool    `json:"is_default"`
+	MaxInputTokens           *string `json:"max_input_tokens,omitempty" desc:"Stored LLM input context window, for example 512, 128K, or 1M" nullable:"true"`
+}
+
+type updateModelProviderGroupModelOpenAPIRequest struct {
+	MaxInputTokens string `json:"max_input_tokens" desc:"LLM input context window, for example 512, 128K, or 1M"`
+}
+
+type listModelProviderGroupModelsOpenAPIItem struct {
+	ID                       string  `json:"id"`
+	UserModelProviderID      string  `json:"user_model_provider_id"`
+	UserModelProviderGroupID string  `json:"user_model_provider_group_id"`
+	Name                     string  `json:"name"`
+	ModelType                string  `json:"model_type"`
+	ProviderName             string  `json:"provider_name"`
+	GroupName                string  `json:"group_name"`
+	BaseURL                  string  `json:"base_url"`
+	IsDefault                bool    `json:"is_default"`
+	IsEditable               bool    `json:"is_editable" desc:"Whether this option supports image editing"`
+	MaxInputTokens           *string `json:"max_input_tokens" desc:"Maximum catalog LLM, VLM, or embedding-model input context window, for example 512, 128K, or 1M; null for other, custom, or unknown models" nullable:"true"`
+}
+
+type listModelProviderGroupModelsOpenAPIResponse struct {
+	Models []listModelProviderGroupModelsOpenAPIItem `json:"models"`
+}
+
+type listUserModelsByModelTypeQueryParams struct {
+	ModelType string `query:"model_type"`
+}
+
+type selectedModelOpenAPIItem struct {
+	ModelKey                 string  `json:"model_key"`
+	ModelID                  string  `json:"model_id"`
+	UserModelProviderID      string  `json:"user_model_provider_id"`
+	UserModelProviderGroupID string  `json:"user_model_provider_group_id"`
+	Name                     string  `json:"name"`
+	ProviderName             string  `json:"provider_name"`
+	GroupName                string  `json:"group_name"`
+	BaseURL                  string  `json:"base_url"`
+	IsDefault                bool    `json:"is_default" desc:"True when the selection was copied from catalog YAML"`
+	IsEditable               bool    `json:"is_editable" desc:"Whether the selected model supports image editing"`
+	MaxInputTokens           *string `json:"max_input_tokens" desc:"Maximum selected catalog LLM, VLM, or embedding-model input context window, for example 512, 128K, or 1M; null for other, custom, or unknown models" nullable:"true"`
+}
+
+type listSelectedModelsOpenAPIResponse struct {
+	Selections []selectedModelOpenAPIItem `json:"selections"`
+}
+
+type setSelectedModelOpenAPIItem struct {
+	ModelKey string `json:"model_key"`
+	ModelID  string `json:"model_id"`
+}
+
+type setSelectedModelsOpenAPIRequest struct {
+	Selections []setSelectedModelOpenAPIItem `json:"selections"`
+}
+
+type modelProviderGroupModelPathParams struct {
+	ModelProviderID string `path:"model_provider_id"`
+	GroupID         string `path:"group_id"`
+	ModelID         string `path:"model_id"`
+}
+
+type deleteModelProviderGroupModelOpenAPIResponse struct {
+	ID string `json:"id"`
+}
+
+type verifiedProviderQueryParams struct {
+	Category string `query:"category"`
+}
+
+type verifiedProviderGroupOpenAPIItem struct {
+	GroupID             string `json:"group_id"`
+	UserModelProviderID string `json:"user_model_provider_id"`
+	ProviderName        string `json:"provider_name"`
+	GroupName           string `json:"group_name"`
+	BaseURL             string `json:"base_url"`
+	Category            string `json:"category"`
+}
+
+type verifiedProviderOpenAPIResponse struct {
+	Ready        bool   `json:"ready"`
+	Source       string `json:"source,omitempty"`
+	SharedByName string `json:"shared_by_name,omitempty"`
+	SharedByID   string `json:"shared_by_id,omitempty"`
+	ProviderName string `json:"provider_name,omitempty"`
+	GroupName    string `json:"group_name,omitempty"`
+}
+
+type verifiedProviderGroupsOpenAPIResponse struct {
+	Groups []verifiedProviderGroupOpenAPIItem `json:"groups"`
+}
+
+type setSelectedProviderOpenAPIRequest struct {
+	Selections []setSelectedProviderOpenAPIItem `json:"selections"`
+}
+
+type setSelectedProviderOpenAPIItem struct {
+	Category string `json:"category"`
+	GroupID  string `json:"group_id"`
+}
+
+type selectedProviderOpenAPIItem struct {
+	Category            string `json:"category"`
+	GroupID             string `json:"group_id"`
+	UserModelProviderID string `json:"user_model_provider_id"`
+	ProviderName        string `json:"provider_name"`
+	GroupName           string `json:"group_name"`
+	BaseURL             string `json:"base_url"`
+	Share               bool   `json:"share"`
+}
+
+type selectedProvidersOpenAPIResponse struct {
+	Selections []selectedProviderOpenAPIItem `json:"selections"`
+}
+
+type setSharedProviderOpenAPIRequest struct {
+	GroupID string `json:"group_id"`
+	Share   bool   `json:"share"`
+}
+
+type userModelProviderOpenAPIItem struct {
+	ID                     string   `json:"id"`
+	DefaultModelProviderID string   `json:"default_model_provider_id"`
+	Name                   string   `json:"name"`
+	Description            string   `json:"description"`
+	BaseURL                string   `json:"base_url"`
+	Category               string   `json:"category"`
+	IsConfigured           bool     `json:"is_configured"`
+	Capabilities           []string `json:"capabilities"`
+}
+
+type listUserModelProvidersOpenAPIResponse struct {
+	Providers []userModelProviderOpenAPIItem `json:"providers"`
+}
+
+type listModelProviderGroupsOpenAPIItem struct {
+	ID                  string `json:"id"`
+	UserModelProviderID string `json:"user_model_provider_id"`
+	Name                string `json:"name"`
+	BaseURL             string `json:"base_url"`
+	APIKey              string `json:"api_key"`
+	IsVerified          bool   `json:"is_verified"`
+}
+
+type listModelProviderGroupsOpenAPIResponse struct {
+	Groups []listModelProviderGroupsOpenAPIItem `json:"groups"`
+}
+
+type listTasksQueryParams struct {
+	PageToken   string `query:"page_token"`
+	PageSize    int32  `query:"page_size"`
+	TaskState   string `query:"task_state"`
+	TaskType    string `query:"task_type"`
+	DocumentID  string `query:"document_id"`
+	DocumentPID string `query:"document_pid"`
+}
+
+type resourceUpdateTaskPathParams struct {
+	TaskID string `path:"task_id"`
+}
+
+type reviewResultPathParams struct {
+	ReviewResultID string `path:"review_result_id"`
+}
+
+type resourceVersionPathParams struct {
+	VersionID string `path:"version_id"`
+}
+
+type resourceUpdateTaskListQueryParams struct {
+	Page         int32  `query:"page"`
+	PageSize     int32  `query:"page_size"`
+	Status       string `query:"status"`
+	ResourceType string `query:"resource_type"`
+	TaskType     string `query:"task_type"`
+}
+
+type skillReviewTaskListQueryParams struct {
+	Page      int32  `query:"page"`
+	PageSize  int32  `query:"page_size"`
+	Status    string `query:"status"`
+	RequestID string `query:"requestid"`
+}
+
+type skillReviewResultListQueryParams struct {
+	Page         int32  `query:"page"`
+	PageSize     int32  `query:"page_size"`
+	ReviewStatus string `query:"review_status"`
+	Type         string `query:"type"`
+	SkillName    string `query:"skill_name"`
+	RequestID    string `query:"requestid"`
+}
+
+type resourceVersionListQueryParams struct {
+	Page         int32  `query:"page"`
+	PageSize     int32  `query:"page_size"`
+	ResourceType string `query:"resource_type"`
+	ResourceID   string `query:"resource_id"`
+}
+
+type resourceUpdateTaskOpenAPIResponse struct {
+	ID             string  `json:"id"`
+	TaskType       string  `json:"task_type"`
+	ResourceType   string  `json:"resource_type"`
+	UserID         string  `json:"user_id"`
+	ResourceID     string  `json:"resource_id"`
+	TriggerType    string  `json:"trigger_type"`
+	TriggerID      string  `json:"trigger_id"`
+	Status         string  `json:"status"`
+	ReviewResultID string  `json:"review_result_id,omitempty"`
+	ResultID       string  `json:"result_id,omitempty"`
+	ErrorCode      string  `json:"error_code,omitempty"`
+	ErrorMessage   string  `json:"error_message,omitempty"`
+	AttemptCount   int32   `json:"attempt_count"`
+	NextRunAt      string  `json:"next_run_at"`
+	CreatedAt      string  `json:"created_at"`
+	UpdatedAt      string  `json:"updated_at"`
+	StartedAt      *string `json:"started_at,omitempty"`
+	FinishedAt     *string `json:"finished_at,omitempty"`
+}
+
+type resourceUpdateTaskListOpenAPIResponse struct {
+	Items    []resourceUpdateTaskOpenAPIResponse `json:"items"`
+	Page     int32                               `json:"page"`
+	PageSize int32                               `json:"page_size"`
+	Total    int64                               `json:"total"`
+}
+
+type skillReviewResultOpenAPIResponse struct {
+	ID             string                         `json:"id"`
+	SkillName      string                         `json:"skill_name"`
+	Type           string                         `json:"type"`
+	ReviewStatus   string                         `json:"review_status"`
+	UserID         string                         `json:"userid"`
+	RequestID      string                         `json:"requestid"`
+	SkillContent   string                         `json:"skill_content,omitempty"`
+	CurrentContent string                         `json:"current_content,omitempty"`
+	Diff           string                         `json:"diff,omitempty"`
+	DiffEntryLines []diffEntryLineOpenAPIResponse `json:"diff_entry_lines,omitempty"`
+	Summary        string                         `json:"summary"`
+	Time           string                         `json:"time"`
+}
+
+type skillReviewResultListOpenAPIResponse struct {
+	Items    []skillReviewResultOpenAPIResponse `json:"items"`
+	Page     int32                              `json:"page"`
+	PageSize int32                              `json:"page_size"`
+	Total    int64                              `json:"total"`
+}
+
+type skillReviewSummaryOpenAPIResponse struct {
+	QualifiedSessionCount int32                              `json:"qualified_session_count"`
+	UserTurnCount         int32                              `json:"user_turn_count"`
+	ToolCallCount         int32                              `json:"tool_call_count"`
+	MinUserTurns          int32                              `json:"min_user_turns"`
+	MinToolTurns          int32                              `json:"min_tool_turns"`
+	QuantityThreshold     int32                              `json:"quantity_threshold"`
+	WindowStart           string                             `json:"window_start"`
+	WindowEnd             string                             `json:"window_end"`
+	RunningTask           *resourceUpdateTaskOpenAPIResponse `json:"running_task,omitempty"`
+	RunningRequestID      string                             `json:"running_requestid,omitempty"`
+}
+
+type skillReviewRunOpenAPIResponse struct {
+	Task      resourceUpdateTaskOpenAPIResponse `json:"task"`
+	Summary   skillReviewSummaryOpenAPIResponse `json:"summary"`
+	RequestID string                            `json:"requestid"`
+}
+
+type skillReviewTaskStatusOpenAPIResponse struct {
+	Task        resourceUpdateTaskOpenAPIResponse `json:"task"`
+	RequestID   string                            `json:"requestid"`
+	Status      string                            `json:"status"`
+	RunStatus   string                            `json:"run_status,omitempty"`
+	ResultCount int64                             `json:"result_count"`
+}
+
+type skillReviewTaskListOpenAPIResponse struct {
+	Items    []skillReviewTaskStatusOpenAPIResponse `json:"items"`
+	Page     int32                                  `json:"page"`
+	PageSize int32                                  `json:"page_size"`
+	Total    int64                                  `json:"total"`
+}
+
+type skillOrganizeOpenAPIRequest struct {
+	RequestID   string   `json:"requestid"`
+	Skills      []string `json:"skills"`
+	ArtifactDir string   `json:"artifact_dir,omitempty"`
+}
+
+type skillOrganizeOpenAPIResponse struct {
+	Status    string `json:"status"`
+	RequestID string `json:"requestid"`
+	TaskID    string `json:"taskid"`
+}
+
+type skillMaintenanceTaskOpenAPIResponse struct {
+	ID        string `json:"id"`
+	RequestID string `json:"request_id"`
+	Type      string `json:"type"`
+	Status    string `json:"status"`
+	StartedAt string `json:"started_at"`
+}
+
+type skillMaintenanceStatusOpenAPIResponse struct {
+	HasActiveTask bool                                 `json:"has_active_task"`
+	Task          *skillMaintenanceTaskOpenAPIResponse `json:"task,omitempty"`
+	Message       string                               `json:"message,omitempty"`
+}
+
+type resourceVersionOpenAPIResponse struct {
+	ID            string `json:"id"`
+	ResourceType  string `json:"resource_type"`
+	ResourceID    string `json:"resource_id"`
+	UserID        string `json:"user_id"`
+	ChangeSource  string `json:"change_source"`
+	FromVersion   int64  `json:"from_version"`
+	ToVersion     int64  `json:"to_version"`
+	SourceRefType string `json:"source_ref_type"`
+	SourceRefID   string `json:"source_ref_id"`
+	BeforeContent string `json:"before_content"`
+	AfterContent  string `json:"after_content"`
+	Diff          string `json:"diff"`
+	CreatedAt     string `json:"created_at"`
+}
+
+type resourceVersionListOpenAPIResponse struct {
+	Items    []resourceVersionOpenAPIResponse `json:"items"`
+	Page     int32                            `json:"page"`
+	PageSize int32                            `json:"page_size"`
+	Total    int64                            `json:"total"`
+}
+
+type latestVersionChangeOpenAPIResponse struct {
+	ChangeSource  string `json:"change_source"`
+	SourceRefType string `json:"source_ref_type"`
+	SourceRefID   string `json:"source_ref_id"`
+	ChangedAt     string `json:"changed_at"`
+}
+
+type skillGenerateOpenAPIRequest struct {
+	UserInstruct string `json:"user_instruct"`
+}
+
+type skillGenerateOpenAPIResponse struct {
+	DraftStatus        string `json:"draft_status"`
+	DraftSourceVersion int64  `json:"draft_source_version"`
+	DraftPath          string `json:"draft_path"`
+	Outdated           bool   `json:"outdated"`
+}
+
+type skillDraftPreviewOpenAPIResponse struct {
+	SkillID            string `json:"skill_id"`
+	ReviewResultID     string `json:"review_result_id"`
+	ReviewStatus       string `json:"review_status"`
+	DraftStatus        string `json:"draft_status"`
+	DraftSourceVersion int64  `json:"draft_source_version"`
+	Diff               string `json:"diff"`
+	Outdated           bool   `json:"outdated"`
+}
+
+type shareItemPathParams struct {
+	ShareItemID string `path:"share_item_id"`
+}
+
+type skillListQueryParams struct {
+	Keyword  string   `query:"keyword"`
+	Category string   `query:"category"`
+	Tags     []string `query:"tags"`
+	Page     int32    `query:"page"`
+	PageSize int32    `query:"page_size"`
+}
+
+type shareListQueryParams struct {
+	Status   string `query:"status"`
+	Page     int32  `query:"page"`
+	PageSize int32  `query:"page_size"`
+}
+
+type skillSourceOpenAPIRequest struct {
+	Type     string `json:"type" desc:"Source type: uploaded_zip or url."`
+	UploadID string `json:"upload_id,omitempty" desc:"Completed upload id when type is uploaded_zip."`
+	URL      string `json:"url,omitempty" desc:"ZIP URL when type is url."`
+}
+
+type skillCreateManagedOpenAPIRequest struct {
+	Name        string                    `json:"name,omitempty" desc:"Legacy inline-create field. ZIP and URL imports derive name from SKILL.md frontmatter."`
+	Category    string                    `json:"category,omitempty" desc:"Legacy inline-create field. ZIP and URL imports use External."`
+	Source      skillSourceOpenAPIRequest `json:"source"`
+	Description string                    `json:"description,omitempty" desc:"Legacy inline-create field. ZIP and URL imports derive description from SKILL.md frontmatter."`
+	Tags        []string                  `json:"tags,omitempty"`
+	AutoEvo     *bool                     `json:"auto_evo,omitempty"`
+	IsEnabled   *bool                     `json:"is_enabled,omitempty"`
+}
+
+type skillUpdateManagedOpenAPIRequest struct {
+	Name        *string                    `json:"name,omitempty" desc:"Optional. Rename the directory skill."`
+	Category    *string                    `json:"category,omitempty" desc:"Optional. Move the skill to another category."`
+	Description *string                    `json:"description,omitempty" desc:"Optional. Replace product metadata description; SKILL.md is not rewritten."`
+	Tags        []string                   `json:"tags,omitempty" desc:"Optional. Replace tags; omit to keep tags unchanged."`
+	AutoEvo     *bool                      `json:"auto_evo,omitempty" desc:"Optional. Enable or disable automatic evolution."`
+	IsEnabled   *bool                      `json:"is_enabled,omitempty" desc:"Optional. Enable or disable the skill."`
+	Source      *skillSourceOpenAPIRequest `json:"source,omitempty" desc:"Optional. Replace the whole skill directory from an uploaded ZIP or URL."`
+}
+
+type skillDraftSummaryOpenAPIResponse struct {
+	HasUncommittedDraft bool   `json:"has_uncommitted_draft"`
+	TaskID              string `json:"task_id,omitempty"`
+	Version             int64  `json:"version"`
+	Type                string `json:"type,omitempty" desc:"Draft type. create identifies a Skill that has no formal revision yet."`
+	Status              string `json:"status,omitempty"`
+}
+
+type skillListItemOpenAPIResponse struct {
+	ID                  string                              `json:"id"`
+	SkillID             string                              `json:"skill_id"`
+	Name                string                              `json:"name"`
+	SkillName           string                              `json:"skill_name,omitempty"`
+	Description         string                              `json:"description"`
+	Category            string                              `json:"category"`
+	Tags                []string                            `json:"tags"`
+	HeadRevisionID      string                              `json:"head_revision_id"`
+	FileContent         string                              `json:"file_content,omitempty"`
+	Draft               skillDraftSummaryOpenAPIResponse    `json:"draft"`
+	LatestVersionChange *latestVersionChangeOpenAPIResponse `json:"latest_version_change,omitempty"`
+	DeletedAt           *string                             `json:"deleted_at,omitempty"`
+	DeletedBy           string                              `json:"deleted_by,omitempty"`
+}
+
+type skillListOpenAPIResponse struct {
+	Items    []skillListItemOpenAPIResponse `json:"items"`
+	Page     int32                          `json:"page"`
+	PageSize int32                          `json:"page_size"`
+	Total    int32                          `json:"total"`
+}
+
+type skillTagsOpenAPIResponse struct {
+	Tags []string `json:"tags"`
+}
+
+type skillCategoriesOpenAPIResponse struct {
+	Categories []string `json:"categories"`
+}
+
+type skillDetailOpenAPIResponse struct {
+	ID                  string                              `json:"id"`
+	SkillID             string                              `json:"skill_id"`
+	Name                string                              `json:"name"`
+	SkillName           string                              `json:"skill_name,omitempty"`
+	Description         string                              `json:"description"`
+	Category            string                              `json:"category"`
+	Tags                []string                            `json:"tags"`
+	HeadRevisionID      string                              `json:"head_revision_id"`
+	FileContent         string                              `json:"file_content,omitempty"`
+	Draft               skillDraftSummaryOpenAPIResponse    `json:"draft"`
+	LatestVersionChange *latestVersionChangeOpenAPIResponse `json:"latest_version_change,omitempty"`
+}
+
+type skillWriteOpenAPIResponse struct {
+	SkillID        string `json:"skill_id"`
+	HeadRevisionID string `json:"head_revision_id,omitempty"`
+}
+
+type skillFileQueryParams struct {
+	Path string `query:"path" required:"true"`
+}
+
+type skillFSQueryParams struct {
+	Path string `query:"path"`
+}
+
+type skillRevisionPathParams struct {
+	SkillID    string `path:"skill_id"`
+	RevisionID string `path:"revision_id"`
+}
+
+type builtinSkillPathParams struct {
+	BuiltinSkillUID string `path:"builtin_skill_uid"`
+}
+
+type builtinSkillOpenAPIResponse struct {
+	BuiltinSkillUID  string `json:"builtin_skill_uid"`
+	Name             string `json:"name"`
+	Description      string `json:"description"`
+	Category         string `json:"category"`
+	Provider         string `json:"provider,omitempty"`
+	Content          string `json:"content"`
+	Installed        bool   `json:"installed"`
+	InstalledSkillID string `json:"installed_skill_id,omitempty"`
+}
+
+type builtinSkillListOpenAPIResponse struct {
+	Items []builtinSkillOpenAPIResponse `json:"items"`
+	Total int                           `json:"total"`
+}
+
+type skillDistributionConflictOpenAPIResponse struct {
+	Path string `json:"path"`
+	Kind string `json:"kind"`
+}
+
+type skillDistributionUpgradeStatusOpenAPIResponse struct {
+	Managed              bool                                       `json:"managed"`
+	UpdateAvailable      bool                                       `json:"update_available"`
+	Pending              bool                                       `json:"pending"`
+	CurrentVersion       string                                     `json:"current_version,omitempty"`
+	CurrentArchiveSHA256 string                                     `json:"current_archive_sha256,omitempty"`
+	PendingVersion       string                                     `json:"pending_version,omitempty"`
+	PendingArchiveSHA256 string                                     `json:"pending_archive_sha256,omitempty"`
+	LatestVersion        string                                     `json:"latest_version,omitempty"`
+	LatestArchiveSHA256  string                                     `json:"latest_archive_sha256,omitempty"`
+	Conflicts            []skillDistributionConflictOpenAPIResponse `json:"conflicts"`
+}
+
+type skillDistributionUpgradePrepareOpenAPIResponse struct {
+	DraftVersion int64                                         `json:"draft_version"`
+	AutoMerged   bool                                          `json:"auto_merged"`
+	Conflicts    []skillDistributionConflictOpenAPIResponse    `json:"conflicts"`
+	Status       skillDistributionUpgradeStatusOpenAPIResponse `json:"status"`
+}
+
+type skillTreeNodeOpenAPIResponse struct {
+	Name     string                         `json:"name"`
+	Path     string                         `json:"path"`
+	Type     string                         `json:"type"`
+	Children []skillTreeNodeOpenAPIResponse `json:"children,omitempty"`
+	BlobHash string                         `json:"blob_hash,omitempty"`
+	Size     int64                          `json:"size,omitempty"`
+	Mime     string                         `json:"mime,omitempty"`
+	FileType string                         `json:"file_type,omitempty"`
+	Binary   bool                           `json:"binary,omitempty"`
+}
+
+type skillFileOpenAPIResponse struct {
+	Path        string `json:"path"`
+	Content     string `json:"content,omitempty"`
+	Binary      bool   `json:"binary"`
+	DownloadURL string `json:"download_url,omitempty"`
+	Mime        string `json:"mime,omitempty"`
+	FileType    string `json:"file_type,omitempty"`
+	BlobHash    string `json:"blob_hash,omitempty"`
+}
+
+type skillFSListOpenAPIResponse struct {
+	Items []skillTreeNodeOpenAPIResponse `json:"items"`
+}
+
+type skillExistsOpenAPIResponse struct {
+	Exists bool `json:"exists"`
+}
+
+type skillDraftStateOpenAPIResponse struct {
+	HasUncommittedDraft bool   `json:"has_uncommitted_draft"`
+	DraftVersion        int64  `json:"draft_version"`
+	BaseRevisionID      string `json:"base_revision_id,omitempty"`
+	TaskID              string `json:"task_id,omitempty"`
+	ConversationID      string `json:"conversation_id,omitempty"`
+}
+
+type skillDraftStatusOpenAPIResponse struct {
+	BaseRevisionID      string `json:"base_revision_id,omitempty"`
+	TaskID              string `json:"task_id,omitempty"`
+	ConversationID      string `json:"conversation_id,omitempty"`
+	DraftVersion        int64  `json:"draft_version"`
+	HasUncommittedDraft bool   `json:"has_uncommitted_draft"`
+	OverlayCount        int64  `json:"overlay_count"`
+}
+
+type skillDraftWriteTextOpenAPIRequest struct {
+	Path                 string `json:"path"`
+	Content              string `json:"content"`
+	ExpectedDraftVersion int64  `json:"expected_draft_version"`
+}
+
+type skillDraftUploadOpenAPIRequest struct {
+	Path                 string `json:"path"`
+	UploadID             string `json:"upload_id"`
+	ExpectedDraftVersion int64  `json:"expected_draft_version"`
+}
+
+type skillDraftMkdirOpenAPIRequest struct {
+	Path                 string `json:"path"`
+	ExpectedDraftVersion int64  `json:"expected_draft_version"`
+}
+
+type skillDraftDeleteOpenAPIRequest struct {
+	Path                 string `json:"path,omitempty"`
+	Recursive            bool   `json:"recursive,omitempty"`
+	ExpectedDraftVersion int64  `json:"expected_draft_version,omitempty"`
+}
+
+type skillDraftMoveOpenAPIRequest struct {
+	From                 string `json:"from"`
+	To                   string `json:"to"`
+	ExpectedDraftVersion int64  `json:"expected_draft_version"`
+}
+
+type skillDraftMutationOpenAPIResponse struct {
+	DraftVersion int64  `json:"draft_version"`
+	BlobHash     string `json:"blob_hash,omitempty"`
+}
+
+type skillCommitOpenAPIRequest struct {
+	DraftVersion int64 `json:"draft_version"`
+}
+
+type skillCommitOpenAPIResponse struct {
+	RevisionID string `json:"revision_id"`
+	RevisionNo int64  `json:"revision_no"`
+}
+
+type skillRevisionOpenAPIResponse struct {
+	ID               string `json:"id"`
+	RevisionID       string `json:"revision_id"`
+	SkillID          string `json:"skill_id"`
+	ParentRevisionID string `json:"parent_revision_id,omitempty"`
+	RevisionNo       int64  `json:"revision_no"`
+	TreeHash         string `json:"tree_hash"`
+	Message          string `json:"message,omitempty"`
+	ChangeSource     string `json:"change_source"`
+	CreatedBy        string `json:"created_by,omitempty"`
+	CreatedAt        string `json:"created_at"`
+	FileContent      string `json:"file_content,omitempty"`
+	IsHead           bool   `json:"is_head"`
+}
+
+type skillRevisionListOpenAPIResponse struct {
+	Items []skillRevisionOpenAPIResponse `json:"items"`
+}
+
+type skillRollbackOpenAPIRequest struct {
+	TargetRevisionID string `json:"target_revision_id,omitempty"`
+	RevisionID       string `json:"revision_id,omitempty"`
+}
+
+type skillRollbackWarningOpenAPIResponse struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+type skillRollbackDiffFileOpenAPIResponse struct {
+	Path   string `json:"path"`
+	Status string `json:"status"`
+}
+
+type skillRollbackDiffTreeOpenAPIResponse struct {
+	Files []skillRollbackDiffFileOpenAPIResponse `json:"files"`
+}
+
+type skillRollbackPreviewOpenAPIResponse struct {
+	TreeDiff skillRollbackDiffTreeOpenAPIResponse  `json:"tree_diff"`
+	Warnings []skillRollbackWarningOpenAPIResponse `json:"warnings"`
+}
+
+type skillRollbackOpenAPIResponse struct {
+	HeadRevisionID string `json:"head_revision_id"`
+	RevisionNo     int64  `json:"revision_no"`
+}
+
+type diffRefOpenAPIRequest struct {
+	Type       string `json:"type"`
+	SkillID    string `json:"skill_id,omitempty"`
+	RevisionID string `json:"revision_id,omitempty"`
+	UploadID   string `json:"upload_id,omitempty"`
+}
+
+type diffOpenAPIRequest struct {
+	Old          diffRefOpenAPIRequest `json:"old"`
+	New          diffRefOpenAPIRequest `json:"new"`
+	Path         string                `json:"path,omitempty"`
+	ContextLines int                   `json:"context_lines,omitempty"`
+	Mode         string                `json:"mode,omitempty"`
+	OldStart     int                   `json:"old_start,omitempty"`
+	NewStart     int                   `json:"new_start,omitempty"`
+	Lines        int                   `json:"lines,omitempty"`
+}
+
+type diffEntryLineOpenAPIResponse struct {
+	Type                    string `json:"type"`
+	Text                    string `json:"text"`
+	HTML                    string `json:"html,omitempty"`
+	OldLine                 int    `json:"oldLine,omitempty"`
+	NewLine                 int    `json:"newLine,omitempty"`
+	DisplayNoNewLineWarning bool   `json:"displayNoNewLineWarning,omitempty"`
+}
+
+type diffFileOpenAPIResponse struct {
+	Path           string                         `json:"path"`
+	Type           string                         `json:"type"`
+	Status         string                         `json:"status"`
+	Binary         bool                           `json:"binary"`
+	TooLarge       bool                           `json:"too_large"`
+	CacheWritten   bool                           `json:"cache_written"`
+	DiffEntryLines []diffEntryLineOpenAPIResponse `json:"diff_entry_lines"`
+}
+
+type diffTreeOpenAPIResponse struct {
+	UserID       string                    `json:"user_id,omitempty"`
+	Files        []diffFileOpenAPIResponse `json:"files"`
+	CacheWritten bool                      `json:"cache_written"`
+}
+
+type remoteFSListQueryParams struct {
+	UserID string `query:"user_id" required:"true" desc:"Required. Target user id used to resolve skills owned by the user."`
+	Path   string `query:"path" required:"true" desc:"RemoteFS path. Use skills for categories, skills/<category> for package list, or skills/<category>/<skill_name>[/rel_path] for package content."`
+	TaskID string `query:"task_id,omitempty" desc:"Optional for skills root/category list; required when path enters a package. Prefix review_ reads/writes existing draft, org_ is skill organization, other values are skill_editor session ids."`
+	Mode   string `query:"mode" enum:"auto,manual" desc:"Conversation mode. auto marks a newly created Skill draft for idle-time auto commit."`
+}
+
+type remoteFSQueryParams struct {
+	UserID   string `query:"user_id" required:"true" desc:"Required. Target user id used to resolve skills owned by the user."`
+	Path     string `query:"path" required:"true" desc:"RemoteFS package path: skills/<category>/<skill_name>[/rel_path]."`
+	TaskID   string `query:"task_id" required:"true" desc:"Required package content task id. Prefix review_ reads/writes existing draft, org_ is skill organization, other values are skill_editor session ids."`
+	Encoding string `query:"encoding,omitempty" enum:"raw,base64" desc:"Optional content encoding for GET /remote-fs/content."`
+	Mode     string `query:"mode" enum:"auto,manual" desc:"Conversation mode."`
+}
+
+type remoteFSTaskQueryParams struct {
+	UserID string `query:"user_id" required:"true" desc:"Required. Target user id used to resolve skills owned by the user."`
+	TaskID string `query:"task_id" required:"true" desc:"Required mutation task id. Prefix review_ writes existing draft, org_ is skill organization, other values are skill_editor session ids."`
+	Mode   string `query:"mode" enum:"auto,manual" desc:"Conversation mode. auto marks a newly created Skill draft for idle-time auto commit."`
+}
+
+type remoteFSUserQueryParams struct {
+	UserID string `query:"user_id" required:"true" desc:"Required. Target user id used to resolve skills owned by the user."`
+}
+
+type remoteFSDeleteQueryParams struct {
+	UserID    string `query:"user_id" required:"true" desc:"Required. Target user id used to resolve skills owned by the user."`
+	Path      string `query:"path" required:"true" desc:"RemoteFS path to delete."`
+	TaskID    string `query:"task_id,omitempty" desc:"Required for package-internal delete; not required for confirmed permanent package purge."`
+	Permanent bool   `query:"permanent,omitempty" desc:"Required true for package root physical purge."`
+	Confirm   bool   `query:"confirm,omitempty" desc:"Required true for package root physical purge."`
+}
+
+type remoteFSDirOpenAPIRequest struct {
+	Path      string `json:"path"`
+	Recursive bool   `json:"recursive"`
+}
+
+type remoteFSCopyOpenAPIRequest struct {
+	From      string `json:"from"`
+	To        string `json:"to"`
+	Overwrite bool   `json:"overwrite"`
+}
+
+type remoteFSMoveOpenAPIRequest struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+}
+
+type remoteFSTrashOpenAPIRequest struct {
+	Path string `json:"path"`
+}
+
+type remoteFSItemOpenAPIResponse struct {
+	Name     string `json:"name"`
+	Path     string `json:"path"`
+	Type     string `json:"type"`
+	Size     int64  `json:"size,omitempty"`
+	Mime     string `json:"mime,omitempty"`
+	FileType string `json:"file_type,omitempty"`
+	Binary   bool   `json:"binary,omitempty"`
+}
+
+type remoteFSListOpenAPIResponse struct {
+	Items []remoteFSItemOpenAPIResponse `json:"items"`
+}
+
+type remoteFSInfoOpenAPIResponse struct {
+	Path     string `json:"path"`
+	Type     string `json:"type"`
+	Size     int64  `json:"size,omitempty"`
+	Mime     string `json:"mime,omitempty"`
+	FileType string `json:"file_type,omitempty"`
+	Binary   bool   `json:"binary,omitempty"`
+}
+
+type remoteFSExistsOpenAPIResponse struct {
+	Exists bool `json:"exists"`
+}
+
+type remoteFSBase64ContentOpenAPIResponse struct {
+	Encoding string `json:"encoding"`
+	Content  string `json:"content"`
+}
+
+type okOpenAPIResponse struct {
+	OK bool `json:"ok"`
+}
+
+type marketItemPathParams struct {
+	MarketItemID string `path:"market_item_id"`
+}
+
+type marketInstallOpenAPIRequest struct {
+	MarketItemID string `json:"market_item_id,omitempty"`
+}
+
+type marketInstallOpenAPIResponse struct {
+	SkillID string `json:"skill_id"`
+}
+
+type marketPublishOpenAPIRequest struct {
+	Name     string                    `json:"name,omitempty" desc:"Deprecated and ignored; the skill name is read from SKILL.md."`
+	Tags     []string                  `json:"tags" desc:"Marketplace discovery tags."`
+	Category string                    `json:"category,omitempty" desc:"Deprecated compatibility field; converted to one marketplace tag when tags is empty."`
+	Source   skillSourceOpenAPIRequest `json:"source"`
+}
+
+type marketPublishOpenAPIResponse struct {
+	MarketItemID  string `json:"market_item_id"`
+	SourceSkillID string `json:"source_skill_id"`
+}
+
+type marketEditOpenAPIRequest struct {
+	Name        *string                    `json:"name,omitempty"`
+	Tags        []string                   `json:"tags,omitempty" desc:"Marketplace discovery tags."`
+	Category    *string                    `json:"category,omitempty" desc:"Deprecated compatibility field; converted to one marketplace tag when tags is omitted."`
+	Description *string                    `json:"description,omitempty"`
+	Source      *skillSourceOpenAPIRequest `json:"source,omitempty"`
+	VersionNote *string                    `json:"version_note,omitempty"`
+}
+
+type marketItemOpenAPIResponse struct {
+	ID               string                      `json:"id,omitempty"`
+	MarketItemID     string                      `json:"market_item_id"`
+	SourceSkillID    string                      `json:"source_skill_id,omitempty"`
+	Status           string                      `json:"status,omitempty"`
+	Tags             []string                    `json:"tags"`
+	Installed        bool                        `json:"installed,omitempty"`
+	InstalledSkillID string                      `json:"installed_skill_id,omitempty"`
+	Icon             string                      `json:"icon,omitempty"`
+	SortOrder        int                         `json:"sort_order,omitempty"`
+	VersionNote      string                      `json:"version_note,omitempty"`
+	PublishedAt      string                      `json:"published_at,omitempty"`
+	CreatedAt        string                      `json:"created_at,omitempty"`
+	UpdatedAt        string                      `json:"updated_at,omitempty"`
+	Source           *skillDetailOpenAPIResponse `json:"source,omitempty"`
+}
+
+type marketListOpenAPIResponse struct {
+	Items    []marketItemOpenAPIResponse `json:"items"`
+	Page     int32                       `json:"page"`
+	PageSize int32                       `json:"page_size"`
+	Total    int32                       `json:"total"`
+}
+
+type marketDeleteOpenAPIResponse struct {
+	Deleted       bool   `json:"deleted"`
+	MarketItemID  string `json:"market_item_id"`
+	SourceSkillID string `json:"source_skill_id"`
+}
+
+type knowledgeMarketItemPathParams struct {
+	MarketItemID string `path:"market_item_id"`
+}
+
+type knowledgeMarketListQueryParams struct {
+	Category string `query:"category" desc:"Filter by category: industry or evaluation." enum:"industry,evaluation"`
+	Domain   string `query:"domain" desc:"Filter by exact domain."`
+	Keyword  string `query:"keyword" desc:"Case-insensitive match on name, description or domain; tags are not searched."`
+	Page     int32  `query:"page"`
+	PageSize int32  `query:"page_size"`
+}
+
+type knowledgeMarketListItemOpenAPIResponse struct {
+	ID              string   `json:"id"`
+	Category        string   `json:"category"`
+	Name            string   `json:"name"`
+	Description     string   `json:"description"`
+	Icon            string   `json:"icon"`
+	Domain          string   `json:"domain"`
+	Tags            []string `json:"tags"`
+	Version         string   `json:"version"`
+	OnlineAccessURL string   `json:"online_access_url"`
+	DataSource      string   `json:"data_source"`
+	SortOrder       int      `json:"sort_order"`
+	CreatedAt       string   `json:"created_at"`
+	UpdatedAt       string   `json:"updated_at"`
+}
+
+type knowledgeMarketListOpenAPIResponse struct {
+	Items    []knowledgeMarketListItemOpenAPIResponse `json:"items"`
+	Page     int32                                    `json:"page"`
+	PageSize int32                                    `json:"page_size"`
+	Total    int32                                    `json:"total"`
+}
+
+type knowledgeMarketDetailOpenAPIResponse struct {
+	ID              string   `json:"id"`
+	Category        string   `json:"category"`
+	Name            string   `json:"name"`
+	Description     string   `json:"description"`
+	Icon            string   `json:"icon"`
+	Domain          string   `json:"domain"`
+	Tags            []string `json:"tags"`
+	Version         string   `json:"version"`
+	VersionDate     string   `json:"version_date"`
+	VersionNote     string   `json:"version_note"`
+	PackageURL      string   `json:"package_url"`
+	PackageRevision string   `json:"package_revision"`
+	DataSource      string   `json:"data_source"`
+	SampleQuestions []string `json:"sample_questions"`
+	SortOrder       int      `json:"sort_order"`
+	CreatedAt       string   `json:"created_at"`
+	UpdatedAt       string   `json:"updated_at"`
+}
+
+type knowledgeMarketDomainsGroupOpenAPIResponse struct {
+	Industry   []string `json:"industry"`
+	Evaluation []string `json:"evaluation"`
+}
+
+type knowledgeMarketDomainsOpenAPIResponse struct {
+	Domains knowledgeMarketDomainsGroupOpenAPIResponse `json:"domains"`
+}
+
+type knowledgeMarketInstallOpenAPIResponse struct {
+	JobID string `json:"job_id"`
+	State string `json:"state"`
+}
+
+type knowledgeMarketTaskPathParams struct {
+	JobID string `path:"job_id"`
+}
+
+type knowledgeMarketTaskListQueryParams struct {
+	Page     int32  `query:"page"`
+	PageSize int32  `query:"page_size"`
+	Status   string `query:"status" enum:"pending,running,succeeded,failed,canceled" desc:"Filter background tasks by async job status."`
+	JobType  string `query:"job_type" desc:"Async job type; defaults to knowledge_market_install."`
+}
+
+type knowledgeMarketTaskProgressOpenAPIResponse struct {
+	Current int64 `json:"current"`
+	Total   int64 `json:"total"`
+}
+
+type knowledgeMarketTaskListItemOpenAPIResponse struct {
+	JobID        string                                     `json:"job_id"`
+	JobType      string                                     `json:"job_type"`
+	JobStatus    string                                     `json:"job_status"`
+	InstallState string                                     `json:"install_state"`
+	MarketItemID string                                     `json:"market_item_id"`
+	Name         string                                     `json:"name"`
+	Icon         string                                     `json:"icon"`
+	Progress     knowledgeMarketTaskProgressOpenAPIResponse `json:"progress"`
+	DatasetID    string                                     `json:"dataset_id"`
+	ErrorMessage string                                     `json:"error_message"`
+	CreatedAt    string                                     `json:"created_at"`
+	FinishedAt   string                                     `json:"finished_at,omitempty"`
+}
+
+type knowledgeMarketTaskListOpenAPIResponse struct {
+	Items    []knowledgeMarketTaskListItemOpenAPIResponse `json:"items"`
+	Page     int32                                        `json:"page"`
+	PageSize int32                                        `json:"page_size"`
+	Total    int32                                        `json:"total"`
+}
+
+type knowledgeMarketTaskPayloadOpenAPIResponse struct {
+	MarketItemID string `json:"market_item_id"`
+	Revision     string `json:"revision,omitempty"`
+	Force        bool   `json:"force,omitempty"`
+}
+
+// knowledgeMarketTaskResultOpenAPIResponse describes the structured success
+// result. Install: {dataset_id, submitted}; single update additionally carries
+// updated/skipped/reason/removed; update-all carries checked plus the spawned
+// item id lists.
+type knowledgeMarketTaskResultOpenAPIResponse struct {
+	DatasetID    string   `json:"dataset_id"`
+	Submitted    int      `json:"submitted"`
+	Reason       string   `json:"reason,omitempty"`
+	Removed      int      `json:"removed,omitempty"`
+	Checked      int      `json:"checked,omitempty"`
+	UpdatedItems []string `json:"updated_items,omitempty"`
+	SkippedItems []string `json:"skipped_items,omitempty"`
+}
+
+type knowledgeMarketTaskParseOpenAPIResponse struct {
+	State   string `json:"state"`
+	Total   int    `json:"total"`
+	Pending int    `json:"pending"`
+	Parsing int    `json:"parsing"`
+	Done    int    `json:"done"`
+	Failed  int    `json:"failed"`
+}
+
+type knowledgeMarketTaskDetailOpenAPIResponse struct {
+	JobID          string                                     `json:"job_id"`
+	JobType        string                                     `json:"job_type"`
+	JobStatus      string                                     `json:"job_status"`
+	InstallState   string                                     `json:"install_state"`
+	MarketItemID   string                                     `json:"market_item_id"`
+	Name           string                                     `json:"name"`
+	Icon           string                                     `json:"icon"`
+	Progress       knowledgeMarketTaskProgressOpenAPIResponse `json:"progress"`
+	DatasetID      string                                     `json:"dataset_id"`
+	ErrorMessage   string                                     `json:"error_message"`
+	CreatedAt      string                                     `json:"created_at"`
+	FinishedAt     string                                     `json:"finished_at,omitempty"`
+	StartedAt      string                                     `json:"started_at,omitempty"`
+	UpdatedAt      string                                     `json:"updated_at,omitempty"`
+	AttemptCount   int                                        `json:"attempt_count"`
+	MaxAttempts    int                                        `json:"max_attempts"`
+	Payload        knowledgeMarketTaskPayloadOpenAPIResponse  `json:"payload"`
+	Result         *knowledgeMarketTaskResultOpenAPIResponse  `json:"result"`
+	Stage          string                                     `json:"stage"`
+	OverallPercent int64                                      `json:"overall_percent"`
+	Parse          knowledgeMarketTaskParseOpenAPIResponse    `json:"parse"`
+}
+
+type knowledgeMarketInstallsOpenAPIResponseItem struct {
+	MarketItemID     string `json:"market_item_id"`
+	Name             string `json:"name"`
+	Icon             string `json:"icon"`
+	Domain           string `json:"domain"`
+	InstallState     string `json:"install_state"`
+	InstalledVersion string `json:"installed_version"`
+	DatasetID        string `json:"dataset_id"`
+	InstalledAt      string `json:"installed_at,omitempty"`
+	UpdatedAt        string `json:"updated_at"`
+	Active           bool   `json:"active"`
+}
+
+type knowledgeMarketInstallsOpenAPIResponse struct {
+	Items []knowledgeMarketInstallsOpenAPIResponseItem `json:"items"`
+	Total int                                          `json:"total"`
+}
+
+type skillDeleteOpenAPIResponse struct {
+	Deleted bool `json:"deleted"`
+}
+
+type skillRestoreOpenAPIResponse struct {
+	Restored bool   `json:"restored"`
+	SkillID  string `json:"skill_id"`
+}
+
+type skillPurgeOpenAPIResponse struct {
+	Purged  bool   `json:"purged"`
+	SkillID string `json:"skill_id"`
+}
+
+type skillEmptyTrashOpenAPIResponse struct {
+	Purged int `json:"purged"`
+}
+
+type skillDiscardOpenAPIResponse struct {
+	Discarded bool `json:"discarded"`
+}
+
+type shareSkillOpenAPIRequest struct {
+	TargetUserIDs  []string `json:"target_user_ids,omitempty"`
+	TargetGroupIDs []string `json:"target_group_ids,omitempty"`
+	Message        string   `json:"message,omitempty"`
+}
+
+type skillShareCreateItemOpenAPIResponse struct {
+	ID                 string  `json:"id"`
+	ShareTaskID        string  `json:"share_task_id"`
+	TargetUserID       string  `json:"target_user_id"`
+	TargetUserName     string  `json:"target_user_name"`
+	Status             string  `json:"status"`
+	TargetRelativeRoot string  `json:"target_relative_root,omitempty"`
+	AcceptedAt         *string `json:"accepted_at,omitempty"`
+	RejectedAt         *string `json:"rejected_at,omitempty"`
+	TargetRootSkillID  string  `json:"target_root_skill_id,omitempty"`
+	ErrorMessage       string  `json:"error_message,omitempty"`
+	CreatedAt          string  `json:"created_at"`
+	UpdatedAt          string  `json:"updated_at"`
+}
+
+type skillShareCreateOpenAPIResponse struct {
+	ShareTaskID string                                `json:"share_task_id"`
+	Items       []skillShareCreateItemOpenAPIResponse `json:"items"`
+}
+
+type skillShareTargetStatusSummaryOpenAPIResponse struct {
+	PendingAccept int64 `json:"pending_accept"`
+	Completed     int64 `json:"completed"`
+	Rejected      int64 `json:"rejected"`
+	Failed        int64 `json:"failed"`
+}
+
+type skillShareTargetItemOpenAPIResponse struct {
+	TargetUserID      string  `json:"target_user_id"`
+	TargetUserName    string  `json:"target_user_name"`
+	Status            string  `json:"status"`
+	ShareItemID       string  `json:"share_item_id"`
+	ShareTaskID       string  `json:"share_task_id"`
+	Message           string  `json:"message"`
+	AcceptedAt        *string `json:"accepted_at,omitempty"`
+	RejectedAt        *string `json:"rejected_at,omitempty"`
+	TargetRootSkillID string  `json:"target_root_skill_id,omitempty"`
+	ErrorMessage      string  `json:"error_message,omitempty"`
+	SharedAt          string  `json:"shared_at"`
+	UpdatedAt         string  `json:"updated_at"`
+}
+
+type skillShareTargetsOpenAPIResponse struct {
+	SkillID       string                                       `json:"skill_id"`
+	StatusSummary skillShareTargetStatusSummaryOpenAPIResponse `json:"status_summary"`
+	Items         []skillShareTargetItemOpenAPIResponse        `json:"items"`
+	Page          int32                                        `json:"page"`
+	PageSize      int32                                        `json:"page_size"`
+	Total         int64                                        `json:"total"`
+}
+
+type skillShareListItemOpenAPIResponse struct {
+	ShareItemID       string  `json:"share_item_id"`
+	ShareTaskID       string  `json:"share_task_id"`
+	Status            string  `json:"status"`
+	SourceUserID      string  `json:"source_user_id"`
+	SourceUserName    string  `json:"source_user_name"`
+	TargetUserID      string  `json:"target_user_id"`
+	TargetUserName    string  `json:"target_user_name"`
+	SourceSkillID     string  `json:"source_skill_id"`
+	SourceCategory    string  `json:"source_category"`
+	Message           string  `json:"message"`
+	AcceptedAt        *string `json:"accepted_at,omitempty"`
+	RejectedAt        *string `json:"rejected_at,omitempty"`
+	TargetRootSkillID string  `json:"target_root_skill_id,omitempty"`
+	ErrorMessage      string  `json:"error_message,omitempty"`
+	CreatedAt         string  `json:"created_at"`
+	UpdatedAt         string  `json:"updated_at"`
+}
+
+type skillShareListOpenAPIResponse struct {
+	Items    []skillShareListItemOpenAPIResponse `json:"items"`
+	Page     int32                               `json:"page"`
+	PageSize int32                               `json:"page_size"`
+	Total    int64                               `json:"total"`
+}
+
+type skillShareDetailOpenAPIResponse struct {
+	ShareItemID string                     `json:"share_item_id"`
+	Status      string                     `json:"status"`
+	Message     string                     `json:"message"`
+	Source      skillDetailOpenAPIResponse `json:"source"`
+}
+
+type skillShareAcceptOpenAPIResponse struct {
+	Accepted          bool   `json:"accepted"`
+	TargetRootSkillID string `json:"target_root_skill_id"`
+}
+
+type skillShareRejectOpenAPIResponse struct {
+	Rejected bool `json:"rejected"`
+}
+
+type personalizationSettingOpenAPIRequest struct {
+	Enabled bool `json:"enabled"`
+}
+
+type personalizationSettingOpenAPIResponse struct {
+	Enabled bool `json:"enabled"`
+}
+
+type chatConversationDefaultsOpenAPI struct {
+	ChatExecutor   string `json:"chat_executor" enum:"lazymind,codex,cursor,workbuddy"`
+	EnableWorkflow bool   `json:"enable_workflow"`
+	WorkflowMode   string `json:"workflow_mode" enum:"auto,dynamic"`
+	EnableSubagent bool   `json:"enable_subagent"`
+}
+
+type chatEntryDefaultsOpenAPI struct {
+	ThinkingDepth        string                          `json:"thinking_depth" enum:"low,medium,high,max"`
+	ConversationSettings chatConversationDefaultsOpenAPI `json:"conversation_settings"`
+}
+
+type chatConversationDefaultsPatchOpenAPIRequest struct {
+	ChatExecutor   *string `json:"chat_executor,omitempty" enum:"lazymind,codex,cursor,workbuddy"`
+	EnableWorkflow *bool   `json:"enable_workflow,omitempty"`
+	WorkflowMode   *string `json:"workflow_mode,omitempty" enum:"auto,dynamic"`
+	EnableSubagent *bool   `json:"enable_subagent,omitempty"`
+}
+
+type chatEntryDefaultsPatchOpenAPIRequest struct {
+	ThinkingDepth        *string                                      `json:"thinking_depth,omitempty" enum:"low,medium,high,max"`
+	ConversationSettings *chatConversationDefaultsPatchOpenAPIRequest `json:"conversation_settings,omitempty"`
+}
+
+type userChatSettingsPatchOpenAPIRequest struct {
+	EnableWorkflow *bool                                 `json:"enable_workflow,omitempty"`
+	WorkflowMode   *string                               `json:"workflow_mode,omitempty"`
+	EnableSubagent *bool                                 `json:"enable_subagent,omitempty"`
+	QuickQuestion  *chatEntryDefaultsPatchOpenAPIRequest `json:"quick_question,omitempty"`
+	NewTask        *chatEntryDefaultsPatchOpenAPIRequest `json:"new_task,omitempty"`
+}
+
+type userChatSettingsOpenAPIResponse struct {
+	EnableWorkflow bool                     `json:"enable_workflow"`
+	WorkflowMode   string                   `json:"workflow_mode"`
+	EnableSubagent bool                     `json:"enable_subagent"`
+	QuickQuestion  chatEntryDefaultsOpenAPI `json:"quick_question"`
+	NewTask        chatEntryDefaultsOpenAPI `json:"new_task"`
+	UpdatedAt      string                   `json:"updated_at"`
+}
+
+type userUIPreferencesPatchOpenAPIRequest struct {
+	ChatPreferenceNoticeDismissed *bool   `json:"chat_preference_notice_dismissed,omitempty"`
+	DeveloperModeActive           *bool   `json:"developer_mode_active,omitempty"`
+	SensitiveWordFilterEnabled    *bool   `json:"sensitive_word_filter_enabled,omitempty"`
+	AcceptedUserAgreementVersion  *string `json:"accepted_user_agreement_version,omitempty"`
+	TaskCenterEnabled             *bool   `json:"task_center_enabled,omitempty"`
+	SchedulesEnabled              *bool   `json:"schedules_enabled,omitempty"`
+	SkillsEnabled                 *bool   `json:"skills_enabled,omitempty"`
+	WorkflowsEnabled              *bool   `json:"workflows_enabled,omitempty"`
+	MCPEnabled                    *bool   `json:"mcp_enabled,omitempty"`
+	DocumentParsingEnabled        *bool   `json:"document_parsing_enabled,omitempty"`
+	PerformanceStatsEnabled       *bool   `json:"performance_stats_enabled,omitempty"`
+}
+
+type userUIPreferencesOpenAPIResponse struct {
+	ChatPreferenceNoticeDismissed bool   `json:"chat_preference_notice_dismissed"`
+	DeveloperModeActive           bool   `json:"developer_mode_active"`
+	SensitiveWordFilterEnabled    bool   `json:"sensitive_word_filter_enabled"`
+	AcceptedUserAgreementVersion  string `json:"accepted_user_agreement_version"`
+	TaskCenterEnabled             bool   `json:"task_center_enabled"`
+	SchedulesEnabled              bool   `json:"schedules_enabled"`
+	SkillsEnabled                 bool   `json:"skills_enabled"`
+	WorkflowsEnabled              bool   `json:"workflows_enabled"`
+	MCPEnabled                    bool   `json:"mcp_enabled"`
+	DocumentParsingEnabled        bool   `json:"document_parsing_enabled"`
+	PerformanceStatsEnabled       bool   `json:"performance_stats_enabled"`
+	UserPreferenceConfigured      bool   `json:"user_preference_configured"`
+	UpdatedAt                     string `json:"updated_at"`
+}
+
+type settingsFeatureControlsOpenAPIResponse struct {
+	TaskCenterEnabled      bool `json:"task_center_enabled"`
+	SchedulesEnabled       bool `json:"schedules_enabled"`
+	SkillsEnabled          bool `json:"skills_enabled"`
+	WorkflowsEnabled       bool `json:"workflows_enabled"`
+	MCPEnabled             bool `json:"mcp_enabled"`
+	DocumentParsingEnabled bool `json:"document_parsing_enabled"`
+}
+
+type settingsOverviewCountsOpenAPIResponse struct {
+	Total      int64 `json:"total"`
+	Enabled    int64 `json:"enabled"`
+	Verified   int64 `json:"verified"`
+	Runnable   int64 `json:"runnable"`
+	Configured int64 `json:"configured"`
+}
+
+type settingsOverviewSectionOpenAPIResponse struct {
+	ID               string                                `json:"id"`
+	Title            string                                `json:"title"`
+	Route            string                                `json:"route"`
+	RawEnabled       *bool                                 `json:"raw_enabled,omitempty"`
+	EffectiveEnabled *bool                                 `json:"effective_enabled,omitempty"`
+	Counts           settingsOverviewCountsOpenAPIResponse `json:"counts"`
+	Status           string                                `json:"status"`
+	Detail           string                                `json:"detail"`
+}
+
+type settingsOverviewIssueOpenAPIResponse struct {
+	ID       string `json:"id"`
+	Severity string `json:"severity"`
+	Message  string `json:"message"`
+	Section  string `json:"section"`
+}
+
+type settingsOverviewOpenAPIResponse struct {
+	Controls  settingsFeatureControlsOpenAPIResponse   `json:"controls"`
+	Sections  []settingsOverviewSectionOpenAPIResponse `json:"sections"`
+	Issues    []settingsOverviewIssueOpenAPIResponse   `json:"issues"`
+	UpdatedAt string                                   `json:"updated_at"`
+}
+
+type settingsCheckResultOpenAPIResponse struct {
+	ID      string `json:"id"`
+	Status  string `json:"status"`
+	Message string `json:"message"`
+	Section string `json:"section"`
+}
+
+type settingsChecksOpenAPIResponse struct {
+	StartedAt  string                               `json:"started_at"`
+	FinishedAt string                               `json:"finished_at"`
+	Results    []settingsCheckResultOpenAPIResponse `json:"results"`
+}
+
+type localFSChatSettingOpenAPIRequest struct {
+	Enabled bool `json:"enabled"`
+}
+
+type localFSChatSettingOpenAPIResponse struct {
+	Enabled bool `json:"enabled"`
+}
+
+type systemGenerateOpenAPIResponse struct {
+	DraftStatus        string `json:"draft_status"`
+	DraftSourceVersion int64  `json:"draft_source_version"`
+	DraftContent       string `json:"draft_content"`
+}
+
+type systemDraftPreviewOpenAPIResponse struct {
+	ReviewResultID     string `json:"review_result_id"`
+	ReviewStatus       string `json:"review_status"`
+	DraftStatus        string `json:"draft_status"`
+	DraftSourceVersion int64  `json:"draft_source_version"`
+	CurrentContent     string `json:"current_content"`
+	DraftContent       string `json:"draft_content"`
+	Diff               string `json:"diff"`
+}
+
+type systemConfirmOpenAPIResponse struct {
+	Content string `json:"content"`
+	Version int64  `json:"version"`
+}
+
+type systemDiscardOpenAPIResponse struct {
+	Discarded bool `json:"discarded"`
+}
+
+type internalSkillCreateOpenAPIRequest struct {
+	SessionID string `json:"session_id"`
+	Category  string `json:"category"`
+	SkillName string `json:"skill_name"`
+	Content   string `json:"content"`
+}
+
+type evalSetImportPreviewOpenAPIRequest struct {
+	File     string `json:"file" required:"true"`
+	FileType string `json:"file_type,omitempty"`
+}
+
+type workflowDraftPathParams struct {
+	DraftID string `path:"draft_id"`
+}
+
+type writerDocumentSyncPathParams struct {
+	SessionID string `path:"session_id"`
+	SlotID    string `path:"slot_id"`
+	ListIndex int    `path:"list_index"`
+}
+
+type writerDocumentSyncOpenAPIRequest struct {
+	BaseRevision    int            `json:"base_revision"`
+	SourceDocument  map[string]any `json:"source_document"`
+	RevisedDocument map[string]any `json:"revised_document"`
+}
+
+type writerDocumentWriteBackPathParams struct {
+	SessionID string `path:"session_id"`
+}
+
+type writerDocumentWriteBackOpenAPIRequest struct {
+	BaseRevision int `json:"base_revision"`
+}
+
+type artifactActionPathParams struct {
+	SessionID string `path:"session_id"`
+	SlotID    string `path:"slot_id"`
+	ListIndex int    `path:"list_index"`
+}
+
+type artifactActionPreviewOpenAPIRequest struct {
+	Action       string         `json:"action"`
+	BaseRevision int            `json:"base_revision"`
+	Input        map[string]any `json:"input"`
+}
+
+type translationOpenAPIRequest struct {
+	Text   string `json:"text"`
+	Target string `json:"target,omitempty"`
+}
+
+type translationOpenAPIResponse struct {
+	TranslatedText string `json:"translated_text"`
+	Source         string `json:"source"`
+	Target         string `json:"target"`
+}
+
+type translationStatusOpenAPIResponse struct {
+	Configured bool `json:"configured"`
+}
+
+func registeredCoreOperations() []openAPIOperation {
+	jsonBodyOf := func(v any, required bool) *openAPIBody {
+		return &openAPIBody{Required: required, ContentType: "application/json", Schema: schemaSource{Type: v}}
+	}
+	multipartBodyOf := func(v any, required bool) *openAPIBody {
+		return &openAPIBody{Required: required, ContentType: "multipart/form-data", Schema: schemaSource{Type: v}}
+	}
+	resp := func(description string, v any) openAPIResponse {
+		return openAPIResponse{Description: description, ContentType: "application/json", Schema: schemaSource{Type: v}}
+	}
+	routerErrorResp := resp("Router management error", agentRouterErrorResponse{})
+	rawResp := func(description string) openAPIResponse {
+		return openAPIResponse{Description: description, ContentType: "application/octet-stream", Schema: schemaSource{Inline: map[string]any{"type": "string", "format": "binary"}}}
+	}
+	refResp := func(description, name string) openAPIResponse {
+		return openAPIResponse{Description: description, ContentType: "application/json", Schema: schemaSource{Ref: name}}
+	}
+	evoObjectSchema := map[string]any{
+		"type":                 "object",
+		"additionalProperties": true,
+	}
+	evoJSONBody := func(required bool) *openAPIBody {
+		return &openAPIBody{Required: required, ContentType: "application/json", Schema: schemaSource{Inline: evoObjectSchema}}
+	}
+	evoJSONResp := func(description string) openAPIResponse {
+		return openAPIResponse{Description: description, ContentType: "application/json", Schema: schemaSource{Inline: evoObjectSchema}}
+	}
+	evoStreamResp := openAPIResponse{
+		Description: "Evo event stream",
+		ContentType: "text/event-stream",
+		Schema: schemaSource{Inline: map[string]any{
+			"type": "string",
+		}},
+	}
+	evoDownloadResp := openAPIResponse{
+		Description: "Evo download",
+		ContentType: "application/octet-stream",
+		Schema: schemaSource{Inline: map[string]any{
+			"type":   "string",
+			"format": "binary",
+		}},
+	}
+	evoGateContentResp := openAPIResponse{
+		Description: "Evo gate content",
+		ContentType: "application/json",
+		Schema: schemaSource{Inline: map[string]any{
+			"type":                 "object",
+			"additionalProperties": true,
+		}},
+	}
+	return []openAPIOperation{
+		{
+			Method:      "POST",
+			Path:        "/workflow-sessions/{session_id}/slots/{slot_id}/items/idx/{list_index}:action-preview",
+			Summary:     "Preview a Workflow-owned artifact action",
+			Tags:        []string{"workflow"},
+			PathParams:  artifactActionPathParams{},
+			RequestBody: jsonBodyOf(artifactActionPreviewOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: evoJSONResp("Artifact action preview")},
+		},
+		{
+			Method:      "POST",
+			Path:        "/workflow-sessions/{session_id}/slots/{slot_id}/items/idx/{list_index}:sync-writer-document",
+			Summary:     "Sync an edited WriterDocument to its cloud provider",
+			Tags:        []string{"workflow", "writer"},
+			PathParams:  writerDocumentSyncPathParams{},
+			RequestBody: jsonBodyOf(writerDocumentSyncOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: evoJSONResp("WriterDocument sync result")},
+		},
+		{
+			Method:      "POST",
+			Path:        "/workflow-sessions/{session_id}/writer-document:write-back",
+			Summary:     "Write the active WriterDocument back to its cloud provider",
+			Tags:        []string{"workflow", "writer"},
+			PathParams:  writerDocumentWriteBackPathParams{},
+			RequestBody: jsonBodyOf(writerDocumentWriteBackOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: evoJSONResp("WriterDocument write-back result")},
+		},
+		{
+			Method:      "GET",
+			Path:        "/datasets",
+			Summary:     "Dataset list",
+			Tags:        []string{"datasets"},
+			QueryParams: datasetQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Dataset list", doc.ListDatasetsResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/datasets",
+			Summary:     "Create dataset",
+			Tags:        []string{"datasets"},
+			QueryParams: createDatasetQueryParams{},
+			RequestBody: jsonBodyOf(doc.Dataset{}, false),
+			Responses:   map[int]openAPIResponse{200: resp("Created dataset", doc.Dataset{})},
+		},
+		{
+			Method:     "GET",
+			Path:       "/datasets/{dataset}",
+			Summary:    "Get dataset",
+			Tags:       []string{"datasets"},
+			PathParams: datasetPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Dataset details", doc.Dataset{})},
+		},
+		{
+			Method:      "PATCH",
+			Path:        "/datasets/{dataset}",
+			Summary:     "Update dataset",
+			Tags:        []string{"datasets"},
+			PathParams:  datasetPathParams{},
+			RequestBody: jsonBodyOf(doc.Dataset{}, false),
+			Responses:   map[int]openAPIResponse{200: resp("Updated dataset", doc.Dataset{})},
+		},
+		{
+			Method:     "DELETE",
+			Path:       "/datasets/{dataset}",
+			Summary:    "Delete dataset",
+			Tags:       []string{"datasets"},
+			PathParams: datasetPathParams{},
+			Responses:  map[int]openAPIResponse{200: refResp("Deleted successfully", "EmptyObject")},
+		},
+		{
+			Method:      "POST",
+			Path:        "/datasets/{dataset}:setDefault",
+			Summary:     "Set as default dataset",
+			Tags:        []string{"datasets"},
+			PathParams:  datasetPathParams{},
+			RequestBody: jsonBodyOf(doc.SetDefaultDatasetRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: refResp("Set successfully", "EmptyObject")},
+		},
+		{
+			Method:      "POST",
+			Path:        "/datasets/{dataset}:unsetDefault",
+			Summary:     "Unset default dataset",
+			Tags:        []string{"datasets"},
+			PathParams:  datasetPathParams{},
+			RequestBody: jsonBodyOf(doc.UnsetDefaultDatasetRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: refResp("Unset successfully", "EmptyObject")},
+		},
+		{
+			Method:    "GET",
+			Path:      "/data-sources/local-fs-chat-setting",
+			Summary:   "Get local filesystem chat setting",
+			Tags:      []string{"data-sources"},
+			Responses: map[int]openAPIResponse{200: resp("Local filesystem chat setting", localFSChatSettingOpenAPIResponse{})},
+		},
+		{
+			Method:      "PUT",
+			Path:        "/data-sources/local-fs-chat-setting",
+			Summary:     "Update local filesystem chat setting",
+			Tags:        []string{"data-sources"},
+			RequestBody: jsonBodyOf(localFSChatSettingOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Updated local filesystem chat setting", localFSChatSettingOpenAPIResponse{})},
+		},
+		{
+			Method:    "GET",
+			Path:      "/data-sources/database-connections",
+			Summary:   "List database connections",
+			Tags:      []string{"data-sources"},
+			Responses: map[int]openAPIResponse{200: resp("Database connection list", datasource.ListDatabaseConnectionsResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/data-sources/database-connections",
+			Summary:     "Create database connection",
+			Tags:        []string{"data-sources"},
+			RequestBody: jsonBodyOf(datasource.DatabaseConnectionRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Created database connection", datasource.DatabaseConnectionResponse{})},
+		},
+		{
+			Method:     "GET",
+			Path:       "/data-sources/database-connections/{connection}",
+			Summary:    "Get database connection",
+			Tags:       []string{"data-sources"},
+			PathParams: databaseConnectionPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Database connection", datasource.DatabaseConnectionResponse{})},
+		},
+		{
+			Method:      "PATCH",
+			Path:        "/data-sources/database-connections/{connection}",
+			Summary:     "Update database connection",
+			Tags:        []string{"data-sources"},
+			PathParams:  databaseConnectionPathParams{},
+			RequestBody: jsonBodyOf(datasource.UpdateDatabaseConnectionRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Updated database connection", datasource.DatabaseConnectionResponse{})},
+		},
+		{
+			Method:     "DELETE",
+			Path:       "/data-sources/database-connections/{connection}",
+			Summary:    "Delete database connection",
+			Tags:       []string{"data-sources"},
+			PathParams: databaseConnectionPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Deleted database connection", deleteDatabaseConnectionOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/builtin-skills",
+			Summary:     "List builtin directory skills",
+			Description: "Lists immutable built-in templates and their installation state for the current user.",
+			Tags:        []string{"skills"},
+			Responses:   map[int]openAPIResponse{200: resp("Builtin skill list", builtinSkillListOpenAPIResponse{})},
+		},
+		{
+			Method:     "POST",
+			Path:       "/data-sources/database-connections/{connection}:check",
+			Summary:    "Check database connection",
+			Tags:       []string{"data-sources"},
+			PathParams: databaseConnectionPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Database connection check result", datasource.CheckDatabaseConnectionResponse{})},
+		},
+		{
+			Method:     "GET",
+			Path:       "/data-sources/database-connections/{connection}:secret",
+			Summary:    "Get database connection secret",
+			Tags:       []string{"data-sources"},
+			PathParams: databaseConnectionPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Database connection secret", datasource.DatabaseConnectionSecretResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/eval-sets",
+			Summary:     "List eval sets",
+			Tags:        []string{"eval-sets"},
+			QueryParams: evalset.ListEvalSetsQuery{},
+			Responses:   map[int]openAPIResponse{200: resp("Eval set list", evalset.ListEvalSetsResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/eval-sets",
+			Summary:     "Create eval set",
+			Tags:        []string{"eval-sets"},
+			RequestBody: jsonBodyOf(evalset.CreateEvalSetRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Created eval set", evalset.EvalSetResponse{})},
+		},
+		{
+			Method:    "GET",
+			Path:      "/eval-sets/datasets",
+			Summary:   "List eval set dataset options",
+			Tags:      []string{"eval-sets"},
+			Responses: map[int]openAPIResponse{200: resp("Dataset options", evalset.DatasetOptionsResponse{})},
+		},
+		{
+			Method:    "GET",
+			Path:      "/eval-sets/question-types",
+			Summary:   "List eval set question type options",
+			Tags:      []string{"eval-sets"},
+			Responses: map[int]openAPIResponse{200: resp("Question type options", evalset.QuestionTypeOptionsResponse{})},
+		},
+		{
+			Method:     "GET",
+			Path:       "/eval-set-import-templates/{file_type}",
+			Summary:    "Download eval set import template",
+			Tags:       []string{"eval-set-imports"},
+			PathParams: evalset.ImportTemplatePathParams{},
+			Responses: map[int]openAPIResponse{200: {
+				Description: "Import template file",
+				ContentType: "application/octet-stream",
+				Schema: schemaSource{Inline: map[string]any{
+					"type":   "string",
+					"format": "binary",
+				}},
+			}},
+		},
+		{
+			Method:      "POST",
+			Path:        "/eval-sets/imports:preview",
+			Summary:     "Preview eval set import",
+			Tags:        []string{"eval-set-imports"},
+			RequestBody: multipartBodyOf(evalSetImportPreviewOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Eval set import preview", evalset.ImportPreviewResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/eval-sets:import",
+			Summary:     "Create eval set by import",
+			Tags:        []string{"eval-set-imports"},
+			RequestBody: jsonBodyOf(evalset.CreateEvalSetByImportRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Created eval set import task", evalset.CreateEvalSetByImportResponse{})},
+		},
+		{
+			Method:     "GET",
+			Path:       "/eval-set-import-tasks/{task_id}",
+			Summary:    "Get eval set import task",
+			Tags:       []string{"eval-set-imports"},
+			PathParams: evalset.EvalSetImportTaskPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Eval set import task", evalset.EvalSetImportTaskResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/eval-sets/{eval_set_id}/question-types",
+			Summary:     "List eval set question types",
+			Tags:        []string{"eval-set-items"},
+			PathParams:  evalset.EvalSetPathParams{},
+			QueryParams: evalset.ListEvalSetQuestionTypesQuery{},
+			Responses:   map[int]openAPIResponse{200: resp("Question type options", evalset.QuestionTypeOptionsResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/eval-sets/{eval_set_id}/items:invalidReferences",
+			Summary:     "List eval set items with invalid references",
+			Tags:        []string{"eval-set-items"},
+			PathParams:  evalset.EvalSetPathParams{},
+			QueryParams: evalset.ListEvalSetItemsQuery{},
+			Responses:   map[int]openAPIResponse{200: resp("Invalid reference eval set item list", evalset.ListEvalSetItemsResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/eval-sets/{eval_set_id}/items",
+			Summary:     "List eval set items",
+			Tags:        []string{"eval-set-items"},
+			PathParams:  evalset.EvalSetPathParams{},
+			QueryParams: evalset.ListEvalSetItemsQuery{},
+			Responses:   map[int]openAPIResponse{200: resp("Eval set item list", evalset.ListEvalSetItemsResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/eval-sets/{eval_set_id}/imports",
+			Summary:     "Append eval set import",
+			Tags:        []string{"eval-set-imports"},
+			PathParams:  evalset.EvalSetPathParams{},
+			RequestBody: jsonBodyOf(evalset.AppendEvalSetImportRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Appended eval set import task", evalset.AppendEvalSetImportResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/eval-sets/{eval_set_id}/items",
+			Summary:     "Create eval set item",
+			Tags:        []string{"eval-set-items"},
+			PathParams:  evalset.EvalSetPathParams{},
+			RequestBody: jsonBodyOf(evalset.CreateEvalSetItemRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Created eval set item", evalset.EvalSetItemResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/eval-sets/{eval_set_id}/items:batchDelete",
+			Summary:     "Batch delete eval set items",
+			Tags:        []string{"eval-set-items"},
+			PathParams:  evalset.EvalSetPathParams{},
+			RequestBody: jsonBodyOf(evalset.BatchDeleteEvalSetItemsRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Deleted eval set items", evalset.BatchDeleteEvalSetItemsResponse{})},
+		},
+		{
+			Method:      "PATCH",
+			Path:        "/eval-sets/{eval_set_id}/items/{item_id}",
+			Summary:     "Update eval set item",
+			Tags:        []string{"eval-set-items"},
+			PathParams:  evalset.EvalSetItemPathParams{},
+			RequestBody: jsonBodyOf(evalset.UpdateEvalSetItemRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Updated eval set item", evalset.EvalSetItemResponse{})},
+		},
+		{
+			Method:     "DELETE",
+			Path:       "/eval-sets/{eval_set_id}/items/{item_id}",
+			Summary:    "Delete eval set item",
+			Tags:       []string{"eval-set-items"},
+			PathParams: evalset.EvalSetItemPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Deleted eval set item", evalset.DeleteEvalSetItemResponse{})},
+		},
+		{
+			Method:     "GET",
+			Path:       "/eval-sets/{eval_set_id}",
+			Summary:    "Get eval set",
+			Tags:       []string{"eval-sets"},
+			PathParams: evalset.EvalSetPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Eval set details", evalset.EvalSetResponse{})},
+		},
+		{
+			Method:      "PATCH",
+			Path:        "/eval-sets/{eval_set_id}",
+			Summary:     "Update eval set",
+			Tags:        []string{"eval-sets"},
+			PathParams:  evalset.EvalSetPathParams{},
+			RequestBody: jsonBodyOf(evalset.UpdateEvalSetRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Updated eval set", evalset.EvalSetResponse{})},
+		},
+		{
+			Method:     "DELETE",
+			Path:       "/eval-sets/{eval_set_id}",
+			Summary:    "Delete eval set",
+			Tags:       []string{"eval-sets"},
+			PathParams: evalset.EvalSetPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Deleted eval set", evalset.DeleteEvalSetResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/datasets/{dataset}/documents",
+			Summary:     "Document list",
+			Tags:        []string{"documents"},
+			PathParams:  datasetPathParams{},
+			QueryParams: listDocumentsQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Document list", doc.ListDocumentsResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/datasets/{dataset}/documents",
+			Summary:     "Create document",
+			Tags:        []string{"documents"},
+			PathParams:  datasetPathParams{},
+			RequestBody: jsonBodyOf(doc.Doc{}, false),
+			Responses:   map[int]openAPIResponse{200: resp("Created document", doc.Doc{})},
+		},
+		{
+			Method:     "GET",
+			Path:       "/datasets/{dataset}/documents/{document}",
+			Summary:    "Get document",
+			Tags:       []string{"documents"},
+			PathParams: documentPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Document details", doc.Doc{})},
+		},
+		{
+			Method:      "PATCH",
+			Path:        "/datasets/{dataset}/documents/{document}",
+			Summary:     "Update document",
+			Tags:        []string{"documents"},
+			PathParams:  documentPathParams{},
+			RequestBody: jsonBodyOf(doc.Doc{}, false),
+			Responses:   map[int]openAPIResponse{200: resp("Updated document", doc.Doc{})},
+		},
+		{
+			Method:     "DELETE",
+			Path:       "/datasets/{dataset}/documents/{document}",
+			Summary:    "Delete document",
+			Tags:       []string{"documents"},
+			PathParams: documentPathParams{},
+			Responses:  map[int]openAPIResponse{200: refResp("Deleted successfully", "EmptyObject")},
+		},
+		{
+			Method:      "POST",
+			Path:        "/datasets/{dataset}/documents:search",
+			Summary:     "Search documents",
+			Tags:        []string{"documents"},
+			PathParams:  datasetPathParams{},
+			RequestBody: jsonBodyOf(doc.SearchDocumentsRequest{}, false),
+			Responses:   map[int]openAPIResponse{200: resp("Document search results", doc.ListDocumentsResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/documents:listByDatasets",
+			Summary:     "List documents by datasets",
+			Tags:        []string{"documents"},
+			RequestBody: jsonBodyOf(doc.ListDatasetDocumentsRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Dataset document list", doc.ListDocumentsResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/documents:search",
+			Summary:     "textSearch documents",
+			Tags:        []string{"documents"},
+			RequestBody: jsonBodyOf(doc.SearchDocumentsRequest{}, false),
+			Responses:   map[int]openAPIResponse{200: resp("textDocument search results", doc.ListDocumentsResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/system-query/documents:aggregate",
+			Summary:     "Aggregate documents",
+			Tags:        []string{"documents"},
+			RequestBody: jsonBodyOf(doc.AggregateDocumentsRequest{}, false),
+			Responses:   map[int]openAPIResponse{200: resp("Document aggregate results", doc.AggregateDocumentsResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/datasets/{dataset}:batchDelete",
+			Summary:     "BatchDelete document",
+			Tags:        []string{"documents"},
+			PathParams:  datasetPathParams{},
+			RequestBody: jsonBodyOf(doc.BatchDeleteDocumentRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: refResp("Deleted successfully", "EmptyObject")},
+		},
+		{
+			Method:      "GET",
+			Path:        "/datasets/{dataset}/tasks",
+			Summary:     "Task list",
+			Tags:        []string{"tasks"},
+			PathParams:  datasetPathParams{},
+			QueryParams: listTasksQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Task list", doc.ListTasksResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/datasets/{dataset}/tasks",
+			Summary:     "Create task",
+			Tags:        []string{"tasks"},
+			PathParams:  datasetPathParams{},
+			RequestBody: jsonBodyOf(doc.CreateTaskRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Created task", doc.CreateTasksResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/datasets/{dataset}/tasks:search",
+			Summary:     "Search tasks by task ID",
+			Tags:        []string{"tasks"},
+			PathParams:  datasetPathParams{},
+			RequestBody: jsonBodyOf(doc.SearchTasksRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Task search results", doc.ListTasksResponse{})},
+		},
+		{
+			Method:     "GET",
+			Path:       "/datasets/{dataset}/tasks/{task}",
+			Summary:    "Get task",
+			Tags:       []string{"tasks"},
+			PathParams: taskPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Task details", doc.TaskResponse{})},
+		},
+		{
+			Method:     "DELETE",
+			Path:       "/datasets/{dataset}/tasks/{task}",
+			Summary:    "Delete task",
+			Tags:       []string{"tasks"},
+			PathParams: taskPathParams{},
+			Responses:  map[int]openAPIResponse{200: refResp("Deleted successfully", "EmptyObject")},
+		},
+		{
+			Method:      "POST",
+			Path:        "/datasets/{dataset}/tasks:start",
+			Summary:     "Start task",
+			Tags:        []string{"tasks"},
+			PathParams:  datasetPathParams{},
+			RequestBody: jsonBodyOf(doc.StartTaskRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Start result", doc.StartTasksResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/datasets/{dataset}/tasks/{task}:resume",
+			Summary:     "Resume task",
+			Tags:        []string{"tasks"},
+			PathParams:  taskPathParams{},
+			RequestBody: jsonBodyOf(doc.ResumeTaskRequest{}, false),
+			Responses:   map[int]openAPIResponse{200: resp("Resume result", doc.StartTasksResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/datasets/{dataset}/tasks/{task}:suspend",
+			Summary:     "Suspend task",
+			Tags:        []string{"tasks"},
+			PathParams:  taskPathParams{},
+			RequestBody: jsonBodyOf(doc.SuspendJobRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: refResp("Suspended successfully", "EmptyObject")},
+		},
+		{
+			Method:      "POST",
+			Path:        "/datasets/{dataset}/uploads:checkHashes",
+			Summary:     "Check reusable file hashes",
+			Tags:        []string{"tasks"},
+			PathParams:  datasetPathParams{},
+			RequestBody: jsonBodyOf(doc.CheckFileHashesRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Missing file hashes", doc.CheckFileHashesResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/datasets/{dataset}/uploads:initUpload",
+			Summary:     "Initialize dataset upload",
+			Tags:        []string{"tasks"},
+			PathParams:  datasetPathParams{},
+			RequestBody: jsonBodyOf(doc.InitUploadRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Upload initialization result", doc.InitUploadResponse{})},
+		},
+		{
+			Method:  "PUT",
+			Path:    "/datasets/{dataset}/uploads/{upload_id}/parts/{part_number}",
+			Summary: "UploadDatasettext",
+			Tags:    []string{"tasks"},
+			PathParams: struct {
+				Dataset    string `path:"dataset"`
+				UploadID   string `path:"upload_id"`
+				PartNumber string `path:"part_number"`
+			}{},
+			RequestBody: &openAPIBody{Required: true, ContentType: "application/octet-stream", Schema: schemaSource{Inline: map[string]any{"type": "string", "format": "binary"}}},
+			Responses:   map[int]openAPIResponse{200: refResp("Part upload result", "UploadPartResponse")},
+		},
+		{
+			Method:      "POST",
+			Path:        "/datasets/{dataset}/uploads/{upload_id}:complete",
+			Summary:     "Complete upload",
+			Tags:        []string{"tasks"},
+			PathParams:  uploadPathParams{},
+			RequestBody: jsonBodyOf(doc.CompleteUploadRequest{}, false),
+			Responses:   map[int]openAPIResponse{200: resp("Complete uploadtext", doc.CompleteUploadResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/datasets/{dataset}/uploads/{upload_id}:abort",
+			Summary:     "Abort upload",
+			Tags:        []string{"tasks"},
+			PathParams:  uploadPathParams{},
+			RequestBody: jsonBodyOf(doc.AbortUploadRequest{}, false),
+			Responses:   map[int]openAPIResponse{200: refResp("Abort uploadtext", "AbortUploadResponse")},
+		},
+		{
+			Method:      "POST",
+			Path:        "/temp/uploads:initUpload",
+			Summary:     "Initialize temp multipart upload",
+			Tags:        []string{"uploads"},
+			RequestBody: jsonBodyOf(doc.InitUploadRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Upload initialization result", doc.InitUploadResponse{})},
+		},
+		{
+			Method:  "PUT",
+			Path:    "/temp/uploads/{upload_id}/parts/{part_number}",
+			Summary: "Upload temp filetext",
+			Tags:    []string{"uploads"},
+			PathParams: struct {
+				UploadID   string `path:"upload_id"`
+				PartNumber string `path:"part_number"`
+			}{},
+			RequestBody: &openAPIBody{Required: true, ContentType: "application/octet-stream", Schema: schemaSource{Inline: map[string]any{"type": "string", "format": "binary"}}},
+			Responses:   map[int]openAPIResponse{200: refResp("Part upload result", "UploadPartResponse")},
+		},
+		{
+			Method:  "POST",
+			Path:    "/temp/uploads/{upload_id}:complete",
+			Summary: "textUpload",
+			Tags:    []string{"uploads"},
+			PathParams: struct {
+				UploadID string `path:"upload_id"`
+			}{},
+			RequestBody: jsonBodyOf(doc.CompleteUploadRequest{}, false),
+			Responses:   map[int]openAPIResponse{200: resp("Complete uploadtext", doc.CompleteUploadResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/skills",
+			Summary:     "List skills",
+			Tags:        []string{"skills"},
+			QueryParams: skillListQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Skill list", skillListOpenAPIResponse{})},
+		},
+		{
+			Method:    "GET",
+			Path:      "/skills/tags",
+			Summary:   "List skill tags",
+			Tags:      []string{"skills"},
+			Responses: map[int]openAPIResponse{200: resp("Skill tag list", skillTagsOpenAPIResponse{})},
+		},
+		{
+			Method:    "GET",
+			Path:      "/skills/maintenance-task",
+			Summary:   "Get current user's active Skill maintenance task",
+			Tags:      []string{"skills"},
+			Responses: map[int]openAPIResponse{200: resp("Skill maintenance task status", skillMaintenanceStatusOpenAPIResponse{})},
+		},
+		{
+			Method:    "GET",
+			Path:      "/skills/categories",
+			Summary:   "List skill categories",
+			Tags:      []string{"skills"},
+			Responses: map[int]openAPIResponse{200: resp("Skill category list", skillCategoriesOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/skill_organize",
+			Summary:     "Submit skill organize task",
+			Description: "Submits 2 to 20 internal SkillV2 files for organization. The task runs asynchronously in the algorithm service.",
+			Tags:        []string{"skills"},
+			RequestBody: jsonBodyOf(skillOrganizeOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Skill organize task accepted", skillOrganizeOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/skill-organize/tasks",
+			Summary:     "List current user's Skill organize tasks",
+			Tags:        []string{"skills"},
+			QueryParams: skillReviewTaskListQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Skill organize task list", skillReviewTaskListOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/skills",
+			Summary:     "Create directory skill",
+			Description: "Creates one directory-based skill from an uploaded ZIP or URL. The package must contain SKILL.md; description is product metadata and is not written into SKILL.md front matter.",
+			Tags:        []string{"skills"},
+			RequestBody: jsonBodyOf(skillCreateManagedOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Created skill", skillWriteOpenAPIResponse{})},
+		},
+		{
+			Method:     "POST",
+			Path:       "/builtin-skills/{builtin_skill_uid}:enable",
+			Summary:    "Enable builtin directory skill",
+			Tags:       []string{"skills"},
+			PathParams: builtinSkillPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Enabled builtin skill", skillDetailOpenAPIResponse{})},
+		},
+		{
+			Method:     "GET",
+			Path:       "/skills/{skill_id}/distribution-upgrade",
+			Summary:    "Get builtin Skill distribution upgrade status",
+			Tags:       []string{"skills"},
+			PathParams: skillPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Distribution upgrade status", skillDistributionUpgradeStatusOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/skills/{skill_id}/distribution-upgrade:prepare",
+			Summary:     "Prepare a three-way builtin Skill distribution upgrade draft",
+			Description: "Merges the installed distribution base, current user Head, and latest builtin package. The candidate is staged in the existing Skill draft/review workflow.",
+			Tags:        []string{"skills"},
+			PathParams:  skillPathParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Prepared distribution upgrade", skillDistributionUpgradePrepareOpenAPIResponse{})},
+		},
+		{
+			Method:     "GET",
+			Path:       "/skills/{skill_id}",
+			Summary:    "Get directory skill details",
+			Tags:       []string{"skills"},
+			PathParams: skillPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Skill details", skillDetailOpenAPIResponse{})},
+		},
+		{
+			Method:      "PATCH",
+			Path:        "/skills/{skill_id}",
+			Summary:     "Update directory skill",
+			Description: "Partially updates skill metadata. When source is present, the whole directory is replaced from an uploaded ZIP or URL after draft conflict checks.",
+			Tags:        []string{"skills"},
+			PathParams:  skillPathParams{},
+			RequestBody: jsonBodyOf(skillUpdateManagedOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Updated skill", skillWriteOpenAPIResponse{})},
+		},
+		{
+			Method:      "DELETE",
+			Path:        "/skills/{skill_id}",
+			Summary:     "Move skill to trash",
+			Description: "Logically deletes a skill by moving it to the recycle bin.",
+			Tags:        []string{"skills"},
+			PathParams:  skillPathParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Moved skill to trash", skillDeleteOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/skills:trash",
+			Summary:     "List trashed skills",
+			Description: "Lists skills in the current user's recycle bin.",
+			Tags:        []string{"skills"},
+			QueryParams: skillListQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Trashed skill list", skillListOpenAPIResponse{})},
+		},
+		{
+			Method:      "DELETE",
+			Path:        "/skills:trash",
+			Summary:     "Empty skill trash",
+			Description: "Permanently deletes every skill in the current user's recycle bin.",
+			Tags:        []string{"skills"},
+			Responses:   map[int]openAPIResponse{200: resp("Emptied skill trash", skillEmptyTrashOpenAPIResponse{})},
+		},
+		{
+			Method:     "POST",
+			Path:       "/skills/{skill_id}:trash",
+			Summary:    "Move skill to trash",
+			Tags:       []string{"skills"},
+			PathParams: skillPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Moved skill to trash", skillDeleteOpenAPIResponse{})},
+		},
+		{
+			Method:     "POST",
+			Path:       "/skills/{skill_id}:restore",
+			Summary:    "Restore skill from trash",
+			Tags:       []string{"skills"},
+			PathParams: skillPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Restored skill", skillRestoreOpenAPIResponse{})},
+		},
+		{
+			Method:     "DELETE",
+			Path:       "/skills/{skill_id}:purge",
+			Summary:    "Permanently delete trashed skill",
+			Tags:       []string{"skills"},
+			PathParams: skillPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Purged skill", skillPurgeOpenAPIResponse{})},
+		},
+		{
+			Method:     "GET",
+			Path:       "/skills/{skill_id}/tree",
+			Summary:    "Get skill tree",
+			Tags:       []string{"skills"},
+			PathParams: skillPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Skill tree", skillTreeNodeOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/skills/{skill_id}/file",
+			Summary:     "Read skill file",
+			Tags:        []string{"skills"},
+			PathParams:  skillPathParams{},
+			QueryParams: skillFileQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Skill file", skillFileOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/skills/{skill_id}/fs/list",
+			Summary:     "List skill directory entries",
+			Tags:        []string{"skill-fs"},
+			PathParams:  skillPathParams{},
+			QueryParams: skillFSQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Skill directory entries", skillFSListOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/skills/{skill_id}/fs/info",
+			Summary:     "Get skill path info",
+			Tags:        []string{"skill-fs"},
+			PathParams:  skillPathParams{},
+			QueryParams: skillFileQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Skill path info", skillTreeNodeOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/skills/{skill_id}/fs/exists",
+			Summary:     "Check skill path exists",
+			Tags:        []string{"skill-fs"},
+			PathParams:  skillPathParams{},
+			QueryParams: skillFileQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Skill path exists", skillExistsOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/skills/{skill_id}/fs/content",
+			Summary:     "Read skill file content",
+			Tags:        []string{"skill-fs"},
+			PathParams:  skillPathParams{},
+			QueryParams: skillFileQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Skill file content", skillFileOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/skills/{skill_id}/fs/download",
+			Summary:     "Download skill file",
+			Tags:        []string{"skill-fs"},
+			PathParams:  skillPathParams{},
+			QueryParams: skillFileQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Skill file download", skillFileOpenAPIResponse{})},
+		},
+		{
+			Method:     "GET",
+			Path:       "/skills/{skill_id}/draft/exists",
+			Summary:    "Check skill draft exists",
+			Tags:       []string{"skill-drafts"},
+			PathParams: skillPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Skill draft state", skillDraftStateOpenAPIResponse{})},
+		},
+		{
+			Method:     "GET",
+			Path:       "/skills/{skill_id}/draft/status",
+			Summary:    "Get skill draft status",
+			Tags:       []string{"skill-drafts"},
+			PathParams: skillPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Skill draft status", skillDraftStatusOpenAPIResponse{})},
+		},
+		{
+			Method:      "PUT",
+			Path:        "/skills/{skill_id}/draft/fs/text",
+			Summary:     "Write text file to skill draft",
+			Tags:        []string{"skill-drafts"},
+			PathParams:  skillPathParams{},
+			RequestBody: jsonBodyOf(skillDraftWriteTextOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Skill draft mutation", skillDraftMutationOpenAPIResponse{})},
+		},
+		{
+			Method:      "PUT",
+			Path:        "/skills/{skill_id}/draft/fs/upload",
+			Summary:     "Write uploaded file to skill draft",
+			Tags:        []string{"skill-drafts"},
+			PathParams:  skillPathParams{},
+			RequestBody: jsonBodyOf(skillDraftUploadOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Skill draft mutation", skillDraftMutationOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/skills/{skill_id}/draft/fs/dir",
+			Summary:     "Create directory in skill draft",
+			Tags:        []string{"skill-drafts"},
+			PathParams:  skillPathParams{},
+			RequestBody: jsonBodyOf(skillDraftMkdirOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Skill draft mutation", skillDraftMutationOpenAPIResponse{})},
+		},
+		{
+			Method:      "DELETE",
+			Path:        "/skills/{skill_id}/draft/fs/path",
+			Summary:     "Delete path from skill draft",
+			Tags:        []string{"skill-drafts"},
+			PathParams:  skillPathParams{},
+			QueryParams: skillFSQueryParams{},
+			RequestBody: jsonBodyOf(skillDraftDeleteOpenAPIRequest{}, false),
+			Responses:   map[int]openAPIResponse{200: resp("Skill draft mutation", skillDraftMutationOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/skills/{skill_id}/draft/fs/move",
+			Summary:     "Move path in skill draft",
+			Tags:        []string{"skill-drafts"},
+			PathParams:  skillPathParams{},
+			RequestBody: jsonBodyOf(skillDraftMoveOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Skill draft mutation", skillDraftMutationOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/skills/{skill_id}/commit",
+			Summary:     "Commit skill draft",
+			Tags:        []string{"skill-revisions"},
+			PathParams:  skillPathParams{},
+			RequestBody: jsonBodyOf(skillCommitOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Committed skill draft", skillCommitOpenAPIResponse{})},
+		},
+		{
+			Method:     "GET",
+			Path:       "/skills/{skill_id}/revisions",
+			Summary:    "List skill revisions",
+			Tags:       []string{"skill-revisions"},
+			PathParams: skillPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Skill revisions", skillRevisionListOpenAPIResponse{})},
+		},
+		{
+			Method:     "GET",
+			Path:       "/skills/{skill_id}/revisions/{revision_id}",
+			Summary:    "Get skill revision",
+			Tags:       []string{"skill-revisions"},
+			PathParams: skillRevisionPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Skill revision", skillRevisionOpenAPIResponse{})},
+		},
+		{
+			Method:     "GET",
+			Path:       "/skills/{skill_id}/revisions/{revision_id}/tree",
+			Summary:    "Get skill revision tree",
+			Tags:       []string{"skill-revisions"},
+			PathParams: skillRevisionPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Skill revision tree", skillTreeNodeOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/skills/{skill_id}/revisions/{revision_id}/file",
+			Summary:     "Read skill revision file",
+			Tags:        []string{"skill-revisions"},
+			PathParams:  skillRevisionPathParams{},
+			QueryParams: skillFileQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Skill revision file", skillFileOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/skills/{skill_id}/rollback/preview",
+			Summary:     "Preview skill rollback",
+			Tags:        []string{"skill-revisions"},
+			PathParams:  skillPathParams{},
+			RequestBody: jsonBodyOf(skillRollbackOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Skill rollback preview", skillRollbackPreviewOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/skills/{skill_id}/rollback",
+			Summary:     "Rollback skill",
+			Tags:        []string{"skill-revisions"},
+			PathParams:  skillPathParams{},
+			RequestBody: jsonBodyOf(skillRollbackOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Rolled back skill", skillRollbackOpenAPIResponse{})},
+		},
+		{
+			Method:     "DELETE",
+			Path:       "/skills/{skill_id}/revisions/{revision_id}",
+			Summary:    "Delete skill revision",
+			Tags:       []string{"skill-revisions"},
+			PathParams: skillRevisionPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Deleted skill revision", skillDeleteOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/skills/{skill_id}:generate",
+			Summary:     "Generate skill draft",
+			Tags:        []string{"skills"},
+			PathParams:  skillPathParams{},
+			RequestBody: jsonBodyOf(skillGenerateOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Generated skill draft", skillGenerateOpenAPIResponse{})},
+		},
+		{
+			Method:     "GET",
+			Path:       "/skills/{skill_id}:draft-preview",
+			Summary:    "Preview skill draft diff",
+			Tags:       []string{"skills"},
+			PathParams: skillPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Skill draft preview", skillDraftPreviewOpenAPIResponse{})},
+		},
+		{
+			Method:     "POST",
+			Path:       "/skills/{skill_id}:confirm",
+			Summary:    "Confirm skill draft",
+			Tags:       []string{"skills"},
+			PathParams: skillPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Confirmed skill", skillDetailOpenAPIResponse{})},
+		},
+		{
+			Method:     "POST",
+			Path:       "/skills/{skill_id}:discard",
+			Summary:    "Discard skill draft",
+			Tags:       []string{"skills"},
+			PathParams: skillPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Discarded skill draft", skillDiscardOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/skills/{skill_id}:share",
+			Summary:     "Share skill",
+			Tags:        []string{"skill-shares"},
+			PathParams:  skillPathParams{},
+			RequestBody: jsonBodyOf(shareSkillOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Created share task", skillShareCreateOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/skills/{skill_id}:shares",
+			Summary:     "List latest skill share status by target user",
+			Tags:        []string{"skill-shares"},
+			PathParams:  skillPathParams{},
+			QueryParams: shareListQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Skill share targets", skillShareTargetsOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/skill-shares/incoming",
+			Summary:     "List incoming skill shares",
+			Tags:        []string{"skill-shares"},
+			QueryParams: shareListQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Incoming share list", skillShareListOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/skill-shares/outgoing",
+			Summary:     "List outgoing skill shares",
+			Tags:        []string{"skill-shares"},
+			QueryParams: shareListQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Outgoing share list", skillShareListOpenAPIResponse{})},
+		},
+		{
+			Method:     "GET",
+			Path:       "/skill-shares/{share_item_id}",
+			Summary:    "Get skill share item",
+			Tags:       []string{"skill-shares"},
+			PathParams: shareItemPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Skill share detail", skillShareDetailOpenAPIResponse{})},
+		},
+		{
+			Method:     "POST",
+			Path:       "/skill-shares/{share_item_id}:accept",
+			Summary:    "Accept skill share",
+			Tags:       []string{"skill-shares"},
+			PathParams: shareItemPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Accepted share", skillShareAcceptOpenAPIResponse{})},
+		},
+		{
+			Method:     "POST",
+			Path:       "/skill-shares/{share_item_id}:reject",
+			Summary:    "Reject skill share",
+			Tags:       []string{"skill-shares"},
+			PathParams: shareItemPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Rejected share", skillShareRejectOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/skill-diff/tree",
+			Summary:     "Compare skill trees",
+			Tags:        []string{"skill-diff"},
+			RequestBody: jsonBodyOf(diffOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Skill tree diff", diffTreeOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/skill-diff/file",
+			Summary:     "Compare skill file",
+			Tags:        []string{"skill-diff"},
+			RequestBody: jsonBodyOf(diffOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Skill file diff", diffFileOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/skill-market",
+			Summary:     "List published market skills",
+			Tags:        []string{"skill-market"},
+			QueryParams: skillListQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Market skill list", marketListOpenAPIResponse{})},
+		},
+		{
+			Method:    "GET",
+			Path:      "/skill-market/tags",
+			Summary:   "List published market skill tags",
+			Tags:      []string{"skill-market"},
+			Responses: map[int]openAPIResponse{200: resp("Market skill tag list", skillTagsOpenAPIResponse{})},
+		},
+		{
+			Method:     "GET",
+			Path:       "/skill-market/{market_item_id}",
+			Summary:    "Get market skill details",
+			Tags:       []string{"skill-market"},
+			PathParams: marketItemPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Market skill item", marketItemOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/skill-market:install",
+			Summary:     "Install skill from market",
+			Tags:        []string{"skill-market"},
+			RequestBody: jsonBodyOf(marketInstallOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Installed market skill", marketInstallOpenAPIResponse{})},
+		},
+		{
+			Method:     "POST",
+			Path:       "/skill-market/{market_item_id}:install",
+			Summary:    "Install skill from market item",
+			Tags:       []string{"skill-market"},
+			PathParams: marketItemPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Installed market skill", marketInstallOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/admin/skill-market",
+			Summary:     "Publish market skill item",
+			Tags:        []string{"skill-market"},
+			RequestBody: jsonBodyOf(marketPublishOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Published market skill", marketPublishOpenAPIResponse{})},
+		},
+		{
+			Method:      "PATCH",
+			Path:        "/admin/skill-market/{market_item_id}",
+			Summary:     "Edit market skill item",
+			Tags:        []string{"skill-market"},
+			PathParams:  marketItemPathParams{},
+			RequestBody: jsonBodyOf(marketEditOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Edited market skill", marketItemOpenAPIResponse{})},
+		},
+		{
+			Method:     "DELETE",
+			Path:       "/admin/skill-market/{market_item_id}",
+			Summary:    "Permanently delete market skill item",
+			Tags:       []string{"skill-market"},
+			PathParams: marketItemPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Deleted market skill", marketDeleteOpenAPIResponse{})},
+		},
+		{
+			Method:     "POST",
+			Path:       "/admin/skill-market/{market_item_id}:offline",
+			Summary:    "Unpublish market skill item",
+			Tags:       []string{"skill-market"},
+			PathParams: marketItemPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Unpublished market skill", marketItemOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/skill-market/admin/items",
+			Summary:     "Publish market skill item",
+			Tags:        []string{"skill-market"},
+			RequestBody: jsonBodyOf(marketPublishOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Published market skill", marketPublishOpenAPIResponse{})},
+		},
+		{
+			Method:      "PATCH",
+			Path:        "/skill-market/admin/items/{market_item_id}",
+			Summary:     "Edit market skill item",
+			Tags:        []string{"skill-market"},
+			PathParams:  marketItemPathParams{},
+			RequestBody: jsonBodyOf(marketEditOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Edited market skill", marketItemOpenAPIResponse{})},
+		},
+		{
+			Method:     "DELETE",
+			Path:       "/skill-market/admin/items/{market_item_id}",
+			Summary:    "Permanently delete market skill item",
+			Tags:       []string{"skill-market"},
+			PathParams: marketItemPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Deleted market skill", marketDeleteOpenAPIResponse{})},
+		},
+		{
+			Method:     "POST",
+			Path:       "/skill-market/admin/items/{market_item_id}:unpublish",
+			Summary:    "Unpublish market skill item",
+			Tags:       []string{"skill-market"},
+			PathParams: marketItemPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Unpublished market skill", marketItemOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/knowledge-market",
+			Summary:     "List published knowledge market items",
+			Description: "Read-only catalog browsing. Filters combine with AND semantics; only published items are returned.",
+			Tags:        []string{"knowledge-market"},
+			QueryParams: knowledgeMarketListQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Knowledge market item list", knowledgeMarketListOpenAPIResponse{})},
+		},
+		{
+			Method:    "GET",
+			Path:      "/knowledge-market/domains",
+			Summary:   "List knowledge market domains grouped by category",
+			Tags:      []string{"knowledge-market"},
+			Responses: map[int]openAPIResponse{200: resp("Knowledge market domains", knowledgeMarketDomainsOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/knowledge-market/items/{market_item_id}",
+			Summary:     "Get knowledge market item details",
+			Description: "Returns the full catalog entry including its latest version, download package URL/revision and sample questions. 404 when the item does not exist or is not published.",
+			Tags:        []string{"knowledge-market"},
+			PathParams:  knowledgeMarketItemPathParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Knowledge market item", knowledgeMarketDetailOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/knowledge-market/items/{market_item_id}:install",
+			Summary:     "Install an official knowledge base",
+			Description: "Enqueues a background install job that downloads the package, creates a personal dataset and submits every file to the parsing/vectorizing pipeline. Returns the job id; progress is polled via GET /knowledge-market/tasks/{job_id}. Conflicts with an in-flight install/update of the same item return 409.",
+			Tags:        []string{"knowledge-market"},
+			PathParams:  knowledgeMarketItemPathParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Install job enqueued", knowledgeMarketInstallOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/knowledge-market/items/{market_item_id}:update",
+			Summary:     "Update one installed official knowledge base",
+			Description: "Enqueues a background update job (strategy A: clear old documents then import the new package). No-change updates finish with updated=false and write nothing. Conflicts with an in-flight install/update of the same item return 409; not-installed items return 404.",
+			Tags:        []string{"knowledge-market"},
+			PathParams:  knowledgeMarketItemPathParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Update job enqueued", knowledgeMarketInstallOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/knowledge-market:update-all",
+			Summary:     "One-click update of all installed official knowledge bases",
+			Description: "Enqueues a check-only batch job that compares every installed item and spawns an independent update job per changed item. A second batch for the same user returns 409.",
+			Tags:        []string{"knowledge-market"},
+			Responses:   map[int]openAPIResponse{200: resp("Update-all job enqueued", knowledgeMarketInstallOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/knowledge-market/tasks",
+			Summary:     "List background knowledge market tasks",
+			Description: "Returns the current user's knowledge market tasks (default job type knowledge_market_install; pass job_type for update/update-all) with market item info and install-state enrichment.",
+			Tags:        []string{"knowledge-market"},
+			QueryParams: knowledgeMarketTaskListQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Background install task list", knowledgeMarketTaskListOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/knowledge-market/tasks/{job_id}",
+			Summary:     "Get background knowledge market task detail",
+			Description: "Returns one knowledge market task (install/update/update-all) with payload, result and the derived stage/overall progress. 404 when the job does not exist or belongs to another user.",
+			Tags:        []string{"knowledge-market"},
+			PathParams:  knowledgeMarketTaskPathParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Background install task detail", knowledgeMarketTaskDetailOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/knowledge-market/installs",
+			Summary:     "List my knowledge market installs",
+			Description: "Returns the current user's install records (all states, no pagination) so plaza cards and the \"my knowledge bases\" tab can map each item to its install state.",
+			Tags:        []string{"knowledge-market"},
+			Responses:   map[int]openAPIResponse{200: resp("My knowledge market installs", knowledgeMarketInstallsOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/skill/create",
+			Summary:     "Create skill directly from internal request",
+			Tags:        []string{"skill-evolution"},
+			RequestBody: jsonBodyOf(internalSkillCreateOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Created skill", skillWriteOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/remote-fs/list",
+			Summary:     "List remote skill filesystem path",
+			Description: "List skills root/category without task_id, or list package content with task-aware view selection.",
+			Tags:        []string{"remote-fs"},
+			QueryParams: remoteFSListQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Remote filesystem list", remoteFSListOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/remote-fs/info",
+			Summary:     "Get remote skill filesystem path info",
+			Description: "Package paths require task_id so RemoteFS can choose publish view, current task draft view, or review draft view.",
+			Tags:        []string{"remote-fs"},
+			QueryParams: remoteFSQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Remote filesystem info", remoteFSInfoOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/remote-fs/exists",
+			Summary:     "Check remote skill filesystem path exists",
+			Description: "Package paths require task_id so RemoteFS can choose publish view, current task draft view, or review draft view.",
+			Tags:        []string{"remote-fs"},
+			QueryParams: remoteFSQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Remote filesystem exists", remoteFSExistsOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/remote-fs/content",
+			Summary:     "Read remote skill filesystem content",
+			Description: "Reads package content using task_id semantics: review_ sees existing draft, org_ and editor session ids see publish unless they own the current draft.",
+			Tags:        []string{"remote-fs"},
+			QueryParams: remoteFSQueryParams{},
+			Responses:   map[int]openAPIResponse{200: rawResp("Remote filesystem raw content")},
+		},
+		{
+			Method:      "PUT",
+			Path:        "/remote-fs/content",
+			Summary:     "Write remote skill filesystem content",
+			Description: "Writes raw body bytes into the task draft. review_ may write an existing draft without changing draft ownership; org_ and editor session ids conflict with another task draft.",
+			Tags:        []string{"remote-fs"},
+			QueryParams: remoteFSQueryParams{},
+			RequestBody: &openAPIBody{Required: true, ContentType: "application/octet-stream", Schema: schemaSource{Inline: map[string]any{"type": "string", "format": "binary"}}},
+			Responses:   map[int]openAPIResponse{200: resp("Remote filesystem write result", okOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/remote-fs/dir",
+			Summary:     "Create remote skill filesystem directory or empty package",
+			Tags:        []string{"remote-fs"},
+			QueryParams: remoteFSTaskQueryParams{},
+			RequestBody: jsonBodyOf(remoteFSDirOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Remote filesystem mkdir result", okOpenAPIResponse{})},
+		},
+		{
+			Method:      "DELETE",
+			Path:        "/remote-fs/path",
+			Summary:     "Delete remote skill filesystem path",
+			Tags:        []string{"remote-fs"},
+			QueryParams: remoteFSDeleteQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Remote filesystem delete result", okOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/remote-fs/copy",
+			Summary:     "Copy remote skill filesystem path",
+			Tags:        []string{"remote-fs"},
+			QueryParams: remoteFSTaskQueryParams{},
+			RequestBody: jsonBodyOf(remoteFSCopyOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Remote filesystem copy result", okOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/remote-fs/move",
+			Summary:     "Move remote skill filesystem path",
+			Tags:        []string{"remote-fs"},
+			QueryParams: remoteFSTaskQueryParams{},
+			RequestBody: jsonBodyOf(remoteFSMoveOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Remote filesystem move result", okOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/remote-fs/trash",
+			Summary:     "Trash remote skill package",
+			Tags:        []string{"remote-fs"},
+			QueryParams: remoteFSUserQueryParams{},
+			RequestBody: jsonBodyOf(remoteFSTrashOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Remote filesystem trash result", okOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/model_providers",
+			Summary:     "List user model providers",
+			Description: "Per-user model provider list. Missing catalog rows are synced from default_model_providers on each request. Query parameter category filters by provider category (default model when category and exclude_category are both omitted). Query parameter exclude_category excludes a category (e.g. exclude_category=model returns ocr and search providers). Query parameter keyword filters by provider name case-insensitively.",
+			Tags:        []string{"model_providers"},
+			QueryParams: listUserModelProvidersQueryParams{},
+			Headers:     localizedCatalogHeaders{},
+			Responses:   map[int]openAPIResponse{200: resp("User model provider list", listUserModelProvidersOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/model_providers:with_groups",
+			Summary:     "List user model providers that have groups",
+			Description: "Returns user_model_providers for the current user that have at least one non-deleted row in user_model_provider_groups. The current user identity is injected by the auth gateway from the token. Same response shape as GET /model_providers.",
+			Tags:        []string{"model_providers"},
+			Headers:     localizedCatalogHeaders{},
+			Responses:   map[int]openAPIResponse{200: resp("User model providers with groups", listUserModelProvidersOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/model_providers/{model_provider_id}/groups/{group_id}:check",
+			Summary:     "Check model provider connectivity",
+			Description: "Validates credentials. Model providers are proxied to the algorithm check endpoint; OCR cloud services use the same provider API/key request shape as the OCR readers. The current user identity is injected by the auth gateway from the token.",
+			Tags:        []string{"model_providers"},
+			RequestBody: jsonBodyOf(checkModelProviderOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("data: success and message from provider check", modelprovider.CheckModelProviderData{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/model_providers/features",
+			Summary:     "Get model feature flags",
+			Description: "Returns feature flags derived from the algorithm service runtime_models.yaml. Result is permanently cached after the first successful fetch. image_embed_enabled is true when a cross_modal_embed role is configured.",
+			Tags:        []string{"model_providers"},
+			Responses:   map[int]openAPIResponse{200: resp("Feature flags", modelprovider.ModelFeaturesResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/model_providers/models",
+			Summary:     "List current user's available models",
+			Description: "Optionally filters by query model_type (e.g. llm, vlm, or embed). When omitted, returns every non-deleted model in the current user's verified provider groups. Each item includes nullable max_input_tokens, the catalog model's maximum input context window expressed as a string such as 512, 128K, or 1M; custom or unknown models return null. Ordered by user_model_provider_id, group id, then name. Same items as GET .../groups/{group_id}/models.",
+			Tags:        []string{"model_providers"},
+			QueryParams: listUserModelsByModelTypeQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Models list", listModelProviderGroupModelsOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/model_providers/selected_models",
+			Summary:     "Get selected models by model_type",
+			Description: "Returns the current user's selected model for each model_type. Each selection includes nullable max_input_tokens, the selected catalog model's maximum input context window expressed as a string such as 512, 128K, or 1M; custom or unknown models return null.",
+			Tags:        []string{"model_providers"},
+			Responses:   map[int]openAPIResponse{200: resp("Selected models", listSelectedModelsOpenAPIResponse{})},
+		},
+		{
+			Method:      "PUT",
+			Path:        "/model_providers/selected_models",
+			Summary:     "Save selected models by model_type",
+			Description: "Upserts selected model rows for the current user. Each selection requires model_type and model_id. model_id must belong to the current user and model_type must match the model row.",
+			Tags:        []string{"model_providers"},
+			RequestBody: jsonBodyOf(setSelectedModelsOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Saved selected models", listSelectedModelsOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/model_providers/{model_provider_id}/groups",
+			Summary:     "List model provider connection groups",
+			Description: "Lists non-deleted groups for the user model provider. model_provider_id is the id from GET /model_providers. Each item includes api_key.",
+			Tags:        []string{"model_providers"},
+			PathParams:  modelProviderGroupPathParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Group list", listModelProviderGroupsOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/model_providers/{model_provider_id}/groups",
+			Summary:     "Create model provider connection group",
+			Description: "Creates a group (name, base_url, optional api_key) under the given user model provider. OCR cloud services validate the submitted API key against the provider API before saving. The api_key is not returned in the response body.",
+			Tags:        []string{"model_providers"},
+			PathParams:  modelProviderGroupPathParams{},
+			RequestBody: jsonBodyOf(createModelProviderGroupOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Created group", createModelProviderGroupOpenAPIResponse{})},
+		},
+		{
+			Method:      "PATCH",
+			Path:        "/model_providers/{model_provider_id}/groups/{group_id}",
+			Summary:     "Update model provider connection group",
+			Description: "Updates name, base_url, and optionally api_key for a group. OCR cloud services validate the effective API key against the provider API before saving. Omit api_key or send an empty string to keep the existing API key. The api_key is not returned in the response body.",
+			Tags:        []string{"model_providers"},
+			PathParams:  modelProviderGroupByIDPathParams{},
+			RequestBody: jsonBodyOf(updateModelProviderGroupOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Updated group", createModelProviderGroupOpenAPIResponse{})},
+		},
+		{
+			Method:      "DELETE",
+			Path:        "/model_providers/{model_provider_id}/groups/{group_id}",
+			Summary:     "Delete model provider connection group",
+			Description: "Soft-deletes the group and its user_model_provider_group_models rows. The current user identity is injected by the auth gateway from the token.",
+			Tags:        []string{"model_providers"},
+			PathParams:  modelProviderGroupByIDPathParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Deleted group", deleteModelProviderGroupOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/model_providers/{model_provider_id}/groups/{group_id}/remote_models",
+			Summary:     "List models advertised by a connection group",
+			Description: "Calls the group's OpenAI-compatible /v1/models endpoint using the stored Base URL and API key. Each item includes an inferred model_type and whether it is already added to the group.",
+			Tags:        []string{"model_providers"},
+			PathParams:  modelProviderGroupByIDPathParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Remote models list", listRemoteGroupModelsOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/model_providers/{model_provider_id}/groups/{group_id}/models",
+			Summary:     "List models under a connection group",
+			Description: "Lists non-deleted user_model_provider_group_models for the group. Each item includes is_default (true when copied from default_models seeding; false for user-added models) and nullable max_input_tokens, the catalog model's maximum input context window expressed as a string such as 512, 128K, or 1M. Custom or unknown models return null.",
+			Tags:        []string{"model_providers"},
+			PathParams:  modelProviderGroupByIDPathParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Group models list", listModelProviderGroupModelsOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/model_providers/{model_provider_id}/groups/{group_id}/models",
+			Summary:     "Add custom model under a connection group",
+			Description: "Creates a user_model_provider_group_models row with is_default false (custom model name and model_type). Name must be unique within the group among active rows. For llm and vlm, max_input_tokens from the request is stored when provided; otherwise it is resolved from config/model_context_windows.yaml by model name and unknown names fall back to 128K. provider_name and base_url are taken from the user provider and group. Response group_name is user_model_provider_groups.name (not stored on the model row).",
+			Tags:        []string{"model_providers"},
+			PathParams:  modelProviderGroupByIDPathParams{},
+			RequestBody: jsonBodyOf(addModelProviderGroupModelOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Created group model", addModelProviderGroupModelOpenAPIResponse{})},
+		},
+		{
+			Method:      "PATCH",
+			Path:        "/model_providers/{model_provider_id}/groups/{group_id}/models/{model_id}",
+			Summary:     "Update a connection group model",
+			Description: "Updates max_input_tokens for a custom (non-catalog) LLM. The field is required. Values use a positive integer or K/M suffix such as 512, 128K, or 1M and must be at most 16 characters. Catalog models keep the YAML value and cannot be patched.",
+			Tags:        []string{"model_providers"},
+			PathParams:  modelProviderGroupModelPathParams{},
+			RequestBody: jsonBodyOf(updateModelProviderGroupModelOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Updated group model", listModelProviderGroupModelsOpenAPIItem{})},
+		},
+		{
+			Method:      "DELETE",
+			Path:        "/model_providers/{model_provider_id}/groups/{group_id}/models/{model_id}",
+			Summary:     "Delete model under a connection group",
+			Description: "Soft-deletes one user_model_provider_group_models row. The current user identity is injected by the auth gateway from the token.",
+			Tags:        []string{"model_providers"},
+			PathParams:  modelProviderGroupModelPathParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Deleted group model", deleteModelProviderGroupModelOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/translation/status",
+			Summary:     "Get translation configuration status",
+			Description: "Reports whether the current user has a selected translation provider with credentials. Secrets are never returned.",
+			Tags:        []string{"translation"},
+			Responses:   map[int]openAPIResponse{200: resp("Translation configuration status", translationStatusOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/translation:translate",
+			Summary:     "Translate selected document text",
+			Description: "Translates up to 5000 characters with the current user's server-side translation credential.",
+			Tags:        []string{"translation"},
+			RequestBody: jsonBodyOf(translationOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Translated text", translationOpenAPIResponse{})},
+		},
+		{
+			Method:    "GET",
+			Path:      "/personalization-setting",
+			Summary:   "Get personalization setting",
+			Tags:      []string{"personalization"},
+			Responses: map[int]openAPIResponse{200: resp("Personalization setting", personalizationSettingOpenAPIResponse{})},
+		},
+		{
+			Method:      "PUT",
+			Path:        "/personalization-setting",
+			Summary:     "Set personalization setting",
+			Tags:        []string{"personalization"},
+			RequestBody: jsonBodyOf(personalizationSettingOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Updated personalization setting", personalizationSettingOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/user/chat-settings",
+			Summary:     "Get quick-question and new-task defaults",
+			Description: "Returns independent thinking-depth and conversation defaults for the quick-question and new-task entry points. Legacy flat fields remain available and mirror the new-task conversation defaults.",
+			Tags:        []string{"user"},
+			Responses:   map[int]openAPIResponse{200: resp("Current user's chat entry defaults", userChatSettingsOpenAPIResponse{})},
+		},
+		{
+			Method:      "PATCH",
+			Path:        "/user/chat-settings",
+			Summary:     "Partially update quick-question and new-task defaults",
+			Description: "Every field is optional. Send quick_question or new_task to update one entry profile without replacing the other. Legacy flat fields remain accepted for installed clients.",
+			Tags:        []string{"user"},
+			RequestBody: jsonBodyOf(userChatSettingsPatchOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Updated chat entry defaults", userChatSettingsOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/chat/models",
+			Summary:     "List usable chat models and resolve the current selection",
+			Description: "Returns only non-deleted LLMs from verified provider groups that are owned by the current user or explicitly shared through the active shared llm selection. Credentials and endpoint configuration are never returned.",
+			Tags:        []string{"chat"},
+			QueryParams: chatModelsQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Chat model selection and providers", chatModelsOpenAPIResponse{})},
+		},
+		{
+			Method:      "PATCH",
+			Path:        "/conversations/{conversation_id}/model",
+			Summary:     "Switch the conversation chat model",
+			Description: "Uses expected_version for optimistic locking and rejects changes while chat generation, a Workflow, or a background task is active. Fixed mode affects only the llm role from the next request onward.",
+			Tags:        []string{"conversations"},
+			PathParams:  conversationModelPathParams{},
+			RequestBody: jsonBodyOf(patchConversationModelOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Updated conversation model selection", patchConversationModelOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/conversations/{parent_id}/sidechat",
+			Summary:     "Create an ephemeral side conversation",
+			Description: "Freezes the selected parent history boundary as read-only model context. The child starts with basic chat only and remains hidden from conversation lists until retained.",
+			Tags:        []string{"conversations"},
+			PathParams:  sidechatParentPathParams{},
+			RequestBody: jsonBodyOf(createSidechatOpenAPIRequest{}, false),
+			Responses:   map[int]openAPIResponse{200: resp("Created side conversation", sidechatConversationOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/conversations/{child_id}/retain",
+			Summary:     "Retain a side conversation",
+			Description: "Promotes an ephemeral side conversation into visible history after at least one completed turn.",
+			Tags:        []string{"conversations"},
+			PathParams:  sidechatChildPathParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Retained side conversation", sidechatConversationOpenAPIResponse{})},
+		},
+		{
+			Method:      "DELETE",
+			Path:        "/conversations/{child_id}/sidechat",
+			Summary:     "Discard an ephemeral side conversation",
+			Description: "Permanently clears an unretained side conversation and its dependent records.",
+			Tags:        []string{"conversations"},
+			PathParams:  sidechatChildPathParams{},
+			Responses:   map[int]openAPIResponse{204: {Description: "Side conversation discarded"}},
+		},
+		{
+			Method:    "GET",
+			Path:      "/user/ui-preferences",
+			Summary:   "Get current user's UI preferences",
+			Tags:      []string{"user"},
+			Responses: map[int]openAPIResponse{200: resp("Current user's UI preferences", userUIPreferencesOpenAPIResponse{})},
+		},
+		{
+			Method:      "PATCH",
+			Path:        "/user/ui-preferences",
+			Summary:     "Partially update current user's UI preferences",
+			Description: "Partial update. Every field inside the request body is optional; send only fields that should change. Updating schedules_enabled pauses or resumes scheduled execution; updating skills_enabled sets all current user skills to the same state; updating workflows_enabled independently sets all available workflows in one transaction.",
+			Tags:        []string{"user"},
+			RequestBody: jsonBodyOf(userUIPreferencesPatchOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Updated current user's UI preferences", userUIPreferencesOpenAPIResponse{})},
+		},
+		{
+			Method:    "GET",
+			Path:      "/settings/overview",
+			Summary:   "Get current user's settings overview",
+			Tags:      []string{"settings"},
+			Responses: map[int]openAPIResponse{200: resp("Settings overview", settingsOverviewOpenAPIResponse{})},
+		},
+		{
+			Method:    "POST",
+			Path:      "/settings/checks",
+			Summary:   "Run current user's settings checks",
+			Tags:      []string{"settings"},
+			Responses: map[int]openAPIResponse{200: resp("Settings checks", settingsChecksOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/prompts",
+			Summary:     "Prompt list",
+			Tags:        []string{"prompts"},
+			QueryParams: promptListQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Prompt list", promptListOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/prompts",
+			Summary:     "Create prompt",
+			Tags:        []string{"prompts"},
+			RequestBody: jsonBodyOf(promptCreateOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Created prompt", promptItemOpenAPIResponse{})},
+		},
+		{
+			Method:    "GET",
+			Path:      "/prompt_categories",
+			Summary:   "Prompt category list",
+			Tags:      []string{"prompts"},
+			Responses: map[int]openAPIResponse{200: resp("Prompt category list", promptCategoryListOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/prompt_categories",
+			Summary:     "Create prompt category",
+			Tags:        []string{"prompts"},
+			RequestBody: jsonBodyOf(promptCategoryCreateOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Created prompt category", promptCategoryOpenAPIResponse{})},
+		},
+		{
+			Method:     "DELETE",
+			Path:       "/prompt_categories/{name}",
+			Summary:    "Delete prompt category",
+			Tags:       []string{"prompts"},
+			PathParams: promptPathParams{},
+			Responses:  map[int]openAPIResponse{200: refResp("Deleted successfully", "EmptyObject")},
+		},
+		{
+			Method:      "POST",
+			Path:        "/prompts:polish",
+			Summary:     "Polish prompt",
+			Tags:        []string{"prompts"},
+			RequestBody: jsonBodyOf(promptPolishOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Polished prompt", promptPolishOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/prompts/{name}",
+			Summary:     "Get prompt",
+			Tags:        []string{"prompts"},
+			PathParams:  promptPathParams{},
+			QueryParams: promptGetQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Prompt details", promptItemOpenAPIResponse{})},
+		},
+		{
+			Method:      "PATCH",
+			Path:        "/prompts/{name}",
+			Summary:     "Update prompt",
+			Tags:        []string{"prompts"},
+			PathParams:  promptPathParams{},
+			RequestBody: jsonBodyOf(promptPatchOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Updated prompt", promptItemOpenAPIResponse{})},
+		},
+		{
+			Method:     "DELETE",
+			Path:       "/prompts/{name}",
+			Summary:    "Delete prompt",
+			Tags:       []string{"prompts"},
+			PathParams: promptPathParams{},
+			Responses:  map[int]openAPIResponse{200: refResp("Deleted successfully", "EmptyObject")},
+		},
+		{
+			Method:     "POST",
+			Path:       "/prompts/{name}:favorite",
+			Summary:    "Favorite prompt",
+			Tags:       []string{"prompts"},
+			PathParams: promptPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Favorited successfully", promptStateOpenAPIResponse{})},
+		},
+		{
+			Method:     "POST",
+			Path:       "/prompts/{name}:unfavorite",
+			Summary:    "Unfavorite prompt",
+			Tags:       []string{"prompts"},
+			PathParams: promptPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Unfavorited successfully", promptStateOpenAPIResponse{})},
+		},
+		{
+			Method:     "POST",
+			Path:       "/prompts/{name}:use",
+			Summary:    "Record prompt usage",
+			Tags:       []string{"prompts"},
+			PathParams: promptPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Usage recorded", promptStateOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/showcase/cases",
+			Summary:     "Showcase case list",
+			Tags:        []string{"showcase"},
+			QueryParams: showcaseListQueryParams{},
+			Headers:     localizedCatalogHeaders{},
+			Responses:   map[int]openAPIResponse{200: resp("Showcase case list", showcase.ShowcaseCaseListResponse{})},
+		},
+		{
+			Method:     "GET",
+			Path:       "/showcase/cases/{case_id}",
+			Summary:    "Showcase case details",
+			Tags:       []string{"showcase"},
+			PathParams: showcaseCasePathParams{},
+			Headers:    localizedCatalogHeaders{},
+			Responses:  map[int]openAPIResponse{200: resp("Showcase case details", showcase.ShowcaseCase{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/tools",
+			Summary:     "Tool list",
+			Tags:        []string{"tools"},
+			QueryParams: toolListQueryParams{},
+			Headers:     localizedCatalogHeaders{},
+			Responses:   map[int]openAPIResponse{200: resp("Tool list", toolListOpenAPIResponse{})},
+		},
+		{
+			Method:     "POST",
+			Path:       "/tools/{tool_name}:disable",
+			Summary:    "Disable tool",
+			Tags:       []string{"tools"},
+			PathParams: toolPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Tool disabled", toolStateOpenAPIResponse{})},
+		},
+		{
+			Method:     "POST",
+			Path:       "/tools/{tool_name}:enable",
+			Summary:    "Enable tool",
+			Tags:       []string{"tools"},
+			PathParams: toolPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Tool enabled", toolStateOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/mcp_servers",
+			Summary:     "List MCP servers",
+			Tags:        []string{"mcp_servers"},
+			QueryParams: mcpServerListQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("MCP server list", mcp.ListServersResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/mcp_servers",
+			Summary:     "Create MCP server",
+			Tags:        []string{"mcp_servers"},
+			RequestBody: jsonBodyOf(mcp.CreateServerRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Created MCP server", mcp.ServerResponse{})},
+		},
+		{
+			Method:      "PATCH",
+			Path:        "/mcp_servers:enabled",
+			Summary:     "Enable or disable owned MCP servers",
+			Tags:        []string{"mcp_servers"},
+			RequestBody: jsonBodyOf(mcp.BulkUpdateServerEnabledRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Bulk updated MCP servers", mcp.BulkUpdateServerEnabledResponse{})},
+		},
+		{
+			Method:     "GET",
+			Path:       "/mcp_servers/{id}",
+			Summary:    "Get MCP server",
+			Tags:       []string{"mcp_servers"},
+			PathParams: mcpServerPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("MCP server", mcp.ServerResponse{})},
+		},
+		{
+			Method:      "PATCH",
+			Path:        "/mcp_servers/{id}",
+			Summary:     "Update MCP server",
+			Tags:        []string{"mcp_servers"},
+			PathParams:  mcpServerPathParams{},
+			RequestBody: jsonBodyOf(mcp.UpdateServerRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Updated MCP server", mcp.ServerResponse{})},
+		},
+		{
+			Method:     "DELETE",
+			Path:       "/mcp_servers/{id}",
+			Summary:    "Delete MCP server",
+			Tags:       []string{"mcp_servers"},
+			PathParams: mcpServerPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Deleted MCP server", mcpDeleteServerOpenAPIResponse{})},
+		},
+		{
+			Method:     "POST",
+			Path:       "/mcp_servers/{id}:check",
+			Summary:    "Check MCP server",
+			Tags:       []string{"mcp_servers"},
+			PathParams: mcpServerPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("MCP server check result", mcp.CheckResponse{})},
+		},
+		{
+			Method:     "POST",
+			Path:       "/mcp_servers/{id}:discover",
+			Summary:    "Discover MCP server tools",
+			Tags:       []string{"mcp_servers"},
+			PathParams: mcpServerPathParams{},
+			Responses:  map[int]openAPIResponse{200: resp("Discovered MCP tools", mcp.DiscoverResponse{})},
+		},
+		{
+			Method:      "PUT",
+			Path:        "/mcp_servers/{id}/tools",
+			Summary:     "Update MCP server tools",
+			Tags:        []string{"mcp_servers"},
+			PathParams:  mcpServerPathParams{},
+			RequestBody: jsonBodyOf(mcp.UpdateToolsRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Updated MCP server tools", mcp.ServerResponse{})},
+		},
+		{
+			Method:      "PATCH",
+			Path:        "/conversations/{name}:search-config",
+			Summary:     "Update conversation search filters",
+			Description: "Replaces any supplied knowledge-base, creator, or tag filters while preserving omitted search settings.",
+			Tags:        []string{"conversations"},
+			PathParams:  conversationPathParams{},
+			RequestBody: jsonBodyOf(conversationSearchConfigOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Updated conversation search config", conversationSearchConfigOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/conversation:export",
+			Summary:     "Export conversations",
+			Tags:        []string{"conversations"},
+			RequestBody: jsonBodyOf(chat.ExportConversationsRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Export conversation files", chat.ExportConversationsResponse{})},
+		},
+		{
+			Method:     "GET",
+			Path:       "/conversation:export/files/{file_id}",
+			Summary:    "Download exported conversation file",
+			Tags:       []string{"conversations"},
+			PathParams: exportConversationFilePathParams{},
+			Responses:  map[int]openAPIResponse{200: {Description: "Exported conversation file", ContentType: "application/octet-stream", Schema: schemaSource{Inline: map[string]any{"type": "string", "format": "binary"}}}},
+		},
+		{
+			Method: "GET", Path: "/agent/evolution-models", Summary: "List validated evolution models",
+			Description: "Personal and explicitly shared Core model candidates with current capability evidence. Connection verification alone never admits a model. A missing available_default_ref requires explicit selection; no silent fallback.",
+			Tags:        []string{"agent"}, Responses: map[int]openAPIResponse{200: resp("Evolution models", modelconfig.EvolutionModels{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/agent/threads",
+			Summary:     "List agent threads",
+			Description: "List the current user's Core thread index entries. Core refreshes status from Evo when available.",
+			Tags:        []string{"agent"},
+			QueryParams: agentThreadListQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Agent thread list", agentThreadListOpenAPIResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/agent/threads",
+			Summary:     "Create agent thread",
+			Description: "Creates an Evo thread. Optional evo_model_ref selects a validated, authorized, version-bound model for this request only. Core resolves credentials and stores a public model_at_creation summary in thread_payload. An omitted reference uses only the configured available default. Client llm_config and model_at_creation are ignored.",
+			Tags:        []string{"agent"},
+			RequestBody: evoJSONBody(true),
+			Responses:   map[int]openAPIResponse{200: evoJSONResp("Created agent thread")},
+		},
+		{
+			Method:      "GET",
+			Path:        "/agent/threads/{thread_id}/events:stream",
+			Summary:     "Stream agent thread events",
+			Description: "Proxies Evo GET /threads/{thread_id}/events:stream.",
+			Tags:        []string{"agent"},
+			PathParams:  agentThreadPathParams{},
+			QueryParams: agentThreadEventsQueryParams{},
+			Responses:   map[int]openAPIResponse{200: evoStreamResp},
+		},
+		{
+			Method:      "GET",
+			Path:        "/agent/threads/{thread_id}/event-trace:stream",
+			Summary:     "Stream agent thread event trace",
+			Description: "Proxies Evo GET /threads/{thread_id}/event-trace:stream.",
+			Tags:        []string{"agent"},
+			PathParams:  agentThreadPathParams{},
+			QueryParams: agentThreadEventTraceQueryParams{},
+			Responses:   map[int]openAPIResponse{200: evoStreamResp},
+		},
+		{
+			Method:      "GET",
+			Path:        "/agent/threads/{thread_id}/steps",
+			Summary:     "List agent thread steps",
+			Description: "Proxies Evo GET /threads/{thread_id}/steps. Core does not read or write step detail rows for this endpoint.",
+			Tags:        []string{"agent"},
+			PathParams:  agentThreadPathParams{},
+			Responses:   map[int]openAPIResponse{200: evoJSONResp("Evo thread steps")},
+		},
+		{
+			Method:      "GET",
+			Path:        "/agent/threads/{thread_id}/gates",
+			Summary:     "List agent thread gates",
+			Description: "Proxies Evo GET /threads/{thread_id}/gates.",
+			Tags:        []string{"agent"},
+			PathParams:  agentThreadPathParams{},
+			Responses:   map[int]openAPIResponse{200: evoJSONResp("Evo gate list")},
+		},
+		{
+			Method:      "GET",
+			Path:        "/agent/threads/{thread_id}/gates/{step}/versions/{version}:download",
+			Summary:     "Download agent thread gate version",
+			Description: "Proxies Evo GET /threads/{thread_id}/gates/{step}/versions/{version}:download.",
+			Tags:        []string{"agent"},
+			PathParams:  agentThreadGatePathParams{},
+			QueryParams: struct {
+				Format string `query:"format" enum:"json"`
+			}{},
+			Responses: map[int]openAPIResponse{200: evoDownloadResp},
+		},
+		{
+			Method:      "GET",
+			Path:        "/agent/threads/{thread_id}/gates/{step}/versions/{version}",
+			Summary:     "Get agent thread gate version",
+			Description: "Proxies Evo GET /threads/{thread_id}/gates/{step}/versions/{version}.",
+			Tags:        []string{"agent"},
+			PathParams:  agentThreadGatePathParams{},
+			Responses:   map[int]openAPIResponse{200: evoGateContentResp},
+		},
+		{
+			Method:      "GET",
+			Path:        "/agent/threads/{thread_id}/gates/abtest/versions/{version}/case-details",
+			Summary:     "List AB test case details for a gate version",
+			Description: "Proxies Evo GET /threads/{thread_id}/gates/abtest/versions/{version}/case-details.",
+			Tags:        []string{"agent"},
+			PathParams:  agentThreadGateVersionPathParams{},
+			QueryParams: agentThreadABTestCaseDetailsQueryParams{},
+			Responses:   map[int]openAPIResponse{200: evoJSONResp("Evo AB test case detail page")},
+		},
+		{
+			Method:      "GET",
+			Path:        "/agent/threads/{thread_id}/results/traces:compare",
+			Summary:     "Compare agent traces",
+			Description: "Proxies Evo GET /threads/{thread_id}/results/traces:compare.",
+			Tags:        []string{"agent"},
+			PathParams:  agentThreadPathParams{},
+			QueryParams: agentThreadTraceCompareQueryParams{},
+			Responses:   map[int]openAPIResponse{200: evoJSONResp("Evo trace comparison")},
+		},
+		{
+			Method:      "GET",
+			Path:        "/agent/threads/{thread_id}/results/traces/{trace_id}",
+			Summary:     "Get agent trace detail",
+			Description: "Proxies Evo GET /threads/{thread_id}/results/traces/{trace_id}.",
+			Tags:        []string{"agent"},
+			PathParams:  agentThreadTracePathParams{},
+			Responses:   map[int]openAPIResponse{200: evoJSONResp("Evo trace detail")},
+		},
+		{
+			Method:      "GET",
+			Path:        "/agent/threads/{thread_id}",
+			Summary:     "Get agent thread",
+			Description: "Returns the current user's local thread index entry with status refreshed from Evo when available.",
+			Tags:        []string{"agent"},
+			PathParams:  agentThreadPathParams{},
+			Responses:   map[int]openAPIResponse{200: evoJSONResp("Agent thread")},
+		},
+		{
+			Method:      "DELETE",
+			Path:        "/agent/threads/{thread_id}",
+			Summary:     "Delete agent thread",
+			Description: "Deletes the Evo thread when present and removes Core's local thread index and active-thread row.",
+			Tags:        []string{"agent"},
+			PathParams:  agentThreadPathParams{},
+			Responses:   map[int]openAPIResponse{200: evoJSONResp("Deleted agent thread")},
+		},
+		{
+			Method:      "GET",
+			Path:        "/agent/threads/{thread_id}/messages",
+			Summary:     "List agent thread messages",
+			Description: "Proxies Evo GET /threads/{thread_id}/messages.",
+			Tags:        []string{"agent"},
+			PathParams:  agentThreadPathParams{},
+			QueryParams: struct {
+				PageSize  int32  `query:"page_size"`
+				PageToken string `query:"page_token"`
+			}{},
+			Responses: map[int]openAPIResponse{200: evoJSONResp("Evo thread messages")},
+		},
+		{
+			Method:      "POST",
+			Path:        "/agent/threads/{thread_id}/messages",
+			Summary:     "Send agent thread message",
+			Description: "Proxies Evo POST /threads/{thread_id}/messages.",
+			Tags:        []string{"agent"},
+			PathParams:  agentThreadPathParams{},
+			RequestBody: evoJSONBody(true),
+			Responses:   map[int]openAPIResponse{200: evoStreamResp},
+		},
+		{
+			Method:      "POST",
+			Path:        "/agent/threads/{thread_id}/start",
+			Summary:     "Start agent thread",
+			Description: "Proxies Evo start and updates Core's local thread status and active-thread lock.",
+			Tags:        []string{"agent"},
+			PathParams:  agentThreadPathParams{},
+			RequestBody: evoJSONBody(false),
+			Responses:   map[int]openAPIResponse{200: evoJSONResp("Evo command response")},
+		},
+		{
+			Method:      "POST",
+			Path:        "/agent/threads/{thread_id}/pause",
+			Summary:     "Pause agent thread",
+			Description: "Proxies Evo pause and updates Core's local thread status.",
+			Tags:        []string{"agent"},
+			PathParams:  agentThreadPathParams{},
+			RequestBody: evoJSONBody(false),
+			Responses:   map[int]openAPIResponse{200: evoJSONResp("Evo command response")},
+		},
+		{
+			Method:      "POST",
+			Path:        "/agent/threads/{thread_id}/cancel",
+			Summary:     "Cancel agent thread",
+			Description: "Proxies Evo cancel and releases Core's active-thread lock for the thread.",
+			Tags:        []string{"agent"},
+			PathParams:  agentThreadPathParams{},
+			RequestBody: evoJSONBody(false),
+			Responses:   map[int]openAPIResponse{200: evoJSONResp("Evo command response")},
+		},
+		{
+			Method:      "POST",
+			Path:        "/agent/threads/{thread_id}/retry",
+			Summary:     "Retry agent thread",
+			Description: "Proxies Evo retry and updates Core's local thread status and active-thread lock.",
+			Tags:        []string{"agent"},
+			PathParams:  agentThreadPathParams{},
+			RequestBody: evoJSONBody(false),
+			Responses:   map[int]openAPIResponse{200: evoJSONResp("Evo command response")},
+		},
+		{
+			Method:      "POST",
+			Path:        "/agent/threads/{thread_id}/continue",
+			Summary:     "Continue agent thread",
+			Description: "Proxies Evo continue and updates Core's local thread status and active-thread lock.",
+			Tags:        []string{"agent"},
+			PathParams:  agentThreadPathParams{},
+			RequestBody: evoJSONBody(false),
+			Responses:   map[int]openAPIResponse{200: evoJSONResp("Evo command response")},
+		},
+		{
+			Method:      "GET",
+			Path:        "/agent/candidates",
+			Summary:     "List Evo candidates",
+			Description: "Proxies Evo GET /candidates for a current-user thread. The thread_id query parameter is required by Core for ownership enforcement.",
+			Tags:        []string{"agent"},
+			QueryParams: agentCandidateListQueryParams{},
+			Responses:   map[int]openAPIResponse{200: evoJSONResp("Evo candidate list")},
+		},
+		{
+			Method:      "GET",
+			Path:        "/agent/candidates/{candidate_id:.*}",
+			Summary:     "Get Evo candidate",
+			Description: "Proxies Evo GET /candidates/{candidate_id} after validating the thread_id prefix belongs to the current user.",
+			Tags:        []string{"agent"},
+			PathParams:  agentCandidatePathParams{},
+			Responses:   map[int]openAPIResponse{200: evoJSONResp("Evo candidate")},
+		},
+		{
+			Method:      "GET",
+			Path:        "/agent/router/status",
+			Summary:     "Get Evo router status",
+			Description: "Returns Router availability, Evo-owned algorithm counts, and the current AB strategy. Evo error status and body are passed through unchanged.",
+			Tags:        []string{"agent"},
+			QueryParams: agentRouterQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Router status", agentRouterStatusResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/agent/router/algorithms",
+			Summary:     "List Evo router algorithms",
+			Description: "Lists the Router default plus one ABTest-approved Evo algorithm per thread, enriched with live Router state.",
+			Tags:        []string{"agent"},
+			QueryParams: agentRouterAlgorithmQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Evo-owned Router algorithms", agentRouterAlgorithmListResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/agent/router/algorithms/{algorithm_id}/action",
+			Summary:     "Run Evo router algorithm action",
+			Description: "Runs healthcheck, start, restart, or stop for an Evo-owned algorithm. Start reactivates a stopped algorithm; restart may restart or reactivate it; stop keeps its Evo ledger record.",
+			Tags:        []string{"agent"},
+			PathParams:  agentRouterAlgorithmPathParams{},
+			QueryParams: agentRouterQueryParams{},
+			RequestBody: jsonBodyOf(agentRouterActionRequest{}, true),
+			Responses: map[int]openAPIResponse{
+				200: resp("Router algorithm action result", agentRouterActionResponse{}),
+				404: routerErrorResp,
+				409: routerErrorResp,
+				422: evoJSONResp("Invalid Router algorithm action"),
+			},
+		},
+		{
+			Method:      "DELETE",
+			Path:        "/agent/router/algorithms/{algorithm_id}",
+			Summary:     "Delete Evo router algorithm",
+			Description: "Stops the algorithm and deletes its Evo ledger entry, candidate artifacts, and managed workspace. Returns 409 while the algorithm is referenced by the active AB strategy. Router metadata is retained as disabled when Router already knew the algorithm.",
+			Tags:        []string{"agent"},
+			PathParams:  agentRouterAlgorithmPathParams{},
+			QueryParams: agentRouterQueryParams{},
+			Responses: map[int]openAPIResponse{
+				200: resp("Deleted Evo router algorithm", agentRouterDeleteResponse{}),
+				404: routerErrorResp,
+				409: routerErrorResp,
+			},
+		},
+		{
+			Method:      "GET",
+			Path:        "/agent/router/ab-strategy",
+			Summary:     "Get Evo router AB strategy",
+			Description: "Returns the effective Router weights and the latest Evo AB audit metadata. When AB routing is inactive, weights is {default: 100}.",
+			Tags:        []string{"agent"},
+			QueryParams: agentRouterQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Router AB strategy", agentRouterABStrategyResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/agent/router/traffic-stats",
+			Summary:     "Get Router traffic statistics",
+			Description: "Aggregates persisted single-answer chat histories by the final Router algorithm, excluding task conversations and unattributed legacy rows.",
+			Tags:        []string{"agent"},
+			QueryParams: agentRouterTrafficQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Router traffic statistics", agent.RouterTrafficStatsResponse{})},
+		},
+		{
+			Method:      "PUT",
+			Path:        "/agent/router/ab-strategy",
+			Summary:     "Update Evo router AB strategy",
+			Description: "Activates the supplied positive integer weights after ownership and health validation. Omit weights or set it to null to clear AB routing and return to the default algorithm.",
+			Tags:        []string{"agent"},
+			RequestBody: jsonBodyOf(agentRouterABStrategyRequest{}, true),
+			Responses: map[int]openAPIResponse{
+				200: resp("Updated Router AB strategy", agentRouterABStrategyResponse{}),
+				404: routerErrorResp,
+				409: routerErrorResp,
+				422: evoJSONResp("Invalid Router AB strategy"),
+			},
+		},
+		{
+			Method:  "POST",
+			Path:    "/temp/uploads/{upload_id}:abort",
+			Summary: "AborttextUpload",
+			Tags:    []string{"uploads"},
+			PathParams: struct {
+				UploadID string `path:"upload_id"`
+			}{},
+			RequestBody: jsonBodyOf(doc.AbortUploadRequest{}, false),
+			Responses:   map[int]openAPIResponse{200: refResp("Abort uploadtext", "AbortUploadResponse")},
+		},
+		{
+			Method:      "POST",
+			Path:        "/word_group:checkExists",
+			Summary:     "Check which words already exist",
+			Tags:        []string{"word_group"},
+			RequestBody: jsonBodyOf(wordgroup.CheckWordsExistRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Existing words among term and aliases", wordgroup.CheckWordsExistResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/word_group:update",
+			Summary:     "Update word group (term, description, lock, replace aliases)",
+			Tags:        []string{"word_group"},
+			RequestBody: jsonBodyOf(wordgroup.UpdateWordGroupRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Updated word group", wordgroup.CreateWordGroupResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/word_group:search",
+			Summary:     "Search word groups by keyword and optional source (paginated list)",
+			Tags:        []string{"word_group"},
+			RequestBody: jsonBodyOf(wordgroup.SearchWordGroupsRequest{}, true),
+			Responses: map[int]openAPIResponse{
+				200: resp("Word group search results", wordgroup.ListWordGroupsResponse{}),
+			},
+		},
+		{
+			Method:      "GET",
+			Path:        "/word_group",
+			Summary:     "List word groups (term row updated_at DESC)",
+			Tags:        []string{"word_group"},
+			QueryParams: listWordGroupsQueryParams{},
+			Responses: map[int]openAPIResponse{
+				200: resp("Word group list", wordgroup.ListWordGroupsResponse{}),
+			},
+		},
+		{
+			Method:  "GET",
+			Path:    "/word_group/{group_id}",
+			Summary: "Get word group detail by group_id",
+			Tags:    []string{"word_group"},
+			PathParams: struct {
+				GroupID string `path:"group_id"`
+			}{},
+			Responses: map[int]openAPIResponse{200: resp("Word group detail", wordgroup.CreateWordGroupResponse{})},
+		},
+		{
+			Method:  "DELETE",
+			Path:    "/word_group/{group_id}",
+			Summary: "Delete word group by group_id",
+			Tags:    []string{"word_group"},
+			PathParams: struct {
+				GroupID string `path:"group_id"`
+			}{},
+			Responses: map[int]openAPIResponse{200: resp("Deleted word group", wordgroup.DeleteWordGroupResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/word_group:batchDelete",
+			Summary:     "Batch soft-delete word groups by group_ids",
+			Tags:        []string{"word_group"},
+			RequestBody: jsonBodyOf(wordgroup.BatchDeleteWordGroupsRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Batch deleted word groups", wordgroup.BatchDeleteWordGroupsResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/word_group:merge",
+			Summary:     "Merge word groups: soft-delete merged groups' words, recreate master group from term, aliases, description",
+			Tags:        []string{"word_group"},
+			RequestBody: jsonBodyOf(wordgroup.MergeWordGroupsRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Merged word group", wordgroup.CreateWordGroupResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/word_group_conflict:mergeAndAddWord",
+			Summary:     "Merge word groups from merges list, add word into group_ids, resolve conflict",
+			Tags:        []string{"word_group"},
+			RequestBody: jsonBodyOf(wordgroup.MergeAndAddWordRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Merged word groups with added word (one item per merge batch)", wordgroup.MergeAndAddWordResponse{})},
+		},
+		{
+			Method:      "POST",
+			Path:        "/word_group",
+			Summary:     "Create word group",
+			Tags:        []string{"word_group"},
+			RequestBody: jsonBodyOf(wordgroup.CreateWordGroupRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Created word group", wordgroup.CreateWordGroupResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/word_group_conflict",
+			Summary:     "List pending word group conflicts (updated_at DESC)",
+			Tags:        []string{"word_group"},
+			QueryParams: listWordGroupsQueryParams{},
+			Responses: map[int]openAPIResponse{
+				200: resp("Word group conflict list", wordgroup.ListWordGroupConflictsResponse{}),
+			},
+		},
+		{
+			Method:      "POST",
+			Path:        "/word_group_conflict:addToGroup",
+			Summary:     "Add conflict word to selected groups",
+			Tags:        []string{"word_group"},
+			RequestBody: jsonBodyOf(wordgroup.AddWordGroupConflictToGroupsRequest{}, true),
+			Responses: map[int]openAPIResponse{
+				200: resp("Conflict word add-to-group result", wordgroup.AddWordGroupConflictToGroupsResponse{}),
+			},
+		},
+		{
+			Method:      "POST",
+			Path:        "/word_group_conflict:createGroup",
+			Summary:     "Create word group from conflict and optionally add conflict word to existing groups",
+			Description: "Creates a new word group (term, aliases, description). If group_ids is non-empty, inserts the conflict word as alias into each existing group (skips duplicates). Soft-deletes the conflict row by id.",
+			Tags:        []string{"word_group"},
+			RequestBody: jsonBodyOf(wordgroup.CreateWordGroupFromConflictRequest{}, true),
+			Responses: map[int]openAPIResponse{
+				200: resp("Created word group from conflict", wordgroup.CreateWordGroupFromConflictResponse{}),
+			},
+		},
+		{
+			Method:  "DELETE",
+			Path:    "/word_group_conflict/{id}",
+			Summary: "Soft-delete a word group conflict by id",
+			Tags:    []string{"word_group"},
+			PathParams: struct {
+				ID string `path:"id"`
+			}{},
+			Responses: map[int]openAPIResponse{
+				200: resp("Deleted word group conflict", wordgroup.DeleteWordGroupConflictResponse{}),
+			},
+		},
+		{
+			Method:      "POST",
+			Path:        "/inner/word_group:apply",
+			Summary:     "Internal: apply word-group actions in batch (algorithm → core)",
+			Tags:        []string{"word_group"},
+			RequestBody: jsonBodyOf(wordgroup.ApplyWordGroupActionRequest{}, true),
+			Responses: map[int]openAPIResponse{
+				200: resp("Per-item apply results", wordgroup.ApplyWordGroupActionBatchResponse{}),
+			},
+		},
+		{
+			Method:      "GET",
+			Path:        "/model_providers/verified",
+			Summary:     "Check whether a provider category is ready",
+			Description: "Checks the current user's selected provider for the given category first, then falls back to a shared provider selection. This endpoint does not return selectable group details.",
+			Tags:        []string{"model_providers"},
+			QueryParams: verifiedProviderQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Provider ready state", verifiedProviderOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/model_providers/provider_groups",
+			Summary:     "List verified provider groups for the current user",
+			Description: "Lists verified provider groups owned by the current user for the given non-model category (for example ocr or search). Shared provider groups are intentionally excluded from this selectable list.",
+			Tags:        []string{"model_providers"},
+			QueryParams: verifiedProviderQueryParams{},
+			Responses:   map[int]openAPIResponse{200: resp("Current user's verified provider groups", verifiedProviderGroupsOpenAPIResponse{})},
+		},
+		{
+			Method:      "GET",
+			Path:        "/model_providers/selected_providers",
+			Summary:     "Get selected provider groups (OCR, search, etc.)",
+			Description: "Returns the current user's selected provider group for each non-model category.",
+			Tags:        []string{"model_providers"},
+			Responses:   map[int]openAPIResponse{200: resp("Selected providers", selectedProvidersOpenAPIResponse{})},
+		},
+		{
+			Method:      "PUT",
+			Path:        "/model_providers/selected_providers",
+			Summary:     "Set selected provider group for a category",
+			Description: "Upserts selected provider groups by category. Request shape mirrors selected_models: selections contains category and group_id. Send an empty group_id to clear a category selection.",
+			Tags:        []string{"model_providers"},
+			RequestBody: jsonBodyOf(setSelectedProviderOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: resp("Saved selected providers", selectedProvidersOpenAPIResponse{})},
+		},
+		{
+			Method:      "PUT",
+			Path:        "/model_providers/selected_providers/share",
+			Summary:     "Set shared provider group for a category",
+			Description: "Sets or clears the share flag for a selected provider row. Only one share=true row is allowed per category. Protected by document.write permission.",
+			Tags:        []string{"model_providers"},
+			RequestBody: jsonBodyOf(setSharedProviderOpenAPIRequest{}, true),
+			Responses:   map[int]openAPIResponse{200: refResp("Updated share flag", "EmptyObject")},
+		},
+	}
+}

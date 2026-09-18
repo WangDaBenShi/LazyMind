@@ -1,0 +1,314 @@
+"""Tests for lazymind.chat.engine.tools.subagent_chat_tools.
+
+Covers: create_subagent auto/manual modes, _resolve_task, and query tools
+(list_subagents, get_subagent_status, list_subagent_artifacts,
+get_subagent_artifacts).  All external HTTP calls are monkeypatched.
+"""
+from __future__ import annotations
+
+from typing import Any, Dict
+
+import lazymind.chat.engine.tools.subagent_chat_tools as sct
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_TASKS = [
+    {'task_id': 'tid-1', 'seq_in_conversation': 1, 'title': '任务A', 'agent_type': 'type_a',
+     'status': 'succeeded', 'progress_pct': 100, 'current_phase': '完成',
+     'artifacts': [{'artifact_key': 'result', 'content_type': 'text'}]},
+    {'task_id': 'tid-2', 'seq_in_conversation': 2, 'title': '素材收集', 'agent_type': 'research',
+     'status': 'running', 'progress_pct': 60, 'current_phase': '分析中', 'estimated_sec': 20,
+     'artifacts': [
+         {'artifact_key': 'refs', 'content_type': 'file_list'},
+         {'artifact_key': 'keywords', 'content_type': 'json'},
+     ]},
+]
+
+
+def _patch_config(monkeypatch, conv_id='conv-1'):
+    """Patch lazyllm.globals so agentic_config returns a known dict."""
+    cfg: Dict[str, Any] = {'mode': 'auto', 'conversation_id': conv_id}
+    monkeypatch.setattr(sct, '_agentic_config', lambda: cfg)
+    return cfg
+
+
+def _patch_list_tasks(monkeypatch, tasks=None):
+    monkeypatch.setattr(sct, '_list_conversation_tasks', lambda: tasks if tasks is not None else _TASKS)
+
+
+def test_resolve_task_by_exact_title():
+    task = sct._resolve_task('素材收集', _TASKS)
+    assert task['task_id'] == 'tid-2'
+
+
+def test_resolve_task_by_seq_chinese():
+    task = sct._resolve_task('第2个', _TASKS)
+    assert task['task_id'] == 'tid-2'
+
+
+def test_resolve_task_by_seq_step_suffix():
+    task = sct._resolve_task('第1步', _TASKS)
+    assert task['task_id'] == 'tid-1'
+
+
+def test_resolve_task_by_agent_type():
+    task = sct._resolve_task('research', _TASKS)
+    assert task['task_id'] == 'tid-2'
+
+
+def test_resolve_task_by_substring():
+    task = sct._resolve_task('素材', _TASKS)
+    assert task['task_id'] == 'tid-2'
+
+
+def test_resolve_task_not_found():
+    task = sct._resolve_task('no_such_task', _TASKS)
+    assert task is None
+
+
+def test_resolve_task_empty_ref():
+    assert sct._resolve_task('', _TASKS) is None
+
+
+# ---------------------------------------------------------------------------
+# create_subagent — manual mode (no polling)
+# ---------------------------------------------------------------------------
+
+def test_create_subagent_manual_returns_immediately(monkeypatch):
+    cfg = _patch_config(monkeypatch)
+    cfg['mode'] = 'manual'
+    write_calls = []
+    monkeypatch.setattr(sct, '_write_agent_data', lambda tag, **kw: write_calls.append((tag, kw)))
+
+    result = sct.create_subagent(
+        agent_type='research',
+        title='素材收集',
+        objective='gather refs',
+        output_slots=['refs'],
+    )
+    assert result['status'] == 'ok'
+    assert 'started in the background' in result['message']
+    # Must have emitted exactly one task_created event.
+    assert write_calls[0][0] == 'task_created'
+    assert write_calls[0][1]['title'] == '素材收集'
+    assert write_calls[0][1]['mode'] == 'manual'
+
+
+def test_create_subagent_propagates_max_thinking_depth(monkeypatch):
+    cfg = _patch_config(monkeypatch)
+    cfg.update({'mode': 'manual', 'thinking_depth': 'max'})
+    write_calls = []
+    monkeypatch.setattr(sct, '_write_agent_data', lambda tag, **kw: write_calls.append((tag, kw)))
+
+    sct.create_subagent(agent_type='research', title='deep research', objective='research')
+
+    assert write_calls[0][1]['params']['_thinking_depth'] == 'max'
+
+
+def test_create_image_subagent_inherits_image_prompt_skill(monkeypatch):
+    cfg = _patch_config(monkeypatch)
+    cfg.update({
+        'mode': 'manual',
+        'available_skills': ['design/image-prompt-craft', 'research/deep-research'],
+        'subagent_skills': [],
+    })
+    write_calls = []
+    monkeypatch.setattr(sct, '_write_agent_data', lambda tag, **kw: write_calls.append((tag, kw)))
+
+    sct.create_subagent(
+        agent_type='image_generation',
+        title='生成 PPT 底图',
+        objective='为演示文稿制作一组统一的 16:9 背景图',
+        params={'_inherited_skills': ['deep-research']},
+    )
+
+    assert write_calls[0][1]['params']['_inherited_skills'] == ['design/image-prompt-craft']
+
+
+def test_unrelated_subagent_does_not_receive_image_prompt_skill(monkeypatch):
+    cfg = _patch_config(monkeypatch)
+    cfg.update({
+        'mode': 'manual',
+        'available_skills': ['design/image-prompt-craft'],
+        'subagent_skills': [],
+    })
+    write_calls = []
+    monkeypatch.setattr(sct, '_write_agent_data', lambda tag, **kw: write_calls.append((tag, kw)))
+
+    sct.create_subagent(
+        agent_type='research', title='研究数据库', objective='分析数据库索引性能',
+    )
+
+    assert '_inherited_skills' not in write_calls[0][1]['params']
+
+
+# ---------------------------------------------------------------------------
+# create_subagent — auto mode (polling until succeeded)
+# ---------------------------------------------------------------------------
+
+def test_create_subagent_auto_polls_and_returns_summary(monkeypatch):
+    _patch_config(monkeypatch)
+    write_calls = []
+    monkeypatch.setattr(sct, '_write_agent_data', lambda tag, **kw: write_calls.append(tag))
+
+    poll_count = [0]
+
+    class FakeDB:
+        def get_task_status(self, _task_id):
+            poll_count[0] += 1
+            if poll_count[0] < 3:
+                return {'status': 'running'}
+            return {'status': 'succeeded', 'summary': '完成了'}
+
+    monkeypatch.setattr(sct, 'TaskQueryDB', FakeDB)
+    monkeypatch.setattr(sct, '_fetch_task_artifacts', lambda _task_id: [])
+    monkeypatch.setattr(sct.time, 'sleep', lambda s: None)
+
+    result = sct.create_subagent(
+        agent_type='test',
+        title='测试任务',
+        objective='do it',
+        output_slots=['out'],
+    )
+    assert result['status'] == 'ok'
+    assert 'completed' in result['message']
+    assert poll_count[0] >= 3
+
+
+def test_create_subagent_auto_failed_task(monkeypatch):
+    _patch_config(monkeypatch)
+    monkeypatch.setattr(sct, '_write_agent_data', lambda tag, **kw: None)
+
+    class FakeDB:
+        def get_task_status(self, _task_id):
+            return {'status': 'failed', 'current_phase': '出错了'}
+
+    monkeypatch.setattr(sct, 'TaskQueryDB', FakeDB)
+
+    monkeypatch.setattr(sct.time, 'sleep', lambda s: None)
+
+    result = sct.create_subagent(
+        agent_type='test', title='失败任务', objective='fail', output_slots=['x'],
+    )
+    assert result['status'] == 'failed'
+    assert 'failed' in result['message']
+
+
+def test_create_subagent_auto_emits_heartbeat(monkeypatch):
+    """Heartbeat must be written when poll interval >= HEARTBEAT_INTERVAL."""
+    _patch_config(monkeypatch)
+    write_calls = []
+    monkeypatch.setattr(sct, '_write_agent_data', lambda tag, **kw: write_calls.append(tag))
+
+    poll_count = [0]
+
+    class FakeDB:
+        def get_task_status(self, _task_id):
+            poll_count[0] += 1
+            if poll_count[0] < 2:
+                return {'status': 'running'}
+            return {'status': 'succeeded'}
+
+    monkeypatch.setattr(sct, 'TaskQueryDB', FakeDB)
+    monkeypatch.setattr(sct, '_fetch_task_artifacts', lambda _task_id: [])
+
+    # Force heartbeat: patch time.time so that elapsed time jumps past _HEARTBEAT_INTERVAL
+    # between the initial timestamp and the first poll check.
+    import time as time_mod
+    real_time = time_mod.time
+    call_count = [0]
+
+    def fake_time():
+        call_count[0] += 1
+        # First call records last_heartbeat; subsequent calls report +20s elapsed.
+        return real_time() + (call_count[0] - 1) * 20
+
+    monkeypatch.setattr(sct.time, 'time', fake_time)
+    monkeypatch.setattr(sct.time, 'sleep', lambda s: None)
+
+    sct.create_subagent(
+        agent_type='test', title='hb', objective='hb', output_slots=['x'],
+    )
+    assert 'heartbeat' in write_calls
+
+
+# ---------------------------------------------------------------------------
+# list_subagents
+# ---------------------------------------------------------------------------
+
+def test_list_subagents_all(monkeypatch):
+    _patch_list_tasks(monkeypatch)
+    result = sct.list_subagents()
+    assert result['status'] == 'ok'
+    assert '任务A' in result['message']
+    assert '素材收集' in result['message']
+
+
+def test_list_subagents_filtered_by_status(monkeypatch):
+    _patch_list_tasks(monkeypatch)
+    result = sct.list_subagents(status='running')
+    assert '素材收集' in result['message']
+    assert '任务A' not in result['message']
+
+
+def test_list_subagents_empty(monkeypatch):
+    _patch_list_tasks(monkeypatch, tasks=[])
+    result = sct.list_subagents()
+    assert 'No SubAgent tasks' in result['message']
+
+
+# ---------------------------------------------------------------------------
+# get_subagent_status
+# ---------------------------------------------------------------------------
+
+def test_get_subagent_status_found(monkeypatch):
+    _patch_list_tasks(monkeypatch)
+    result = sct.get_subagent_status('素材收集')
+    assert result['status'] == 'ok'
+    assert '60%' in result['message']
+    assert '分析中' in result['message']
+
+
+def test_get_subagent_status_not_found(monkeypatch):
+    _patch_list_tasks(monkeypatch)
+    result = sct.get_subagent_status('不存在的任务')
+    assert result['status'] == 'empty'
+
+
+# ---------------------------------------------------------------------------
+# list_subagent_artifacts
+# ---------------------------------------------------------------------------
+
+def test_list_subagent_artifacts_found(monkeypatch):
+    _patch_list_tasks(monkeypatch)
+    result = sct.list_subagent_artifacts('素材收集')
+    assert result['status'] == 'ok'
+    assert 'refs' in result['keys']
+    assert 'keywords' in result['keys']
+
+
+def test_list_subagent_artifacts_not_found(monkeypatch):
+    _patch_list_tasks(monkeypatch)
+    result = sct.list_subagent_artifacts('不存在')
+    assert result['status'] == 'empty'
+
+
+# ---------------------------------------------------------------------------
+# get_subagent_artifacts
+# ---------------------------------------------------------------------------
+
+def test_get_subagent_artifacts_all_keys(monkeypatch):
+    _patch_list_tasks(monkeypatch)
+    result = sct.get_subagent_artifacts('素材收集')
+    assert result['status'] == 'ok'
+    assert len(result['artifacts']) == 2
+
+
+def test_get_subagent_artifacts_filtered_keys(monkeypatch):
+    _patch_list_tasks(monkeypatch)
+    result = sct.get_subagent_artifacts('素材收集', keys=['refs'])
+    assert result['status'] == 'ok'
+    assert all(a['artifact_key'] == 'refs' for a in result['artifacts'])

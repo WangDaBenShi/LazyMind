@@ -1,0 +1,378 @@
+package modelprovider
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+
+	"gorm.io/gorm"
+
+	"lazymind/core/common"
+	"lazymind/core/common/orm"
+	"lazymind/core/store"
+)
+
+type listItem struct {
+	ID                     string              `json:"id"`
+	DefaultModelProviderID string              `json:"default_model_provider_id"`
+	Name                   string              `json:"name"`
+	Description            string              `json:"description"`
+	BaseURL                string              `json:"base_url"`
+	BaseURLPresets         []baseURLPresetItem `json:"base_url_presets,omitempty"`
+	Category               string              `json:"category"`
+	IsConfigured           bool                `json:"is_configured"`
+	Capabilities           []string            `json:"capabilities"`
+	ModelTypes             []string            `json:"model_types"`
+}
+
+type baseURLPresetItem struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+type listResponse struct {
+	Providers []listItem `json:"providers"`
+}
+
+const defaultProviderCategory = "model"
+
+// ListUserProviders returns the current user's model providers. Missing catalog
+// rows are copied from default_model_providers on each request (incremental sync).
+// Query params: category (default model when omitted), exclude_category,
+// keyword — case-insensitive substring match on name.
+func ListUserProviders(w http.ResponseWriter, r *http.Request) {
+	locale := common.NormalizeLocale(r.Header.Get("Accept-Language"))
+	common.SetLanguageResponseHeaders(w, locale)
+	db := store.DB()
+	if db == nil {
+		common.ReplyErr(w, "store not initialized", http.StatusInternalServerError)
+		return
+	}
+	userID := strings.TrimSpace(store.UserID(r))
+	if userID == "" {
+		common.ReplyErr(w, "missing X-User-Id", http.StatusBadRequest)
+		return
+	}
+
+	userName := strings.TrimSpace(store.UserName(r))
+	if err := syncUserProvidersFromDefaults(r.Context(), db, userID, userName); err != nil {
+		common.ReplyErr(w, "sync model providers failed", http.StatusInternalServerError)
+		return
+	}
+
+	category := strings.TrimSpace(r.URL.Query().Get("category"))
+	excludeCategory := strings.TrimSpace(r.URL.Query().Get("exclude_category"))
+	keyword := strings.TrimSpace(r.URL.Query().Get("keyword"))
+	q := db.WithContext(r.Context()).Model(&orm.UserModelProvider{}).
+		Where("create_user_id = ? AND deleted_at IS NULL", userID)
+	if category != "" {
+		q = q.Where("category = ?", category)
+	} else if excludeCategory == "" {
+		q = q.Where("category = ?", defaultProviderCategory)
+	}
+	if excludeCategory != "" {
+		for _, cat := range strings.Split(excludeCategory, ",") {
+			cat = strings.TrimSpace(cat)
+			if cat != "" {
+				q = q.Where("category != ?", cat)
+			}
+		}
+	}
+	if keyword != "" {
+		q = q.Where("LOWER(name) LIKE ?", "%"+strings.ToLower(keyword)+"%")
+	}
+
+	var rows []orm.UserModelProvider
+	if err := q.Order("name ASC").Find(&rows).Error; err != nil {
+		common.ReplyErr(w, "list model providers failed", http.StatusInternalServerError)
+		return
+	}
+
+	out := buildListItems(r.Context(), db, rows, locale)
+	common.ReplyOK(w, listResponse{Providers: out})
+}
+
+// ListUserProvidersWithGroups returns user_model_providers rows that have at least one non-deleted
+// user_model_provider_groups row for the current user (distinct parent ids from groups, then load providers).
+func ListUserProvidersWithGroups(w http.ResponseWriter, r *http.Request) {
+	locale := common.NormalizeLocale(r.Header.Get("Accept-Language"))
+	common.SetLanguageResponseHeaders(w, locale)
+	db := store.DB()
+	if db == nil {
+		common.ReplyErr(w, "store not initialized", http.StatusInternalServerError)
+		return
+	}
+	userID := strings.TrimSpace(store.UserID(r))
+	if userID == "" {
+		common.ReplyErr(w, "missing X-User-Id", http.StatusBadRequest)
+		return
+	}
+	var providerIDs []string
+	if err := db.WithContext(r.Context()).Model(&orm.UserModelProviderGroup{}).
+		Where("create_user_id = ? AND deleted_at IS NULL", userID).
+		Distinct("user_model_provider_id").
+		Pluck("user_model_provider_id", &providerIDs).Error; err != nil {
+		common.ReplyErr(w, "list group parent ids failed", http.StatusInternalServerError)
+		return
+	}
+	if len(providerIDs) == 0 {
+		common.ReplyOK(w, listResponse{Providers: []listItem{}})
+		return
+	}
+
+	var rows []orm.UserModelProvider
+	if err := db.WithContext(r.Context()).
+		Where("id IN ? AND create_user_id = ? AND deleted_at IS NULL", providerIDs, userID).
+		Order("name ASC").
+		Find(&rows).Error; err != nil {
+		common.ReplyErr(w, "list model providers failed", http.StatusInternalServerError)
+		return
+	}
+
+	out := buildListItems(r.Context(), db, rows, locale)
+	common.ReplyOK(w, listResponse{Providers: out})
+}
+
+// buildListItems converts UserModelProvider rows to listItems and batch-loads
+// distinct model_types from default_models for each provider.
+func buildListItems(ctx context.Context, db *gorm.DB, rows []orm.UserModelProvider, locale string) []listItem {
+	out := make([]listItem, 0, len(rows))
+	for i := range rows {
+		row := rows[i]
+		caps := splitCapabilities(row.Capabilities)
+		out = append(out, listItem{
+			ID:                     row.ID,
+			DefaultModelProviderID: row.DefaultModelProviderID,
+			Name:                   row.Name,
+			Description:            row.Description,
+			BaseURL:                row.BaseURL,
+			BaseURLPresets:         buildBaseURLPresets(row),
+			Category:               row.Category,
+			IsConfigured:           false,
+			Capabilities:           caps,
+			ModelTypes:             []string{},
+		})
+	}
+	if len(out) == 0 {
+		return out
+	}
+	if db == nil {
+		return out
+	}
+
+	providerIDs := make([]string, 0, len(out))
+	defaultProviderIDs := make([]string, 0, len(out))
+	for i := range out {
+		providerIDs = append(providerIDs, out[i].ID)
+		defaultProviderIDs = append(defaultProviderIDs, out[i].DefaultModelProviderID)
+	}
+	type localizedDescriptionRow struct {
+		ID              string      `gorm:"column:id"`
+		DescriptionI18n orm.RawJSON `gorm:"column:description_i18n"`
+	}
+	var descriptionRows []localizedDescriptionRow
+	if err := db.WithContext(ctx).
+		Model(&orm.DefaultModelProvider{}).
+		Select("id, description_i18n").
+		Where("id IN ? AND deleted_at IS NULL", defaultProviderIDs).
+		Find(&descriptionRows).Error; err == nil {
+		descriptionByID := make(map[string][]byte, len(descriptionRows))
+		for _, row := range descriptionRows {
+			descriptionByID[row.ID] = []byte(row.DescriptionI18n)
+		}
+		for i := range out {
+			out[i].Description = selectLocalizedDescription(
+				descriptionByID[out[i].DefaultModelProviderID],
+				locale,
+				out[i].Description,
+			)
+		}
+	}
+	type configuredProviderRow struct {
+		UserModelProviderID string `gorm:"column:user_model_provider_id"`
+		BaseURL             string `gorm:"column:base_url"`
+		APIKey              string `gorm:"column:api_key"`
+		APIKeyCiphertext    string `gorm:"column:api_key_ciphertext"`
+	}
+	var configuredRows []configuredProviderRow
+	if err := db.WithContext(ctx).
+		Model(&orm.UserModelProviderGroup{}).
+		Select("user_model_provider_id, base_url, api_key, api_key_ciphertext").
+		Where("user_model_provider_id IN ? AND deleted_at IS NULL AND is_verified = ?", providerIDs, true).
+		Find(&configuredRows).Error; err == nil {
+		defaultProviderIDByProviderID := make(map[string]string, len(out))
+		for i := range out {
+			defaultProviderIDByProviderID[out[i].ID] = out[i].DefaultModelProviderID
+		}
+		configuredProviderIDs := make(map[string]bool, len(configuredRows))
+		for _, row := range configuredRows {
+			row.APIKey, _ = ResolveAPIKey(row.APIKey, row.APIKeyCiphertext)
+			if strings.TrimSpace(row.APIKey) != "" ||
+				isCustomBaseURL(ctx, db, defaultProviderIDByProviderID[row.UserModelProviderID], row.BaseURL) {
+				configuredProviderIDs[row.UserModelProviderID] = true
+			}
+		}
+		for i := range out {
+			out[i].IsConfigured = configuredProviderIDs[out[i].ID]
+		}
+	}
+
+	type modelTypeRow struct {
+		DefaultModelProviderID string `gorm:"column:default_model_provider_id"`
+		ModelType              string `gorm:"column:model_type"`
+	}
+	var mtRows []modelTypeRow
+	if err := db.WithContext(ctx).
+		Model(&orm.DefaultModel{}).
+		Select("default_model_provider_id, model_type").
+		Where("default_model_provider_id IN ? AND deleted_at IS NULL", defaultProviderIDs).
+		Distinct("default_model_provider_id", "model_type").
+		Find(&mtRows).Error; err == nil {
+		mtMap := make(map[string][]string, len(defaultProviderIDs))
+		for _, r := range mtRows {
+			mtMap[r.DefaultModelProviderID] = append(mtMap[r.DefaultModelProviderID], r.ModelType)
+		}
+		for i := range out {
+			if types, ok := mtMap[out[i].DefaultModelProviderID]; ok {
+				out[i].ModelTypes = types
+			}
+		}
+	}
+	return out
+}
+
+func selectLocalizedDescription(raw []byte, locale, fallback string) string {
+	descriptions := map[string]string{}
+	if len(raw) > 0 && json.Unmarshal(raw, &descriptions) == nil {
+		if value := strings.TrimSpace(descriptions[common.NormalizeLocale(locale)]); value != "" {
+			return value
+		}
+		if value := strings.TrimSpace(descriptions[common.LocaleZhCN]); value != "" {
+			return value
+		}
+	}
+	return fallback
+}
+
+// syncUserProvidersFromDefaults copies missing default_model_providers rows into
+// user_model_providers for the given user (matched by default_model_provider_id).
+// It also syncs category and capabilities for already-existing rows.
+func syncUserProvidersFromDefaults(ctx context.Context, db *gorm.DB, userID, userName string) error {
+	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var existing []orm.UserModelProvider
+		if err := tx.Where("create_user_id = ? AND deleted_at IS NULL", userID).Find(&existing).Error; err != nil {
+			return err
+		}
+		existingByDefault := make(map[string]*orm.UserModelProvider, len(existing))
+		for i := range existing {
+			existingByDefault[existing[i].DefaultModelProviderID] = &existing[i]
+		}
+
+		var defs []orm.DefaultModelProvider
+		if err := tx.Where("deleted_at IS NULL").Find(&defs).Error; err != nil {
+			return err
+		}
+
+		now := time.Now()
+		var toCreate []orm.UserModelProvider
+		for i := range defs {
+			d := defs[i]
+			if row, ok := existingByDefault[d.ID]; ok {
+				// Sync category / capabilities from defaults if changed.
+				if row.Category != d.Category || row.Capabilities != d.Capabilities {
+					_ = tx.Model(row).Updates(map[string]interface{}{
+						"category":     d.Category,
+						"capabilities": d.Capabilities,
+						"updated_at":   now,
+					})
+				}
+			} else {
+				toCreate = append(toCreate, orm.UserModelProvider{
+					ID:                     common.GenerateID(),
+					DefaultModelProviderID: d.ID,
+					Name:                   d.Name,
+					Description:            d.Description,
+					BaseURL:                d.BaseURL,
+					Category:               d.Category,
+					Capabilities:           d.Capabilities,
+					BaseModel: orm.BaseModel{
+						CreateUserID:   userID,
+						CreateUserName: userName,
+						CreatedAt:      now,
+						UpdatedAt:      now,
+						DeletedAt:      nil,
+					},
+				})
+			}
+		}
+		if len(toCreate) == 0 {
+			return nil
+		}
+		return tx.Create(&toCreate).Error
+	})
+}
+
+// splitCapabilities splits a comma-separated capabilities string into a slice.
+func splitCapabilities(caps string) []string {
+	if caps == "" {
+		return []string{}
+	}
+	parts := strings.Split(caps, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func buildBaseURLPresets(row orm.UserModelProvider) []baseURLPresetItem {
+	if normalizeProviderName(row.Name) != "mineru" {
+		return nil
+	}
+
+	presets := make([]baseURLPresetItem, 0, 2)
+	seen := map[string]struct{}{}
+	appendPreset := func(key, value string) {
+		trimmedValue := strings.TrimSpace(value)
+		if trimmedValue == "" {
+			return
+		}
+		normalizedValue := strings.TrimRight(trimmedValue, "/")
+		if _, ok := seen[normalizedValue]; ok {
+			return
+		}
+		seen[normalizedValue] = struct{}{}
+		presets = append(presets, baseURLPresetItem{
+			Key:   key,
+			Value: trimmedValue,
+		})
+	}
+
+	appendPreset("official", row.BaseURL)
+	if localBaseURL := configuredLocalMinerUBaseURL(); localBaseURL != "" {
+		appendPreset("local", localBaseURL)
+	}
+
+	return presets
+}
+
+func configuredLocalMinerUBaseURL() string {
+	if !isEnvEnabled("LAZYMIND_DEPLOY_MINERU") {
+		return ""
+	}
+	return "http://mineru:8000/api/v1/pdf_parse"
+}
+
+func isEnvEnabled(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}

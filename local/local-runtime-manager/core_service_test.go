@@ -1,0 +1,124 @@
+package main
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+func TestCoreServiceBuildUsesBackendCore(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	runner := &fakeRunner{t: t}
+	manager := NewCoreServiceManager(runner)
+	cfg, paths, err := NewRuntimeConfig(defaultProfileValue(), repo)
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	runner.handlers = append(runner.handlers, func(cmd Command) (CommandResult, error) {
+		assertCommand(t, cmd, "go", "build", "-buildvcs=false", "-o", paths.CoreBin, ".")
+		if cmd.Dir != filepath.Join(repo, coreSourceDirName) {
+			t.Fatalf("unexpected core build dir %q", cmd.Dir)
+		}
+		return CommandResult{}, nil
+	})
+
+	if err := manager.buildCore(context.Background(), cfg, paths); err != nil {
+		t.Fatalf("build core: %v", err)
+	}
+	runner.assertCommandCount(1)
+}
+
+func TestCoreServiceEnvUsesLocalEndpoints(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	cfg, paths, err := NewRuntimeConfig(defaultProfileValue(), repo)
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	env := coreServiceEnv(cfg, paths)
+
+	assertEnvContains(t, env, "LAZYMIND_CORE_HOST=127.0.0.1")
+	assertEnvContains(t, env, "LAZYMIND_CORE_PORT="+strconv.Itoa(cfg.LocalProxy.CoreHostPort))
+	assertEnvContains(t, env, "ACL_DB_DRIVER=sqlite")
+	assertEnvContains(t, env, "ACL_DB_DSN=sqliteproxy://core")
+	assertEnvContains(t, env, "LAZYMIND_CORE_DATABASE_URL=sqliteproxy://core")
+	assertEnvContains(t, env, sqliteServerURLEnvVar+"=http://127.0.0.1:"+strconv.Itoa(cfg.SQLiteServerPort))
+	assertEnvContains(t, env, sqliteServerTokenFileEnvVar+"="+paths.RunDirTokenFile)
+	assertEnvContains(t, env, "LAZYMIND_WORKFLOW_EXECUTOR_TOKEN=dev-workflow-executor-token")
+	assertEnvContains(t, env, "LAZYMIND_AUTH_SERVICE_URL=http://127.0.0.1:"+strconv.Itoa(cfg.AuthService.Port)+"/api/authservice")
+	assertEnvContains(t, env, "LAZYMIND_DOCUMENT_SERVICE_URL=http://127.0.0.1:"+strconv.Itoa(cfg.Algorithm.DocPort))
+	assertEnvContains(t, env, "LAZYMIND_PARSING_SERVICE_URL=http://127.0.0.1:"+strconv.Itoa(cfg.Algorithm.ProcessorPort))
+	assertEnvContains(t, env, "LAZYMIND_CHAT_SERVICE_URL=http://127.0.0.1:"+strconv.Itoa(cfg.Algorithm.ChatPort))
+	assertEnvContains(t, env, "LAZYMIND_BROWSER_PREFERRED_DEVICE_BROWSER=")
+	assertEnvContains(t, env, "LAZYMIND_BROWSER_EXTENSION_SOURCE_DIR="+filepath.Join(paths.RepoRoot, "browser-extension"))
+	assertEnvContains(t, env, "LAZYMIND_OFFICE_CONVERT_URL=http://127.0.0.1:18082/v1/office/to-pdf")
+	assertEnvContains(t, env, "LAZYMIND_READONLY_DB_DRIVER=sqlite")
+	assertEnvContains(t, env, "LAZYMIND_READONLY_DB_DSN=sqliteproxy://lazyllm")
+	assertEnvContains(t, env, "LAZYMIND_HISTORY_INJECTION_ENABLED=true")
+	assertEnvContains(t, env, "LAZYMIND_HISTORY_INJECTION_ROOT="+paths.HistoryInjectionRoot)
+	assertEnvContains(t, env, "LAZYMIND_BOOTSTRAP_ADMIN_USERNAME=admin")
+	assertEnvContains(t, env, "LAZYMIND_BOOTSTRAP_ADMIN_PASSWORD=admin")
+	assertEnvNotContains(t, env, "LAZYMIND_CAPABILITY_MCP_ENABLED=")
+}
+
+func TestCoreServiceEnvUsesRuntimeUploadPaths(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	cfg, paths, err := NewRuntimeConfig(defaultProfileValue(), repo)
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	env := coreServiceEnv(cfg, paths)
+
+	assertEnvContains(t, env, "LAZYMIND_UPLOAD_ROOT="+paths.UploadRoot)
+	assertEnvContains(t, env, "LAZYMIND_SHARED_UPLOAD_DIR="+paths.UploadRoot)
+	assertEnvContains(t, env, "LAZYLLM_TEMP_DIR="+paths.LazyLLMTempDir)
+	assertEnvContains(t, env, "LAZYMIND_OCR_CACHE_DIR="+paths.OCRCacheDir)
+	assertEnvContains(t, env, "LAZYMIND_SUBAGENT_WORKSPACE="+paths.SubagentDataDir)
+	assertEnvNotContains(t, env, filepath.Join(paths.RepoRoot, "data", "core", "uploads"))
+	assertEnvNotContains(t, env, filepath.Join(paths.RepoRoot, "data", "subagent"))
+}
+
+func TestCoreServiceWaitForDatabasePreparesSQLiteDirs(t *testing.T) {
+	repo := t.TempDir()
+	writeComposeFixture(t, repo)
+	cfg, paths, err := NewRuntimeConfig(defaultProfileValue(), repo)
+	if err != nil {
+		t.Fatalf("runtime config: %v", err)
+	}
+	runner := &fakeRunner{t: t}
+	manager := NewCoreServiceManager(runner)
+
+	if err := manager.waitForCoreDatabase(context.Background(), cfg, paths); err != nil {
+		t.Fatalf("wait database: %v", err)
+	}
+	runner.assertCommandCount(0)
+	for _, path := range []string{paths.CoreDBPath, paths.LazyLLMDBPath} {
+		if _, err := os.Stat(filepath.Dir(path)); err != nil {
+			t.Fatalf("expected sqlite dir for %s: %v", path, err)
+		}
+	}
+}
+
+func assertEnvContains(t *testing.T, env []string, want string) {
+	t.Helper()
+	for _, item := range env {
+		if item == want {
+			return
+		}
+	}
+	t.Fatalf("missing env %q in %#v", want, env)
+}
+
+func assertEnvNotContains(t *testing.T, env []string, forbidden string) {
+	t.Helper()
+	for _, item := range env {
+		if strings.Contains(item, forbidden) {
+			t.Fatalf("env contains forbidden path %q in %q", forbidden, item)
+		}
+	}
+}

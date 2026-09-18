@@ -1,0 +1,239 @@
+package mcpadapter
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"sort"
+	"strings"
+	"testing"
+
+	"github.com/modelcontextprotocol/go-sdk/auth"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"lazymind/core/capability"
+)
+
+type mcpFakePorts struct{ call capability.InvocationContext }
+
+type schemaOnlyExternal struct {
+	capability.ExternalCapabilityExecutor
+}
+
+func TestExternalToolResultPublishesObjectSchemaForStrictClients(t *testing.T) {
+	ports := &mcpFakePorts{}
+	service, err := capability.NewService(capability.Dependencies{
+		Skills: ports, Knowledge: ports, Documents: ports, Search: ports,
+		Cloud: ports, Vocabulary: ports, External: schemaOnlyExternal{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := newServer(service).Connect(context.Background(), serverTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverSession.Close()
+	client := mcp.NewClient(&mcp.Implementation{Name: "schema-test", Version: "1"}, nil)
+	session, err := client.Connect(context.Background(), clientTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	listed, err := session.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tool := range listed.Tools {
+		if tool.Name != "tool.call" {
+			continue
+		}
+		raw, err := json.Marshal(tool.OutputSchema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var schema struct {
+			Properties map[string]json.RawMessage `json:"properties"`
+			Required   []string                   `json:"required"`
+		}
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			t.Fatal(err)
+		}
+		if string(schema.Properties["result"]) != "{}" || len(schema.Required) != 1 || schema.Required[0] != "result" {
+			t.Fatalf("result must remain required and unconstrained with an object schema: %s", raw)
+		}
+		return
+	}
+	t.Fatal("tool.call was not published")
+}
+
+func (f *mcpFakePorts) ListVocabularyWordbooks(context.Context, capability.InvocationContext) (capability.ListVocabularyWordbooksResult, error) {
+	return capability.ListVocabularyWordbooksResult{}, nil
+}
+func (f *mcpFakePorts) ListVocabularyWords(context.Context, capability.InvocationContext, capability.ListVocabularyWordsInput) (capability.ListVocabularyWordsResult, error) {
+	return capability.ListVocabularyWordsResult{}, nil
+}
+func (f *mcpFakePorts) NextVocabularyReview(context.Context, capability.InvocationContext, capability.NextVocabularyReviewInput) (capability.NextVocabularyReviewResult, error) {
+	return capability.NextVocabularyReviewResult{}, nil
+}
+func (f *mcpFakePorts) StartVocabularyReview(context.Context, capability.InvocationContext, capability.StartVocabularyReviewInput) (capability.StartVocabularyReviewResult, error) {
+	return capability.StartVocabularyReviewResult{}, nil
+}
+func (f *mcpFakePorts) AnswerVocabularyReview(context.Context, capability.InvocationContext, capability.AnswerVocabularyReviewInput) (capability.AnswerVocabularyReviewResult, error) {
+	return capability.AnswerVocabularyReviewResult{}, nil
+}
+func (f *mcpFakePorts) VocabularyReviewReport(context.Context, capability.InvocationContext, capability.VocabularyReviewReportInput) (capability.VocabularyReviewReportResult, error) {
+	return capability.VocabularyReviewReportResult{}, nil
+}
+
+func (f *mcpFakePorts) ListCloudDocuments(_ context.Context, call capability.InvocationContext, _ capability.CloudDocumentListQuery) (capability.CloudDocumentListPage, error) {
+	f.call = call
+	return capability.CloudDocumentListPage{}, nil
+}
+func (f *mcpFakePorts) GetCloudDocument(_ context.Context, call capability.InvocationContext, _ capability.GetCloudDocumentInput) (capability.GetCloudDocumentResult, error) {
+	f.call = call
+	return capability.GetCloudDocumentResult{}, nil
+}
+func (f *mcpFakePorts) SearchCloudDocuments(_ context.Context, call capability.InvocationContext, _ capability.SearchCloudDocumentsInput) (capability.SearchCloudDocumentsResult, error) {
+	f.call = call
+	return capability.SearchCloudDocumentsResult{}, nil
+}
+
+func (f *mcpFakePorts) ListSkills(context.Context, capability.InvocationContext, capability.SkillListQuery) (capability.SkillListPage, error) {
+	return capability.SkillListPage{Items: []capability.SkillSummary{}, Total: 0}, nil
+}
+func (f *mcpFakePorts) GetSkillMetadata(context.Context, capability.InvocationContext, string) (capability.SkillMetadata, error) {
+	return capability.SkillMetadata{Published: true, Summary: capability.SkillSummary{ID: "skill", HeadRevisionID: "rev"}}, nil
+}
+func (f *mcpFakePorts) ReadSkillContent(context.Context, capability.InvocationContext, string, string) (capability.SkillContent, error) {
+	return capability.SkillContent{RevisionID: "rev", Text: "content"}, nil
+}
+func (f *mcpFakePorts) ListKnowledge(context.Context, capability.InvocationContext, capability.KnowledgeListQuery) (capability.KnowledgeListPage, error) {
+	return capability.KnowledgeListPage{Items: []capability.KnowledgeSummary{}, Total: 0}, nil
+}
+func (f *mcpFakePorts) ListKnowledgeDocuments(context.Context, capability.InvocationContext, capability.KnowledgeDocumentListQuery) (capability.KnowledgeDocumentListPage, error) {
+	return capability.KnowledgeDocumentListPage{Items: []capability.KnowledgeDocumentSummary{}, Total: 0}, nil
+}
+func (f *mcpFakePorts) GetKnowledgeDocument(context.Context, capability.InvocationContext, capability.GetKnowledgeDocumentInput) (capability.GetKnowledgeDocumentResult, error) {
+	return capability.GetKnowledgeDocumentResult{Document: capability.KnowledgeDocumentDetail{KnowledgeDocumentSummary: capability.KnowledgeDocumentSummary{ID: "doc", KnowledgeID: "kb"}}}, nil
+}
+func (f *mcpFakePorts) SearchKnowledge(_ context.Context, call capability.InvocationContext, _ capability.SearchKnowledgeInput) (capability.SearchKnowledgeResult, error) {
+	f.call = call
+	return capability.SearchKnowledgeResult{Hits: []capability.KnowledgeSearchHit{{KnowledgeID: "kb", DocumentID: "doc", Text: "source"}}}, nil
+}
+
+func TestStreamableHTTPPublishesAuthenticatedReadOnlyTools(t *testing.T) {
+	ports := &mcpFakePorts{}
+	service, err := capability.NewService(capability.Dependencies{Skills: ports, Knowledge: ports, Documents: ports, Search: ports, Cloud: ports, Vocabulary: ports})
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifier := func(_ context.Context, token string, _ *http.Request) (*auth.TokenInfo, error) {
+		if token != "valid-token" {
+			return nil, auth.ErrInvalidToken
+		}
+		return &auth.TokenInfo{
+			UserID: "verified-user", Scopes: []string{capability.RequiredPermission},
+			Extra: map[string]any{extraTenantID: "verified-tenant"},
+		}, nil
+	}
+	handler, err := NewHandler(service, HandlerConfig{Verifier: verifier})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	httpClient := &http.Client{Transport: bearerTransport{base: http.DefaultTransport, token: "valid-token"}}
+	client := mcp.NewClient(&mcp.Implementation{Name: "integration-client", Version: "1"}, nil)
+	session, err := client.Connect(context.Background(), &mcp.StreamableClientTransport{
+		Endpoint: server.URL, HTTPClient: httpClient, DisableStandaloneSSE: true,
+	}, nil)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer session.Close()
+
+	listed, err := session.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	names := make([]string, 0, len(listed.Tools))
+	for _, tool := range listed.Tools {
+		names = append(names, tool.Name)
+		if tool.Annotations == nil || tool.Annotations.DestructiveHint == nil || *tool.Annotations.DestructiveHint {
+			t.Fatalf("tool %q is not marked non-destructive", tool.Name)
+		}
+		stateChanging := false
+		if !stateChanging && (!tool.Annotations.ReadOnlyHint || !tool.Annotations.IdempotentHint) {
+			t.Fatalf("tool %q annotations = %#v, want read-only and idempotent", tool.Name, tool.Annotations)
+		}
+		if stateChanging && (tool.Annotations.ReadOnlyHint || tool.Annotations.IdempotentHint) {
+			t.Fatalf("tool %q annotations = %#v, want state-changing and non-idempotent", tool.Name, tool.Annotations)
+		}
+	}
+	sort.Strings(names)
+	if got, want := strings.Join(names, ","), "cloud_document.get,cloud_document.list,cloud_document.search,knowledge.document.get,knowledge.document.list,knowledge.list,knowledge.search,skill.get,skill.list,vocabulary.word.list,vocabulary.wordbook.list"; got != want {
+		t.Fatalf("tool names = %q, want %q", got, want)
+	}
+
+	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "knowledge.search", Arguments: map[string]any{"query": "q", "knowledge_ids": []string{"kb"}},
+	})
+	if err != nil || result.IsError {
+		t.Fatalf("CallTool result=%#v err=%v", result, err)
+	}
+	if ports.call.Principal.UserID != "verified-user" || ports.call.Principal.TenantID != "verified-tenant" {
+		t.Fatalf("verified invocation = %#v", ports.call)
+	}
+
+	request, _ := http.NewRequest(http.MethodPost, server.URL, strings.NewReader("{}"))
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusUnauthorized {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("unauthenticated status=%d body=%s", response.StatusCode, body)
+	}
+}
+
+func TestAuthServiceVerifierUsesBearerAndValidatedClaims(t *testing.T) {
+	authServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/authservice/auth/validate" || r.Header.Get("Authorization") != "Bearer user-token" {
+			t.Fatalf("validation request path=%s authorization=%q", r.URL.Path, r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":200,"message":"success","data":{"sub":"user-9","role":"user","tenant_id":"tenant-9","permissions":["qa.read","qa.read"]}}`))
+	}))
+	defer authServer.Close()
+	verifier, err := NewAuthServiceVerifier(AuthServiceVerifierConfig{BaseURL: authServer.URL + "/api/authservice", HTTPClient: authServer.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := verifier(context.Background(), "user-token", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.UserID != "user-9" || strings.Join(info.Scopes, ",") != "qa.read" || info.Extra[extraTenantID] != "tenant-9" {
+		t.Fatalf("token info = %#v", info)
+	}
+}
+
+type bearerTransport struct {
+	base  http.RoundTripper
+	token string
+}
+
+func (t bearerTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	clone := request.Clone(request.Context())
+	clone.Header = request.Header.Clone()
+	clone.Header.Set("Authorization", "Bearer "+t.token)
+	clone.Header.Set("X-User-Id", "spoofed-user")
+	clone.Header.Set("X-Tenant-Id", "spoofed-tenant")
+	return t.base.RoundTrip(clone)
+}

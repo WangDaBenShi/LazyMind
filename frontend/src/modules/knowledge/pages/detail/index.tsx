@@ -1,0 +1,885 @@
+import {
+  Alert,
+  message,
+  Modal,
+  Button,
+  Badge,
+  Dropdown,
+  Tooltip,
+  Input,
+} from "antd";
+import { axiosInstance, BASE_URL } from "@/components/request";
+import { AgentAppsAuth } from "@/components/auth";
+import { runtimeFeatures } from "@/runtime/features";
+import {
+  fetchModelFeatures,
+  isImageEmbedRequired,
+  MODEL_FEATURES_CHANGED_EVENT,
+} from "@/hooks/useModelFeatures";
+import type { MenuProps } from "antd";
+import { useEffect, useRef, useState, useCallback, MouseEvent } from "react";
+import { useParams } from "react-router-dom";
+import {
+  EditOutlined,
+  SettingOutlined,
+  DeleteOutlined,
+  CopyOutlined,
+  DownOutlined,
+} from "@ant-design/icons";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import { useTranslation } from "react-i18next";
+import {
+  Dataset,
+  DatasetAclEnum,
+  DocTypeEnum,
+} from "@/api/generated/knowledge-client";
+
+import Polling from "@/modules/knowledge/utils/polling";
+import RenameModel, {
+  RenameFormItem,
+  RenameModalRef,
+} from "@/modules/knowledge/components/RenameModel";
+import KnowledgeTable, {
+  IKnowledgeListRef,
+  TreeNode,
+} from "./components/KnowledgeTable";
+import ImportKnowledgeModal, {
+  IImportKnowledgeModalRef,
+} from "./components/ImportKnowledgeModal";
+import ImportTaskManage, {
+  IImportTaskManageRef,
+} from "./components/ImportTaskManage";
+import TreeUtils from "@/modules/knowledge/utils/tree";
+import { IMPORT_TASK_POLL_INTERVAL } from "@/modules/knowledge/constants/common";
+import { isFFmpegDependencyError } from "@/modules/knowledge/utils/taskError";
+import TypedConfirmModal, {
+  type TypedConfirmModalRef,
+} from "@/components/ui/TypedConfirmModal";
+import CreateUpdateModal, {
+  UpdateImperativeProps,
+} from "@/modules/knowledge/components/UpdateModal";
+import { KnowledgeBaseServiceApi } from "@/modules/knowledge/utils/request";
+import { DocumentServiceApi, TaskServiceApi } from "../../utils/request";
+import { useDatasetPermissionStore } from "@/modules/knowledge/store/dataset_permission";
+import {
+  fetchUserUiPreferences,
+  USER_UI_PREFERENCES_CHANGED_EVENT,
+} from "@/modules/user/uiPreferencesApi";
+import {
+  DEVELOPER_ACTIVE_EVENT,
+  isDeveloperModeActive,
+} from "@/utils/developerMode";
+
+import { DetailPageHeader } from "@/components/ui";
+import KnowledgeBaseSyncNow from "@/modules/knowledge/components/KnowledgeBaseSyncNow";
+import {
+  effectiveProcessingLevel,
+  type ProcessingLevel,
+} from "@/modules/knowledge/utils/processingLevel";
+
+import "./index.scss";
+
+type DatasetWithDataSourceFlag = Dataset & {
+  created_by_data_source?: boolean;
+};
+
+type DatasetWithProcessingLevel = DatasetWithDataSourceFlag & {
+  processing_level?: ProcessingLevel;
+};
+
+function isDatasetCreatedByDataSource(dataset?: DatasetWithDataSourceFlag) {
+  return Boolean(dataset?.created_by_data_source);
+}
+
+const { Search } = Input;
+
+async function writeTextToClipboard(text: string) {
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.readOnly = true;
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  textarea.style.top = "0";
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+
+  let copied = false;
+  try {
+    if (typeof document.execCommand === "function") {
+      copied = document.execCommand("copy");
+    }
+  } finally {
+    document.body.removeChild(textarea);
+  }
+
+  if (copied) {
+    return;
+  }
+
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  throw new Error("Copy command failed");
+}
+
+const Detail = () => {
+  const { t } = useTranslation();
+  const knowledgeListRef = useRef<IKnowledgeListRef>(null);
+  const createFolderRef = useRef<RenameModalRef>(null);
+  const importKnowledgeRef = useRef<IImportKnowledgeModalRef>();
+  const importTaskRef = useRef<IImportTaskManageRef>();
+  const pollingRef = useRef(new Polling());
+  const importingTaskListRef = useRef([]);
+  const promptedDependencyTaskIdsRef = useRef(new Set<string>());
+  const confirmRef = useRef<TypedConfirmModalRef>(null);
+  const createUpdateRef = useRef<UpdateImperativeProps>(null);
+
+  const [detail, setDetail] = useState<DatasetWithProcessingLevel>();
+  const [runningTotal, setRunningTotal] = useState(0);
+  const [developerActive, setDeveloperActive] = useState(isDeveloperModeActive);
+  const [embeddingReady, setEmbeddingReady] = useState<boolean | null>(null);
+  const [multimodalEmbeddingReady, setMultimodalEmbeddingReady] = useState<
+    boolean | null
+  >(null);
+  const [documentParsingEnabled, setDocumentParsingEnabled] = useState<boolean | null>(null);
+  const [uploadingNoticeVisible, setUploadingNoticeVisible] = useState(false);
+  const isAdmin = AgentAppsAuth.getUserInfo()?.role === "system-admin";
+
+  const { id = "" } = useParams();
+
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+
+  const { setCurrentDataset, clearDataset } = useDatasetPermissionStore();
+
+  const getDetail = useCallback(() => {
+    KnowledgeBaseServiceApi()
+      .datasetServiceGetDataset({ dataset: id })
+      .then((res) => {
+        const dataset = res.data as unknown as DatasetWithProcessingLevel;
+        setDetail(dataset);
+        setCurrentDataset(dataset);
+      });
+  }, [id, setCurrentDataset]);
+
+  useEffect(() => {
+    getDetail();
+    getImportingTotal();
+    const unwrap = (
+      resp: { data: { data?: { ready: boolean } } | { ready: boolean } } | null,
+    ): boolean | null => {
+      if (!resp) return null;
+      const body = resp.data;
+      const d =
+        body && typeof body === "object" && "data" in body
+          ? (body as { data?: { ready: boolean } }).data
+          : (body as { ready: boolean });
+      return d?.ready ?? null;
+    };
+    const loadEmbeddingReady = () => {
+      fetchModelFeatures(true)
+        .then((features) => {
+          const imageEmbedRequired = isImageEmbedRequired(features);
+          return Promise.all([
+            axiosInstance
+              .get<
+                { data?: { ready: boolean } } | { ready: boolean }
+              >(`${BASE_URL}/api/core/model_providers/models/ready?model_type=embed_main`)
+              .catch(() => null),
+            imageEmbedRequired
+              ? axiosInstance
+                  .get<
+                    { data?: { ready: boolean } } | { ready: boolean }
+                  >(`${BASE_URL}/api/core/model_providers/models/ready?model_type=embed_image`)
+                  .catch(() => null)
+              : Promise.resolve(null),
+          ]).then(([embResp, multiResp]) => {
+            setEmbeddingReady(unwrap(embResp));
+            setMultimodalEmbeddingReady(
+              imageEmbedRequired ? unwrap(multiResp) : null,
+            );
+          });
+        })
+        .catch(() => {
+          setEmbeddingReady(null);
+          setMultimodalEmbeddingReady(null);
+        });
+    };
+    loadEmbeddingReady();
+    window.addEventListener(MODEL_FEATURES_CHANGED_EVENT, loadEmbeddingReady);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        loadEmbeddingReady();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+
+    return () => {
+      window.removeEventListener(
+        MODEL_FEATURES_CHANGED_EVENT,
+        loadEmbeddingReady,
+      );
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      pollingRef.current.cancel();
+      clearDataset();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [getDetail, clearDataset]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadDocumentParsingState = () => fetchUserUiPreferences({ silentError: true } as never)
+      .then((preferences) => {
+        if (!cancelled) setDocumentParsingEnabled(preferences.document_parsing_enabled);
+      })
+      .catch(() => {
+        // Keep the existing backend protection authoritative when the optional
+        // preference request cannot be read.
+      });
+    void loadDocumentParsingState();
+    window.addEventListener(USER_UI_PREFERENCES_CHANGED_EVENT, loadDocumentParsingState);
+    return () => {
+      cancelled = true;
+      window.removeEventListener(USER_UI_PREFERENCES_CHANGED_EVENT, loadDocumentParsingState);
+    };
+  }, []);
+
+  useEffect(() => {
+    const syncDeveloperActive = () => {
+      setDeveloperActive(isDeveloperModeActive());
+    };
+
+    const handleDeveloperActiveChange = (event: Event) => {
+      const nextActive = (event as CustomEvent<{ active?: boolean }>).detail
+        ?.active;
+      setDeveloperActive(
+        typeof nextActive === "boolean" ? nextActive : isDeveloperModeActive(),
+      );
+    };
+
+    window.addEventListener("storage", syncDeveloperActive);
+    window.addEventListener(
+      DEVELOPER_ACTIVE_EVENT,
+      handleDeveloperActiveChange,
+    );
+
+    return () => {
+      window.removeEventListener("storage", syncDeveloperActive);
+      window.removeEventListener(
+        DEVELOPER_ACTIVE_EVENT,
+        handleDeveloperActiveChange,
+      );
+    };
+  }, []);
+
+  function getImportingTotal() {
+    pollingRef.current.cancel();
+    pollingRef.current.start({
+      interval: IMPORT_TASK_POLL_INTERVAL,
+      // Filter to running tasks on the backend so total_size is accurate and
+      // we are not limited by the default page size of 20.
+      request: () =>
+        TaskServiceApi().listTasks(id, {
+          taskStatus: "running",
+          pageSize: 1000,
+        }, { silentError: true } as never),
+      onSuccess: ({ data = {} }) => {
+        const newTaskList = data.tasks || [];
+        // Tasks in WORKING state are actively being parsed by the algorithm service.
+        // Tasks in WAITING state are still uploading / queued before parsing starts.
+        const uploadingTasks = newTaskList.filter(
+          (t: any) => t.task_state === "WAITING",
+        );
+        if (newTaskList.length === 0) {
+          pollingRef.current.cancel();
+        }
+        compareTaskChange(newTaskList, importingTaskListRef.current);
+        // Use total_size from the backend for an accurate count; fall back to
+        // the length of the current page if total_size is absent.
+        setRunningTotal(data.total_size ?? newTaskList.length);
+        // Show notice only while files are still uploading; once upload is done
+        // the user can safely close the tab even if parsing continues in the background.
+        setUploadingNoticeVisible(uploadingTasks.length > 0);
+        importingTaskListRef.current = newTaskList;
+      },
+    });
+  }
+
+  function compareTaskChange(newTaskList: any[], prevTaskList: any[]) {
+    const completeTasks = prevTaskList.filter(
+      (item) => !newTaskList.some((i) => item.task_id === i.task_id),
+    );
+    if (!completeTasks.length) {
+      return;
+    }
+
+    // Update document count.
+    if (completeTasks.length > 0) {
+      getDetail();
+    }
+    void notifyDependencyFailures(completeTasks);
+
+    // There are multiple tasks to complete or the root node needs to be updated.
+    if (
+      completeTasks.length > 1 ||
+      completeTasks.find((item) => !item.target_pid)
+    ) {
+      knowledgeListRef.current?.getTableData();
+      return;
+    }
+
+    // Only one task is completed to update the parent node and child node.
+    const task = completeTasks[0];
+    const parentNode: TreeNode | undefined = TreeUtils.findNode(
+      knowledgeListRef.current?.treeData || [],
+      (node: TreeNode) => {
+        return node.document_id === task.target_pid;
+      },
+    );
+    if (!parentNode) {
+      return;
+    }
+    if (parentNode?.loaded) {
+      knowledgeListRef.current!.getTableData({
+        pId: parentNode.document_id ?? "",
+        level: parentNode.level + 1,
+        parentNode: { ...parentNode, loaded: false },
+      });
+      return;
+    }
+    knowledgeListRef.current!.updateDocument({
+      documentId: parentNode.document_id ?? "",
+    });
+  }
+
+  async function notifyDependencyFailures(tasks: any[]) {
+    for (const task of tasks) {
+      const taskId = String(task?.task_id || "");
+      if (!taskId || promptedDependencyTaskIdsRef.current.has(taskId)) {
+        continue;
+      }
+      try {
+        const response = await TaskServiceApi().getTask(
+          id,
+          taskId,
+          { silentError: true } as never,
+        );
+        const finishedTask = response.data as any;
+        if (!isFFmpegDependencyError(finishedTask?.err_msg)) {
+          continue;
+        }
+        promptedDependencyTaskIdsRef.current.add(taskId);
+        Modal.confirm({
+          title: t("knowledge.ffmpegRequiredTitle"),
+          content: t("knowledge.ffmpegRequiredDesc"),
+          okText: t("knowledge.configureFfmpeg"),
+          cancelText: t("common.close"),
+          onOk: () => navigate("/settings?section=system_tools#ffmpeg-dependency"),
+        });
+      } catch (error) {
+        console.error("Failed to inspect completed task:", error);
+      }
+    }
+  }
+
+  function openImportModal(data?: any) {
+    const modalData = { ...detail, ...data };
+    importKnowledgeRef.current?.handleOpen(modalData);
+  }
+
+  function onCreateFolder(data: RenameFormItem) {
+    DocumentServiceApi()
+      .documentServiceCreateDocument({
+        dataset: id,
+        doc: {
+          display_name: data.name,
+          name: data.name,
+          type: DocTypeEnum.Folder,
+        },
+      })
+      .then(() => {
+        message.success(t("knowledge.createFolderSuccess"));
+        knowledgeListRef.current?.getTableData();
+      });
+  }
+
+  async function onUpdate(
+    data: Dataset & { processing_level?: ProcessingLevel },
+  ): Promise<void> {
+    const { processing_level: nextLevel, ...dataset } = data;
+    const currentLevel = effectiveProcessingLevel(detail?.processing_level);
+    if (nextLevel && nextLevel !== currentLevel) {
+      await axiosInstance.patch(
+        `${BASE_URL}/api/core/datasets/${encodeURIComponent(id)}/processing-level`,
+        { processing_level: nextLevel },
+      );
+    }
+    return KnowledgeBaseServiceApi()
+      .datasetServiceUpdateDataset({
+        dataset: data.dataset_id || "",
+        dataset2: dataset,
+      })
+      .then(() => {
+        message.success(t("knowledge.editSuccess"));
+        getDetail();
+      });
+  }
+
+  function onDelete(knowledgeBaseId: string) {
+    KnowledgeBaseServiceApi()
+      .datasetServiceDeleteDataset({ dataset: knowledgeBaseId })
+      .then(() => {
+        message.success(t("knowledge.deleteSuccess"));
+        navigate({
+          pathname: "/lib/knowledge/list",
+        });
+      });
+  }
+
+  function onSearch(value: string) {
+    knowledgeListRef.current?.refresh(value);
+  }
+
+  const hasWritePermission = useDatasetPermissionStore((state) =>
+    state.hasWritePermission(),
+  );
+
+  const hasUploadPermission = useDatasetPermissionStore((state) =>
+    state.hasUploadPermission(),
+  );
+  const canImport = hasUploadPermission || hasWritePermission;
+  const isDocumentParsingUnavailable = documentParsingEnabled !== true;
+  const importDisabled =
+    isDocumentParsingUnavailable ||
+    embeddingReady === false ||
+    multimodalEmbeddingReady === false;
+  const importDisabledReason = isDocumentParsingUnavailable
+    ? documentParsingEnabled === false
+      ? "文档解析已暂停，请在设置中重新启用"
+      : "正在读取文档解析状态"
+    : undefined;
+  const showDataSourceSync = isDatasetCreatedByDataSource(
+    detail as DatasetWithDataSourceFlag | undefined,
+  );
+
+  const refreshKnowledgeAfterSync = useCallback(() => {
+    getDetail();
+    getImportingTotal();
+    knowledgeListRef.current?.getTableData();
+  }, [getDetail]);
+
+  return (
+    <div
+      className="knowledge-detail-page"
+      style={{
+        width: "100%",
+        minWidth: 0,
+        display: "flex",
+        flexDirection: "column",
+        paddingBottom: "24px",
+      }}
+    >
+      <DetailPageHeader
+        className="knowledge-detail-header"
+        title={
+          <span className="knowledge-detail-title-copy">
+            <strong>{detail?.display_name}</strong>
+            {detail?.desc ? <small>{detail.desc}</small> : null}
+          </span>
+        }
+        titleExtra={
+          developerActive ? (
+            <>
+              <span
+                style={{
+                  marginRight: "4px",
+                  color: "var(--color-text-description)",
+                }}
+              >
+                ID: {detail?.dataset_id}
+              </span>
+              <CopyOutlined
+                style={{ color: "var(--color-text-description)" }}
+                onClick={async () => {
+                  try {
+                    await writeTextToClipboard(detail?.dataset_id || "");
+                    message.success(t("knowledge.copySuccess"));
+                  } catch {
+                    message.error(t("knowledge.copyFailedManual"));
+                  }
+                }}
+              />
+            </>
+          ) : null
+        }
+        settingsMenu={
+          detail?.acl?.includes(DatasetAclEnum.DatasetWrite) && (
+            <div>
+              <Button
+                icon={<EditOutlined />}
+                onClick={() => {
+                  createUpdateRef.current?.onOpen(detail);
+                }}
+              >
+                {t("common.edit")}
+              </Button>
+              {!runtimeFeatures.hideUserGroupSurfaces && (
+                <Button
+                  icon={<SettingOutlined />}
+                  onClick={() =>
+                    navigate({
+                      pathname: `/lib/knowledge/auth/${id}`,
+                    })
+                  }
+                >
+                  {t("knowledge.authorize")}
+                </Button>
+              )}
+              <Button
+                danger
+                icon={<DeleteOutlined />}
+                onClick={() => {
+                  const knowledgeName = detail?.display_name || id;
+                  confirmRef.current?.onOpen({
+                    id,
+                    title: t("knowledge.deleteTitle", {
+                      name: knowledgeName,
+                    }),
+                    content: t("knowledge.deleteContent"),
+                    confirmText: t("knowledge.deleteConfirmText", {
+                      name: knowledgeName,
+                    }),
+                  });
+                }}
+              >
+                {t("common.delete")}
+              </Button>
+            </div>
+          )
+        }
+        breadcrumbs={[
+          { title: t("layout.knowledgeBase"), href: "/lib/knowledge/list" },
+          { title: detail?.display_name },
+        ]}
+        onBack={() => {
+          const bool = ["aiwrite", "aireview", "chat"].includes(
+            searchParams.get("from") ?? "",
+          );
+          if (bool) {
+            navigate("/lib/knowledge/list");
+          } else {
+            navigate(-1);
+          }
+        }}
+      />
+      {uploadingNoticeVisible && (
+        <Alert
+          className="knowledge-parsing-notice"
+          message={t("knowledge.documentUploadingKeepTabOpen")}
+          type="warning"
+          showIcon
+        />
+      )}
+      <div className="toolbar my-4 mt-6 w-full">
+        <Search
+          className="search-input"
+          placeholder={t("knowledge.searchDocPlaceholder")}
+          allowClear
+          variant="borderless"
+          onSearch={onSearch}
+          style={{
+            width: 300,
+          }}
+        />
+        {canImport && (
+          <div className="toolbar-actions">
+            {showDataSourceSync && detail?.dataset_id ? (
+              <KnowledgeBaseSyncNow
+                datasetId={detail.dataset_id}
+                documentParsingEnabled={documentParsingEnabled}
+                onSyncComplete={refreshKnowledgeAfterSync}
+              />
+            ) : null}
+            {hasWritePermission && (
+              <Button
+                color="primary"
+                variant="outlined"
+                ghost
+                onClick={() => {
+                  createFolderRef.current?.onOpen({
+                    title: t("knowledge.createFolder"),
+                    form: {
+                      name: t("knowledge.folderName"),
+                      namePlaceholder: t("knowledge.folderNameRule"),
+                      nameLen: 30,
+                      nameRules: [
+                        {
+                          required: true,
+                          validator: (_: any, value: string) => {
+                            if (!value) {
+                              return Promise.reject(
+                                t("knowledge.inputFolderName"),
+                              );
+                            }
+                            if (
+                              !/^[a-zA-Z\d\u4e00-\u9fa5_]+$/.test(value) ||
+                              value.length > 30
+                            ) {
+                              return Promise.reject(
+                                t("knowledge.folderNameRule"),
+                              );
+                            }
+                            return Promise.resolve();
+                          },
+                        },
+                      ],
+                    },
+                    data: {
+                      name: "",
+                    },
+                  });
+                }}
+              >
+                {t("knowledge.createFolder")}
+              </Button>
+            )}
+            <Badge count={runningTotal} size="small" style={{ zIndex: 2 }}>
+              <Tooltip
+                title={
+                  importDisabledReason ||
+                  (embeddingReady === false || multimodalEmbeddingReady === false ? (
+                    isAdmin ? (
+                      <span>
+                        {embeddingReady === false
+                          ? t("knowledge.embeddingNotReadyBannerAdmin")
+                          : t(
+                              "knowledge.multimodalEmbeddingNotReadyBannerAdmin",
+                            )}
+                        <a
+                          href="/settings?section=models"
+                          style={{
+                            marginLeft: 8,
+                            color: "#fff",
+                            textDecoration: "underline",
+                          }}
+                          onClick={(e: MouseEvent<HTMLAnchorElement>) => {
+                            e.preventDefault();
+                            navigate("/settings?section=models");
+                          }}
+                        >
+                          {t("knowledge.goToConfig")}
+                        </a>
+                      </span>
+                    ) : embeddingReady === false ? (
+                      t("knowledge.embeddingNotReadyBanner")
+                    ) : (
+                      t("knowledge.multimodalEmbeddingNotReadyBanner")
+                    )
+                  ) : undefined)
+                }
+              >
+                <Dropdown
+                  menu={{
+                    items: [
+                      {
+                        key: "importFile",
+                        label: t("knowledge.importFile"),
+                        disabled: importDisabled,
+                      },
+                      {
+                        key: "importFolder",
+                        label: t("knowledge.importFolder"),
+                        disabled: importDisabled,
+                      },
+                      {
+                        key: "importZip",
+                        label: t("knowledge.importZip"),
+                        disabled: importDisabled,
+                      },
+                      {
+                        key: "taskManage",
+                        label: (
+                          <>
+                            {t("knowledge.taskManageParse")}
+                            {runningTotal > 0 && (
+                              <Badge
+                                count={runningTotal}
+                                size="small"
+                                offset={[-4, 6]}
+                              >
+                                <span
+                                  style={{
+                                    marginLeft: runningTotal >= 10 ? 6 : 12,
+                                    opacity: 0,
+                                  }}
+                                >
+                                  {runningTotal}
+                                </span>
+                              </Badge>
+                            )}
+                          </>
+                        ),
+                      },
+                    ],
+                    onClick: ({ key }) => {
+                      if (key === "importFile") {
+                        openImportModal({ importMode: "file" });
+                        return;
+                      }
+
+                      if (key === "importFolder") {
+                        openImportModal({
+                          selectDirectory: true,
+                          importMode: "folder",
+                        });
+                        return;
+                      }
+
+                      if (key === "importZip") {
+                        openImportModal({ importMode: "zip" });
+                        return;
+                      }
+
+                      if (key === "taskManage") {
+                        importTaskRef.current?.handleOpen(detail);
+                      }
+                    },
+                  }}
+                  trigger={["click"]}
+                >
+                  <Button
+                    className="knowledge-toolbar-dropdown-button"
+                    type="primary"
+                  >
+                    {t("knowledge.importFile")}
+                    <DownOutlined />
+                  </Button>
+                </Dropdown>
+              </Tooltip>
+            </Badge>
+            {hasWritePermission && (
+              <Dropdown
+                menu={{
+                  items: [
+                    {
+                      key: "batchMove",
+                      label: t("knowledge.batchMove"),
+                      onClick: () => {
+                        knowledgeListRef.current?.openBatchMove?.();
+                      },
+                    },
+                    {
+                      key: "batchDelete",
+                      label: t("knowledge.batchDelete"),
+                      onClick: () => {
+                        knowledgeListRef.current?.deleteKnowledge();
+                      },
+                    },
+                    {
+                      key: "batchReparse",
+                      label: t("knowledge.batchReparse"),
+                      disabled: isDocumentParsingUnavailable,
+                      onClick: () => {
+                        knowledgeListRef.current?.restartCheckedKnowledge();
+                      },
+                    },
+                    {
+                      key: "batchEditTags",
+                      label: t("knowledge.batchEditTags"),
+                      onClick: () => {
+                        knowledgeListRef.current?.openBatchEditTags?.();
+                      },
+                    },
+                  ] as MenuProps["items"],
+                }}
+                trigger={["click"]}
+              >
+                <span style={{ display: "inline-flex" }}>
+                  <Button
+                    className="knowledge-toolbar-dropdown-button"
+                    variant="outlined"
+                    color="primary"
+                    ghost
+                  >
+                    {t("knowledge.batchActions")}
+                    <DownOutlined />
+                  </Button>
+                </span>
+              </Dropdown>
+            )}
+          </div>
+        )}
+      </div>
+      {detail && (
+        <KnowledgeTable
+          ref={knowledgeListRef}
+          detail={detail}
+          documentParsingEnabled={documentParsingEnabled}
+          onImportKnowledge={(data) => openImportModal(data)}
+          getImportingTotal={getImportingTotal}
+          getDetail={getDetail}
+        />
+      )}
+
+      <TypedConfirmModal ref={confirmRef} onClick={onDelete} />
+
+      <CreateUpdateModal
+        ref={createUpdateRef}
+        onUpdate={onUpdate}
+        embeddingReady={embeddingReady}
+      />
+
+      <RenameModel
+        ref={createFolderRef}
+        onSubmit={async (data) => onCreateFolder(data)}
+      />
+
+      <ImportKnowledgeModal
+        ref={importKnowledgeRef}
+        onParsingStart={() => setUploadingNoticeVisible(true)}
+        onParsingSettled={() => setUploadingNoticeVisible(false)}
+        onOk={({ pId } = {}) => {
+          importingTaskListRef.current = [];
+          getImportingTotal();
+          getDetail();
+
+          if (pId) {
+            const parentNode = TreeUtils.findNode(
+              knowledgeListRef.current?.treeData || [],
+              (node: TreeNode) => node.document_id === pId,
+            );
+
+            if (parentNode) {
+              knowledgeListRef.current?.getTableData({
+                pId,
+                level: parentNode.level + 1,
+                parentNode,
+              });
+              return;
+            }
+          }
+
+          knowledgeListRef.current?.getTableData({ pId: "", level: 0 });
+        }}
+      />
+
+      <ImportTaskManage
+        ref={importTaskRef}
+        onClose={(hasSuspended) => {
+          if (hasSuspended) {
+            importingTaskListRef.current = [];
+            getImportingTotal();
+            knowledgeListRef.current?.getTableData({ pId: "", level: 0 });
+          } else {
+            getImportingTotal();
+          }
+        }}
+      />
+    </div>
+  );
+};
+
+export default Detail;

@@ -1,0 +1,334 @@
+package handler
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"gorm.io/gorm"
+
+	"lazymind/core/algo"
+	"lazymind/core/common"
+	"lazymind/core/common/orm"
+	"lazymind/core/skillv2/testutil"
+	"lazymind/core/store"
+)
+
+func TestSubmitSkillOrganizeForwardsCoreManagedFields(t *testing.T) {
+	oldCaller := skillOrganizeCaller
+	oldLoader := skillOrganizeLoadModelConfig
+	oldDB := store.DB()
+	t.Cleanup(func() {
+		skillOrganizeCaller = oldCaller
+		skillOrganizeLoadModelConfig = oldLoader
+		store.Init(oldDB, nil, nil)
+	})
+
+	db := testutil.NewTestDB(t)
+	testutil.SeedSkillWithRevision(t, db, "skill1", "rev1")
+	testutil.SeedSkillWithRevision(t, db, "skill2", "rev2")
+	testutil.SeedSkillWithRevision(t, db, "skill3", "rev3")
+	setSkillOrganizeCategory(t, db, "skill1", "internal", "internal/论文精读")
+	setSkillOrganizeCategory(t, db, "skill2", "external", "external/论文精读-skill2")
+	setSkillOrganizeCategory(t, db, "skill3", "internal", "internal/第二技能")
+	testutil.SeedTextBlob(t, db, "external_draft_hash", "external draft")
+	testutil.SeedDraftEntry(t, db, "skill2", "SKILL.md", "upsert", "file", "external_draft_hash")
+	store.Init(db.DB, nil, nil)
+
+	var captured algo.SkillOrganizeRequest
+	skillOrganizeLoadModelConfig = func(_ context.Context, _ *gorm.DB, userID string) (map[string]any, error) {
+		if userID != "user_001" {
+			t.Fatalf("load model config user_id = %q", userID)
+		}
+		return map[string]any{"llm": map[string]any{"model": "m"}}, nil
+	}
+	skillOrganizeCaller = func(_ context.Context, req algo.SkillOrganizeRequest) (*algo.SkillOrganizeResponse, int, error) {
+		captured = req
+		return &algo.SkillOrganizeResponse{
+			Code: 0,
+			Data: algo.SkillOrganizeData{
+				Status:    "pending",
+				RequestID: req.RequestID,
+				TaskID:    "org_smoke_20260707183512345678",
+			},
+		}, http.StatusOK, nil
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/core/skill_organize", strings.NewReader(`{
+		"requestid": "org_smoke",
+		"user_id": "ignored",
+		"skills": [" /skills/internal/论文精读/ ", "skills/external/论文精读-skill2", "skills/internal/第二技能"],
+		"fs_base_url": "http://frontend-should-not-win",
+		"artifact_dir": "tmp/a-skill-org",
+		"model_configs": {"llm": {"api_key": "frontend-should-not-win"}}
+	}`))
+	req.Header.Set("X-User-Id", "user_001")
+	rec := httptest.NewRecorder()
+
+	SubmitSkillOrganize(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if captured.UserID != "user_001" || captured.RequestID != "org_smoke" {
+		t.Fatalf("unexpected forwarded request identity: %#v", captured)
+	}
+	if strings.Join(captured.Skills, ",") != "internal/论文精读,internal/第二技能" {
+		t.Fatalf("unexpected forwarded skills: %#v", captured.Skills)
+	}
+	if captured.ArtifactDir != "tmp/a-skill-org" {
+		t.Fatalf("artifact_dir = %q", captured.ArtifactDir)
+	}
+	if _, ok := captured.ModelConfigs["llm"]; !ok {
+		t.Fatalf("expected core-loaded model config, got %#v", captured.ModelConfigs)
+	}
+	var reservation orm.ResourceUpdateTask
+	if err := db.Where("task_type = ?", orm.ResourceUpdateTaskTypeOrganizeSkill).Take(&reservation).Error; err != nil {
+		t.Fatalf("load organize reservation: %v", err)
+	}
+	if reservation.Status != orm.ResourceUpdateTaskStatusDone {
+		t.Fatalf("organize reservation status = %q, want done", reservation.Status)
+	}
+	if reservation.ResultID != "org_smoke_20260707183512345678" {
+		t.Fatalf("organize reservation result_id = %q", reservation.ResultID)
+	}
+
+	var out common.APIResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	data, ok := out.Data.(map[string]any)
+	if !ok || data["taskid"] != "org_smoke_20260707183512345678" || data["status"] != "pending" {
+		t.Fatalf("unexpected response: %#v", out)
+	}
+}
+
+func TestSubmitSkillOrganizeFiltersNonInternalSkills(t *testing.T) {
+	oldCaller := skillOrganizeCaller
+	oldLoader := skillOrganizeLoadModelConfig
+	oldDB := store.DB()
+	t.Cleanup(func() {
+		skillOrganizeCaller = oldCaller
+		skillOrganizeLoadModelConfig = oldLoader
+		store.Init(oldDB, nil, nil)
+	})
+
+	db := testutil.NewTestDB(t)
+	testutil.SeedSkillWithRevision(t, db, "skill1", "rev1")
+	testutil.SeedSkillWithRevision(t, db, "skill2", "rev2")
+	setSkillOrganizeCategory(t, db, "skill1", "internal", "internal/another-skill")
+	if err := db.Model(&testutil.SkillRow{}).Where("id = ?", "skill2").Updates(map[string]any{
+		"category":      "internal",
+		"relative_root": "internal/generated-skill",
+	}).Error; err != nil {
+		t.Fatalf("mark internal skill: %v", err)
+	}
+	store.Init(db.DB, nil, nil)
+
+	skillOrganizeLoadModelConfig = func(context.Context, *gorm.DB, string) (map[string]any, error) {
+		return map[string]any{"llm": map[string]any{"model": "m"}}, nil
+	}
+	var captured algo.SkillOrganizeRequest
+	skillOrganizeCaller = func(_ context.Context, req algo.SkillOrganizeRequest) (*algo.SkillOrganizeResponse, int, error) {
+		captured = req
+		return &algo.SkillOrganizeResponse{Code: 0, Data: algo.SkillOrganizeData{
+			Status: "pending", RequestID: req.RequestID, TaskID: "org_filtered_task",
+		}}, http.StatusOK, nil
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/core/skill_organize", strings.NewReader(`{
+		"requestid":"org_filtered",
+		"skills":["skills/creative/art_style","skills/vcs/git-guide","skills/internal/another-skill","skills/external/downloaded","skills/internal/generated-skill"]
+	}`))
+	req.Header.Set("X-User-Id", "user_001")
+	rec := httptest.NewRecorder()
+
+	SubmitSkillOrganize(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Join(captured.Skills, ",") != "internal/another-skill,internal/generated-skill" {
+		t.Fatalf("forwarded skills = %#v, want only internal skills", captured.Skills)
+	}
+}
+
+func TestSubmitSkillOrganizeRejectsSingleInternalSkill(t *testing.T) {
+	oldCaller := skillOrganizeCaller
+	oldDB := store.DB()
+	t.Cleanup(func() {
+		skillOrganizeCaller = oldCaller
+		store.Init(oldDB, nil, nil)
+	})
+
+	db := testutil.NewTestDB(t)
+	testutil.SeedSkillWithRevision(t, db, "skill1", "rev1")
+	setSkillOrganizeCategory(t, db, "skill1", "internal", "internal/only-skill")
+	store.Init(db.DB, nil, nil)
+
+	called := false
+	skillOrganizeCaller = func(_ context.Context, _ algo.SkillOrganizeRequest) (*algo.SkillOrganizeResponse, int, error) {
+		called = true
+		return nil, 0, nil
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/core/skill_organize", strings.NewReader(`{
+		"requestid": "org_single_internal",
+		"skills": ["skills/internal/only-skill"]
+	}`))
+	req.Header.Set("X-User-Id", "user_001")
+	rec := httptest.NewRecorder()
+
+	SubmitSkillOrganize(rec, req)
+
+	if rec.Code != http.StatusBadRequest || called {
+		t.Fatalf("status=%d called=%v body=%s", rec.Code, called, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "skill_organize_insufficient_internal_skills") {
+		t.Fatalf("unexpected body: %s", rec.Body.String())
+	}
+	var count int64
+	if err := db.Model(&orm.ResourceUpdateTask{}).
+		Where("task_type = ?", orm.ResourceUpdateTaskTypeOrganizeSkill).
+		Count(&count).Error; err != nil {
+		t.Fatalf("count organize reservations: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("organize reservation count = %d, want 0", count)
+	}
+}
+
+func TestSubmitSkillOrganizeRejectsRequestWithoutInternalSkills(t *testing.T) {
+	oldCaller := skillOrganizeCaller
+	oldDB := store.DB()
+	t.Cleanup(func() {
+		skillOrganizeCaller = oldCaller
+		store.Init(oldDB, nil, nil)
+	})
+
+	db := testutil.NewTestDB(t)
+	testutil.SeedSkillWithRevision(t, db, "skill1", "rev1")
+	setSkillOrganizeCategory(t, db, "skill1", "external", "external/论文精读")
+	store.Init(db.DB, nil, nil)
+
+	called := false
+	skillOrganizeCaller = func(_ context.Context, _ algo.SkillOrganizeRequest) (*algo.SkillOrganizeResponse, int, error) {
+		called = true
+		return nil, 0, nil
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/core/skill_organize", strings.NewReader(`{
+		"requestid": "org_external_only",
+		"skills": ["skills/external/论文精读"]
+	}`))
+	req.Header.Set("X-User-Id", "user_001")
+	rec := httptest.NewRecorder()
+
+	SubmitSkillOrganize(rec, req)
+
+	if rec.Code != http.StatusBadRequest || called {
+		t.Fatalf("status=%d called=%v body=%s", rec.Code, called, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "skill_organize_no_internal_skills") {
+		t.Fatalf("unexpected body: %s", rec.Body.String())
+	}
+	var count int64
+	if err := db.Model(&orm.ResourceUpdateTask{}).
+		Where("task_type = ?", orm.ResourceUpdateTaskTypeOrganizeSkill).
+		Count(&count).Error; err != nil {
+		t.Fatalf("count organize reservations: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("organize reservation count = %d, want 0", count)
+	}
+}
+
+func TestNormalizeSkillOrganizeRequestAddsTaskModePrefix(t *testing.T) {
+	normalized, err := normalizeSkillOrganizeRequest(skillOrganizeSubmitRequest{
+		RequestID: "request-1",
+		Skills:    []string{"skills/cat/skill"},
+	})
+	if err != nil {
+		t.Fatalf("normalize request: %v", err)
+	}
+	if normalized.RequestID != "org_request-1" {
+		t.Fatalf("requestid = %q, want org_request-1", normalized.RequestID)
+	}
+}
+
+func TestSkillMaintenanceAdmissionAllowsOnlyOneActiveReservation(t *testing.T) {
+	db := testutil.NewTestDB(t)
+	now := time.Now().UTC()
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+
+	go func() {
+		<-start
+		errs <- db.Create(&orm.ResourceUpdateTask{
+			ID:           "review-reservation",
+			TaskType:     orm.ResourceUpdateTaskTypeGenerateReview,
+			ResourceType: orm.ResourceUpdateResourceTypeSkill,
+			UserID:       "user-1",
+			TriggerType:  orm.ResourceUpdateTriggerTypeManual,
+			TriggerID:    "review-reservation",
+			Status:       orm.ResourceUpdateTaskStatusPending,
+			NextRunAt:    now,
+			CreatedAt:    now,
+			UpdatedAt:    now,
+		}).Error
+	}()
+	go func() {
+		<-start
+		_, err := createSkillOrganizeReservation(context.Background(), db.DB, "user-1", "org-reservation")
+		errs <- err
+	}()
+	close(start)
+
+	successes := 0
+	for range 2 {
+		if err := <-errs; err == nil {
+			successes++
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("active reservation successes = %d, want 1", successes)
+	}
+	var count int64
+	if err := db.Model(&orm.ResourceUpdateTask{}).
+		Where("user_id = ? AND task_type IN ? AND status IN ?", "user-1",
+			[]string{orm.ResourceUpdateTaskTypeGenerateReview, orm.ResourceUpdateTaskTypeOrganizeSkill},
+			[]string{orm.ResourceUpdateTaskStatusPending, orm.ResourceUpdateTaskStatusRunning}).
+		Count(&count).Error; err != nil {
+		t.Fatalf("count active reservations: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("active reservation count = %d, want 1", count)
+	}
+}
+
+func TestNormalizeSkillOrganizeRequestRejectsTooManySkills(t *testing.T) {
+	skills := make([]string, maxSkillOrganizeSkills+1)
+	for i := range skills {
+		skills[i] = "skills/cat/skill_" + string(rune('a'+i))
+	}
+	_, err := normalizeSkillOrganizeRequest(skillOrganizeSubmitRequest{
+		RequestID: "org_many",
+		Skills:    skills,
+	})
+	if err == nil || !strings.Contains(err.Error(), "must not exceed") {
+		t.Fatalf("expected too many skills error, got %v", err)
+	}
+}
+
+func setSkillOrganizeCategory(t *testing.T, db *testutil.TestDB, skillID, category, relativeRoot string) {
+	t.Helper()
+	if err := db.Model(&testutil.SkillRow{}).
+		Where("id = ?", skillID).
+		Updates(map[string]any{"category": category, "relative_root": relativeRoot}).Error; err != nil {
+		t.Fatalf("update skill category: %v", err)
+	}
+}

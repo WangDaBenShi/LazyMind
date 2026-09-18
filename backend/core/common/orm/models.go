@@ -1,0 +1,282 @@
+// Package orm text。
+// text：text migrations/*.sql，Starttext migrate.RunUp() text。text Model text all_models.go text，text dbmigrate migrate text DDL。
+
+package orm
+
+import (
+	"encoding/json"
+	"time"
+)
+
+// ----- ACL text -----
+
+// VisibilityModel text（text kb）text。
+type VisibilityModel struct {
+	ID         int64  `gorm:"primaryKey;autoIncrement"`
+	ResourceID string `gorm:"column:resource_id;type:varchar(255);index"`
+	Level      string `gorm:"column:level;type:varchar(32)"`
+}
+
+func (VisibilityModel) TableName() string { return "acl_visibility" }
+
+// ACLModel ACL text。
+type ACLModel struct {
+	ID           int64      `gorm:"primaryKey;autoIncrement"`
+	ResourceType string     `gorm:"column:resource_type;type:varchar(32);index:idx_acl_resource,priority:1"`
+	ResourceID   string     `gorm:"column:resource_id;type:varchar(255);index:idx_acl_resource,priority:2"`
+	GranteeType  string     `gorm:"column:grantee_type;type:varchar(32)"`
+	TargetID     string     `gorm:"column:target_id;type:varchar(255)"`
+	Permission   string     `gorm:"column:permission;type:varchar(32)"`
+	CreatedBy    string     `gorm:"column:created_by;type:varchar(255)"`
+	CreatedAt    time.Time  `gorm:"column:created_at"`
+	ExpiresAt    *time.Time `gorm:"column:expires_at"`
+}
+
+func (ACLModel) TableName() string { return "acl_rows" }
+
+// KBModel Knowledge basetext。
+type KBModel struct {
+	ID         string `gorm:"primaryKey;column:id;type:varchar(64)"`
+	Name       string `gorm:"column:name;type:varchar(255)"`
+	OwnerID    string `gorm:"column:owner_id;type:varchar(255)"`
+	Visibility string `gorm:"column:visibility;type:varchar(32)"`
+}
+
+func (KBModel) TableName() string { return "acl_kbs" }
+
+// ACLGroupModel User grouptext。
+type ACLGroupModel struct {
+	ID   string `gorm:"primaryKey;column:id;type:varchar(255)"`
+	Name string `gorm:"column:name;type:varchar(255);not null;default:''"`
+}
+
+func (ACLGroupModel) TableName() string { return "acl_groups" }
+
+// UserGroupModel Usertext。
+type UserGroupModel struct {
+	UserID  string `gorm:"primaryKey;column:user_id;type:varchar(255)"`
+	GroupID string `gorm:"primaryKey;column:group_id;type:varchar(255)"`
+}
+
+func (UserGroupModel) TableName() string { return "acl_user_groups" }
+
+// ----- Chat / Prompt text -----
+
+type Prompt struct {
+	ID       string `gorm:"column:id;type:varchar(64);primaryKey"`
+	Name     string `gorm:"column:name;type:varchar(255);not null"`
+	Content  string `gorm:"column:content;type:text;not null"`
+	Category string `gorm:"column:category;type:varchar(64);not null;default:custom"`
+
+	BaseModel
+}
+
+func (Prompt) TableName() string { return "prompts" }
+
+type PromptCategory struct {
+	ID   string `gorm:"column:id;type:varchar(64);primaryKey"`
+	Name string `gorm:"column:name;type:varchar(64);not null"`
+
+	BaseModel
+}
+
+func (PromptCategory) TableName() string { return "prompt_categories" }
+
+type PromptUserState struct {
+	ID             string     `gorm:"column:id;type:varchar(64);primaryKey"`
+	PromptID       string     `gorm:"column:prompt_id;type:varchar(64);not null;uniqueIndex:uk_prompt_user_states_user_prompt,priority:2"`
+	IsFavorite     bool       `gorm:"column:is_favorite;type:boolean;not null;default:false"`
+	UsageCount     int64      `gorm:"column:usage_count;type:bigint;not null;default:0"`
+	LastUsedAt     *time.Time `gorm:"column:last_used_at"`
+	CreateUserID   string     `gorm:"column:create_user_id;type:varchar(255);not null;uniqueIndex:uk_prompt_user_states_user_prompt,priority:1"`
+	CreateUserName string     `gorm:"column:create_user_name;type:varchar(255);not null"`
+	CreatedAt      time.Time  `gorm:"column:created_at;not null"`
+	UpdatedAt      time.Time  `gorm:"column:updated_at;not null"`
+	DeletedAt      *time.Time `gorm:"column:deleted_at"`
+}
+
+func (PromptUserState) TableName() string { return "prompt_user_states" }
+
+type DatasetUserState struct {
+	ID             string     `gorm:"column:id;type:varchar(64);primaryKey"`
+	DatasetID      string     `gorm:"column:dataset_id;type:varchar(255);not null;uniqueIndex:uk_dataset_user_states_user_dataset,priority:2"`
+	UsageCount     int64      `gorm:"column:usage_count;type:bigint;not null;default:0"`
+	LastUsedAt     *time.Time `gorm:"column:last_used_at"`
+	CreateUserID   string     `gorm:"column:create_user_id;type:varchar(255);not null;uniqueIndex:uk_dataset_user_states_user_dataset,priority:1"`
+	CreateUserName string     `gorm:"column:create_user_name;type:varchar(255);not null"`
+	CreatedAt      time.Time  `gorm:"column:created_at;not null"`
+	UpdatedAt      time.Time  `gorm:"column:updated_at;not null"`
+	DeletedAt      *time.Time `gorm:"column:deleted_at"`
+}
+
+func (DatasetUserState) TableName() string { return "dataset_user_states" }
+
+type UserDisabledTool struct {
+	ID             int64      `gorm:"column:id;primaryKey;autoIncrement"`
+	ToolName       string     `gorm:"column:tool_name;type:varchar(255);not null;uniqueIndex:uk_user_disabled_tools_user_tool,priority:2"`
+	CreateUserID   string     `gorm:"column:create_user_id;type:varchar(255);not null;uniqueIndex:uk_user_disabled_tools_user_tool,priority:1"`
+	CreateUserName string     `gorm:"column:create_user_name;type:varchar(255);not null"`
+	CreatedAt      time.Time  `gorm:"column:created_at;not null"`
+	UpdatedAt      time.Time  `gorm:"column:updated_at;not null"`
+	DeletedAt      *time.Time `gorm:"column:deleted_at"`
+}
+
+func (UserDisabledTool) TableName() string { return "user_disabled_tools" }
+
+type MultiAnswersSwitch struct {
+	ID     int32 `gorm:"column:id;primaryKey;autoIncrement"`
+	Status int32 `gorm:"column:status;not null;default:0"`
+
+	BaseModel
+}
+
+func (MultiAnswersSwitch) TableName() string { return "multi_answers_switches" }
+
+type Conversation struct {
+	TitleSource   string          `gorm:"column:title_source;type:varchar(16);not null;default:unknown"`
+	TitleRevision int64           `gorm:"column:title_revision;not null;default:0"`
+	ID            string          `gorm:"column:id;type:varchar(36);primaryKey"`
+	DisplayName   string          `gorm:"column:display_name;type:varchar(255)"`
+	ChannelID     string          `gorm:"column:channel_id;type:varchar(36);not null;default:default"`
+	SearchConfig  json.RawMessage `gorm:"column:search_config;type:json"`
+	ApplicationID string          `gorm:"column:application_id;type:varchar(64);default:''"`
+	Ext           json.RawMessage `gorm:"column:ext;type:json"`
+	Model         string          `gorm:"column:model;type:varchar(64);default:''"`
+	Models        json.RawMessage `gorm:"column:models;type:json"`
+	// ChatModel* stores the conversation-scoped chat LLM selection. Historical
+	// rows keep these fields empty and continue to use the user's runtime default.
+	ChatModelMode     *string         `gorm:"column:chat_model_mode;type:varchar(16)"`
+	ChatModelID       *string         `gorm:"column:chat_model_id;type:varchar(64)"`
+	ChatModelSnapshot json.RawMessage `gorm:"column:chat_model_snapshot;type:json"`
+	ChatModelVersion  int64           `gorm:"column:chat_model_version;not null;default:0"`
+	ChatTimes         int32           `gorm:"column:chat_times;not null;default:0"`
+	// Workflow/subagent policy snapshot. Historical NULL values use the legacy hard defaults.
+	EnableWorkflow *bool   `gorm:"column:enable_plugin"`
+	WorkflowMode   *string `gorm:"column:plugin_mode;type:varchar(16)"`
+	EnableSubagent *bool   `gorm:"column:enable_subagent"`
+	// ChatExecutor selects the upstream Agent while the existing Chat application
+	// remains responsible for persistence, Workflow, artifacts and SSE delivery.
+	ChatExecutor string `gorm:"column:chat_executor;type:varchar(32);not null;default:'lazymind'"`
+	// ThinkingDepth snapshots the entry default selected when the conversation is created.
+	ThinkingDepth string `gorm:"column:thinking_depth;type:varchar(16);not null;default:'medium'"`
+	// IsTaskConv marks conversations created by the scheduler or task center (not user-initiated).
+	IsTaskConv         bool       `gorm:"column:is_task_conv;not null;default:false"`
+	IsEphemeral        bool       `gorm:"column:is_ephemeral;not null;default:false"`
+	EphemeralExpiresAt *time.Time `gorm:"column:ephemeral_expires_at"`
+	SourceType         string     `gorm:"column:source_type;type:varchar(32);not null;default:''"`
+	SourceDatasetID    string     `gorm:"column:source_dataset_id;type:varchar(255);not null;default:''"`
+	SourceDocumentID   string     `gorm:"column:source_document_id;type:varchar(255);not null;default:''"`
+	SourceDisplayName  string     `gorm:"column:source_display_name;type:varchar(255);not null;default:''"`
+	// ParentConversationID and relation metadata keep side chats/forks attached
+	// to their owner conversation without mixing their independent histories.
+	ParentConversationID *string         `gorm:"column:parent_conversation_id;type:varchar(36);index"`
+	RelationType         string          `gorm:"column:relation_type;type:varchar(16);not null;default:'';check:chk_conversations_relation_type,relation_type IN ('','sidechat','fork')"`
+	SourceHistoryID      *string         `gorm:"column:source_history_id;type:varchar(36)"`
+	SourceSeq            *int            `gorm:"column:source_seq"`
+	SourceSelectedText   string          `gorm:"column:source_selected_text;type:text;not null;default:''"`
+	SourceContext        json.RawMessage `gorm:"column:source_context;type:json"`
+	PinnedAt             *time.Time      `gorm:"column:pinned_at"`
+	HistoryOrder         *int64          `gorm:"column:history_order"`
+	UnpinnedHistoryOrder *int64          `gorm:"column:unpinned_history_order"`
+	ArchivedAt           *time.Time      `gorm:"column:archived_at"`
+	ArchiveFolderID      *string         `gorm:"column:archive_folder_id;type:varchar(36)"`
+	TrashExpiresAt       *time.Time      `gorm:"column:trash_expires_at"`
+
+	BaseModel
+}
+
+func (Conversation) TableName() string { return "conversations" }
+
+// ConversationArchiveFolder groups archived conversations for a single user.
+// A nil Conversation.ArchiveFolderID represents the virtual "unfiled" group.
+type ConversationArchiveFolder struct {
+	ID             string    `gorm:"column:id;type:varchar(36);primaryKey"`
+	UserID         string    `gorm:"column:user_id;type:varchar(255);not null;uniqueIndex:uk_conversation_archive_folders_user_name,priority:1"`
+	Name           string    `gorm:"column:name;type:varchar(255);not null"`
+	NormalizedName string    `gorm:"column:normalized_name;type:varchar(255);not null;uniqueIndex:uk_conversation_archive_folders_user_name,priority:2"`
+	CreatedAt      time.Time `gorm:"column:created_at;not null"`
+	UpdatedAt      time.Time `gorm:"column:updated_at;not null"`
+}
+
+func (ConversationArchiveFolder) TableName() string { return "conversation_archive_folders" }
+
+type ChatHistory struct {
+	ID                string          `gorm:"column:id;type:varchar(36);primaryKey"`
+	Seq               int             `gorm:"column:seq;not null;index:idx_chat_histories_conversation_seq,priority:2,sort:desc"`
+	ConversationID    string          `gorm:"column:conversation_id;type:varchar(36);index;index:idx_chat_histories_conversation_seq,priority:1;not null"`
+	RawContent        string          `gorm:"column:raw_content;type:text"`
+	RetrievalResult   json.RawMessage `gorm:"column:retrieval_result;type:json"`
+	Content           string          `gorm:"column:content;type:text"`
+	Result            string          `gorm:"column:result;type:text"`
+	FeedBack          int             `gorm:"column:feed_back;default:0"`
+	Reason            string          `gorm:"column:reason;type:varchar(255)"`
+	ExpectedAnswer    string          `gorm:"column:expected_answer;type:text"`
+	AlgorithmID       string          `gorm:"column:algorithm_id;type:varchar(64)"`
+	RunID             string          `gorm:"column:run_id;type:varchar(64);index"`
+	RunStatus         string          `gorm:"column:run_status;type:varchar(32)"`
+	RunTerminal       json.RawMessage `gorm:"column:run_terminal;type:json"`
+	Ext               json.RawMessage `gorm:"column:ext;type:json"`
+	Version           string          `gorm:"column:version;type:varchar(128);default:2.3"`
+	ToolCallTurns     int             `gorm:"column:tool_call_turns;not null;default:0;check:chk_chat_histories_tool_call_turns_non_negative,tool_call_turns >= 0"`
+	ThinkingDurationS int64           `gorm:"column:thinking_duration_s;not null;default:0"`
+
+	TimeMixin
+}
+
+func (ChatHistory) TableName() string { return "chat_histories" }
+
+type MultiAnswersChatHistory struct {
+	ID                string          `gorm:"column:id;type:varchar(36);primaryKey"`
+	Seq               int             `gorm:"column:seq;not null"`
+	ConversationID    string          `gorm:"column:conversation_id;type:varchar(36);index;not null"`
+	RawContent        string          `gorm:"column:raw_content;type:text"`
+	RetrievalResult   json.RawMessage `gorm:"column:retrieval_result;type:json"`
+	Content           string          `gorm:"column:content;type:text"`
+	Result            string          `gorm:"column:result;type:text"`
+	ToolCallTurns     int             `gorm:"column:tool_call_turns;not null;default:0;check:chk_multi_answers_chat_histories_tool_call_turns_non_negative,tool_call_turns >= 0"`
+	ThinkingDurationS int64           `gorm:"column:thinking_duration_s;not null;default:0"`
+	FeedBack          int             `gorm:"column:feed_back;default:0"`
+	Reason            string          `gorm:"column:reason;type:varchar(255)"`
+	Ext               json.RawMessage `gorm:"column:ext;type:json"`
+	Endpoint          string          `gorm:"column:endpoint;type:varchar(512)"`
+	RunID             string          `gorm:"column:run_id;type:varchar(64);index"`
+	RunStatus         string          `gorm:"column:run_status;type:varchar(32)"`
+	RunTerminal       json.RawMessage `gorm:"column:run_terminal;type:json"`
+
+	TimeMixin
+}
+
+func (MultiAnswersChatHistory) TableName() string { return "multi_answers_chat_histories" }
+
+// ChatRunPerformance stores normalized, content-free facts for restoring the
+// performance UI. Provider-specific observations remain outside Core.
+type ChatRunPerformance struct {
+	RunID              string    `gorm:"column:run_id;type:varchar(64);primaryKey"`
+	ConversationID     string    `gorm:"column:conversation_id;type:varchar(36);not null;index"`
+	HistoryID          string    `gorm:"column:history_id;type:varchar(36);not null;index"`
+	UserID             string    `gorm:"column:user_id;type:varchar(255);not null;index"`
+	TurnSeq            *int      `gorm:"column:turn_seq"`
+	SchemaVersion      int       `gorm:"column:schema_version;not null"`
+	Status             string    `gorm:"column:status;type:varchar(32);not null"`
+	Model              string    `gorm:"column:model;type:varchar(255);not null;default:''"`
+	Steps              int       `gorm:"column:steps;not null;default:0"`
+	ModelSteps         int       `gorm:"column:model_steps;not null;default:0"`
+	ToolSteps          int       `gorm:"column:tool_steps;not null;default:0"`
+	WallMS             *int64    `gorm:"column:wall_ms"`
+	ModelMS            *int64    `gorm:"column:model_ms"`
+	ToolMS             *int64    `gorm:"column:tool_ms"`
+	TTFTMS             *int64    `gorm:"column:ttft_ms"`
+	InputTokens        *int64    `gorm:"column:input_tokens"`
+	OutputTokens       *int64    `gorm:"column:output_tokens"`
+	TotalTokens        *int64    `gorm:"column:total_tokens"`
+	CachedTokens       *int64    `gorm:"column:cached_tokens"`
+	CacheInputTokens   *int64    `gorm:"column:cache_input_tokens"`
+	ReasoningTokens    *int64    `gorm:"column:reasoning_tokens"`
+	MaxInputTokens     *int64    `gorm:"column:max_input_tokens"`
+	ContextInputTokens *int64    `gorm:"column:context_input_tokens"`
+	ObservedAt         time.Time `gorm:"column:observed_at;not null"`
+	CreatedAt          time.Time `gorm:"column:created_at;not null"`
+	UpdatedAt          time.Time `gorm:"column:updated_at;not null"`
+}
+
+func (ChatRunPerformance) TableName() string { return "chat_run_performance" }

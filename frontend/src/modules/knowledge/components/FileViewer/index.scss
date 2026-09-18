@@ -1,0 +1,233 @@
+.file-viewer-container {
+  position: relative;
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  .file-viewer-content {
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+
+    .scroll-container {
+      flex: 1;
+      min-height: 0;
+    }
+  }
+
+  .vue-office-excel {
+    height: 100%;
+    .vue-office-excel-main {
+      height: 100%;
+    }
+    .x-spreadsheet {
+      display: flex !important;
+      flex-direction: column !important;
+      height: 100% !important;
+      .x-spreadsheet-sheet {
+        flex: 1 !important;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+    }
+  }
+  .vue-office-docx .docx-wrapper {
+    padding: 0.625rem !important;
+  }
+  .vue-office-docx section {
+    padding: 0.3125rem 0.625rem !important;
+    font-size: 0.75rem !important;
+  }
+  .vue-office-docx section,
+  .vue-office-docx section article {
+    width: 100% !important;
+  }
+  .vue-office-docx section table,
+  .vue-office-docx section div,
+  .vue-office-docx section img {
+    max-width: 100% !important;
+    height: auto !important;
+  }
+  p.docx-num-num {
+    margin-left: 0.3125rem !important;
+  }
+}
+.file-viewer-container.is-paragraph-selecting{outline:2px solid #1677ff;outline-offset:-2px}.file-viewer-paragraph-selection-panel{background:#e6f4ff;border-bottom:1px solid #91caff;color:#0958d9;z-index:5}.file-viewer-paragraph-selection-bar{display:flex;align-items:center;gap:10px;padding:8px 12px}.file-viewer-paragraph-selection-bar span{flex:1}.file-viewer-paragraph-selection-bar button,.file-viewer-paragraph-selection-list button{padding:4px 12px;border:1px solid #91caff;border-radius:6px;background:#fff;color:#1677ff;cursor:pointer}.file-viewer-paragraph-selection-bar button:last-child{background:#1677ff;color:#fff}.file-viewer-paragraph-selection-bar button:disabled{opacity:.45;cursor:not-allowed}.file-viewer-paragraph-selection-list{display:flex;gap:8px;overflow-x:auto;padding:0 12px 8px}.file-viewer-paragraph-selection-list>div{display:flex;min-width:180px;max-width:320px;align-items:center;gap:6px;padding:5px 6px 5px 10px;border:1px solid #91caff;border-radius:6px;background:#fff}.file-viewer-paragraph-selection-list span{overflow:hidden;flex:1;text-overflow:ellipsis;white-space:nowrap}.file-viewer-paragraph-selection-list button{padding:0 6px;border:0;font-size:18px;line-height:24px}
+
+.file-viewer-text-container {
+  height: 100%;
+  min-height: 0;
+  max-height: 100%;
+  overflow: auto;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  & > pre {
+    white-space: pre-wrap;
+    word-break: break-word;
+    padding: 16px;
+    margin: 0;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+}
+
+.file-viewer-markdown-container {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.file-viewer-markdown-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-bg-container, #fff);
+}
+
+.file-viewer-markdown-content {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 16px 20px;
+
+}
+
+.file-viewer-markdown-source {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+// docx-preview renders every page into one growing document. FileViewer's
+// generic content host intentionally clips overflow for PDF/Office renderers,
+// so Word needs to own its vertical scroll area explicitly.
+.file-viewer-word-scroll {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 800px;
+  height: 100%;
+  min-height: 0;
+  margin: 0 auto;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.file-viewer-word-document {
+  min-height: 100%;
+}
+
+.file-viewer-media-container {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: calc(100vh - 150px);
+  overflow: auto;
+  background: #fff;
+}
+
+.file-viewer-media {
+  max-width: 100%;
+  max-height: 100%;
+}
+
+.file-viewer-image {
+  object-fit: contain;
+}
+
+.file-viewer-video {
+  width: 100%;
+  background: #000;
+}
+
+.file-viewer-audio {
+  width: 100%;
+}
+
+.pptx-preview-wrapper {
+  background: #000 !important;
+  position: relative !important;
+  margin: 0 auto !important;
+  overflow: auto !important;
+
+  .pptx-preview-slide-wrapper {
+    background: #fff !important;
+    margin: 0 auto 10px !important;
+    overflow: hidden !important;
+    position: relative !important;
+
+    .slide-master-wrapper,
+    .slide-layout-wrapper,
+    .slide-wrapper {
+      position: absolute !important;
+      left: 0 !important;
+      top: 0 !important;
+      transform-origin: 0 0 !important;
+    }
+  }
+
+  .pptx-preview-wrapper-next {
+    position: absolute !important;
+    bottom: 20px !important;
+    z-index: 100 !important;
+    cursor: pointer !important;
+    width: 40px !important;
+    height: 40px !important;
+    background: #666666 !important;
+    border-radius: 100% !important;
+
+    div {
+      width: 10px !important;
+      height: 10px !important;
+      border-left: 2px solid #fff !important;
+      border-bottom: 2px solid #fff !important;
+      position: absolute !important;
+      top: 15px !important;
+      left: 15px !important;
+    }
+  }
+
+  .pptx-preview-wrapper-pagination {
+    position: absolute !important;
+    bottom: 33px !important;
+    right: 20px !important;
+    color: #666666 !important;
+    font-size: 14px !important;
+    z-index: 100 !important;
+  }
+}
+.file-viewer-content {
+  position: relative;
+}
+
+.file-viewer-selection-translate-wrap {
+  position: absolute;
+  z-index: 40;
+  transform: translateX(-50%);
+}
+
+.file-viewer-selection-translate {
+  border: 0;
+  border-radius: 8px;
+  padding: 8px 12px;
+  background: #1677ff;
+  color: #fff;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+  cursor: pointer;
+  white-space: nowrap;
+
+  &:disabled {
+    background: #f5f5f5;
+    color: rgba(0, 0, 0, 0.25);
+    cursor: not-allowed;
+  }
+}

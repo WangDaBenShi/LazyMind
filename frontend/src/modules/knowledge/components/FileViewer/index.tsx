@@ -1,0 +1,535 @@
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useState,
+} from "react";
+import { Spin, message, Empty } from "antd";
+import { useTranslation } from "react-i18next";
+import { AgentAppsAuth } from "@/components/auth";
+import { localizeErrorCode } from "@/components/request";
+import FileUtils from "@/modules/knowledge/utils/file";
+import { Segment } from "@/api/generated/knowledge-client";
+import {
+  RenderHtml,
+  RenderTxt,
+  RenderPpt,
+  RenderExcel,
+  RenderWord,
+  RenderMarkdown,
+} from "./renderers";
+
+import {
+  RenderPdf,
+  exportPdfAsImagePdf,
+  isLearningActionCompatible,
+  type LearningSelectionAction,
+  type PdfTextSelection,
+} from "@/components/ui";
+import { normalizeProxyableUrl } from "@/modules/knowledge/utils/request";
+import { isSingleEnglishWord } from "@/modules/knowledge/api/translation";
+import { paragraphSelectionsOverlap } from "./paragraphSelection";
+
+import "./index.scss";
+
+export interface FileViewerRef {
+  exportImagePdf: () => Promise<void>;
+}
+
+interface FileViewerProps {
+  file?: string;
+  fileName: string;
+  segment?: Segment;
+  onExportReadyChange?: (ready: boolean) => void;
+  onPdfSelection?: (selection: PdfTextSelection) => void;
+  onPdfTranslateSelection?: (selection: PdfTextSelection) => void;
+  onAddVocabularySelection?: (selection: PdfTextSelection) => void;
+  translationConfigured?: boolean;
+  learningSelectionActions?: LearningSelectionAction[];
+  onLearningSelection?: (key:string, selection:PdfTextSelection)=>void;
+  paragraphSelectionMode?: boolean;
+  onParagraphSelectionConfirm?: (selections:PdfTextSelection[])=>void;
+  onParagraphSelectionCancel?: ()=>void;
+}
+
+const IMAGE_FILE_TYPES = [
+  "jpg",
+  "jpeg",
+  "png",
+  "gif",
+  "bmp",
+  "webp",
+  "tiff",
+  "tif",
+];
+
+const VIDEO_FILE_TYPES = ["mp4", "webm", "ogg", "ogv", "mov", "m4v"];
+const AUDIO_FILE_TYPES = ["mp3", "wav", "m4a", "aac", "flac"];
+
+const MEDIA_MIME_TYPES: Record<string, string> = {
+  aac: "audio/aac",
+  bmp: "image/bmp",
+  flac: "audio/flac",
+  gif: "image/gif",
+  jpeg: "image/jpeg",
+  jpg: "image/jpeg",
+  m4a: "audio/mp4",
+  m4v: "video/mp4",
+  mov: "video/quicktime",
+  mp3: "audio/mpeg",
+  mp4: "video/mp4",
+  ogg: "video/ogg",
+  ogv: "video/ogg",
+  png: "image/png",
+  tif: "image/tiff",
+  tiff: "image/tiff",
+  wav: "audio/wav",
+  webm: "video/webm",
+  webp: "image/webp",
+};
+
+const FileViewer = forwardRef<FileViewerRef, FileViewerProps>((props, ref) => {
+  const { t } = useTranslation();
+  const { file, segment, onExportReadyChange } = props;
+  const resolvedFileUrl = useMemo(() => normalizeProxyableUrl(file), [file]);
+  const [loading, setLoading] = useState(false);
+  const [fileData, setFileData] = useState<ArrayBuffer | null>(null);
+  const [meta, setMeta] = useState<Record<string, unknown> | null>(null);
+  const [content, setContent] = useState<string | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [mediaObjectUrl, setMediaObjectUrl] = useState("");
+  const [textSelectionAction, setTextSelectionAction] = useState<{ text: string; left: number; top: number } | null>(null);
+  const [paragraphSelections, setParagraphSelections] = useState<PdfTextSelection[]>([]);
+
+  useEffect(()=>{if(props.paragraphSelectionMode){setTextSelectionAction(null);setParagraphSelections([])}},[props.paragraphSelectionMode]);
+
+  useEffect(() => {
+    if (!segment) {
+      setMeta(null);
+      setContent(null);
+      return;
+    }
+    if (segment?.meta) {
+      try {
+        const parsedMeta = JSON.parse(segment.meta);
+        setMeta(parsedMeta);
+      } catch {
+        const uiMessage = localizeErrorCode("2000509");
+        message.error(uiMessage);
+        setMeta(null);
+      }
+    } else {
+      setMeta(null);
+    }
+
+    if (segment?.content) {
+      setContent(segment.content);
+    } else {
+      setContent(null);
+    }
+  }, [segment?.meta, segment?.content]);
+
+  const fileSuffix = useMemo(() => {
+    const suffixFromUrl = FileUtils.getFileTypeFromURI(resolvedFileUrl || (file as string));
+    const suffixFromName = FileUtils.getFileTypeFromURI(props.fileName || "");
+    return suffixFromUrl || suffixFromName;
+  }, [file, props.fileName, resolvedFileUrl]);
+
+  const fileType = useMemo(() => {
+    if (["md", "markdown"].includes(fileSuffix)) {
+      return "markdown";
+    }
+    if (["txt", "json", "log", "csv"].includes(fileSuffix)) {
+      return "text";
+    }
+    if (["html", "xml", "svg"].includes(fileSuffix)) {
+      return "html";
+    }
+    if (["pdf"].includes(fileSuffix)) {
+      return "pdf";
+    }
+    if (["pptx", "ppt", "pptm"].includes(fileSuffix)) {
+      return "pptx";
+    }
+    if (["docx", "doc"].includes(fileSuffix)) {
+      return "docx";
+    }
+    if (["xlsx", "xls"].includes(fileSuffix)) {
+      return "excel";
+    }
+    if (IMAGE_FILE_TYPES.includes(fileSuffix)) {
+      return "image";
+    }
+    if (VIDEO_FILE_TYPES.includes(fileSuffix)) {
+      return "video";
+    }
+    if (AUDIO_FILE_TYPES.includes(fileSuffix)) {
+      return "audio";
+    }
+    return "unknown";
+  }, [fileSuffix]);
+
+  const handlePreviewSelection = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    if (props.paragraphSelectionMode) {
+      const selection=window.getSelection();
+      const text=selection?.toString().trim()||"";
+      if(!selection||selection.isCollapsed||!text)return;
+      const anchor=selection.anchorNode instanceof Element?selection.anchorNode:selection.anchorNode?.parentElement;
+      const pageElement=anchor?.closest<HTMLElement>("[data-pdf-page-index]");
+      const page=Number(pageElement?.dataset.pdfPageIndex??0)+1;
+      const selectionRect=selection.getRangeAt(0).getBoundingClientRect();
+      const pageRect=pageElement?.getBoundingClientRect();
+      const bbox:PdfTextSelection["bbox"]=pageRect?[selectionRect.left-pageRect.left,selectionRect.top-pageRect.top,selectionRect.right-pageRect.left,selectionRect.bottom-pageRect.top]:undefined;
+      const next={text,context:text,page,bbox};
+      setParagraphSelections(current=>{
+        if(current.some(item=>paragraphSelectionsOverlap(item,next))){message.warning(t("learning.paragraphSelectionOverlap"));return current}
+        return [...current,next];
+      });
+      selection.removeAllRanges();
+      return;
+    }
+    if (fileType === "pdf" || !props.onPdfTranslateSelection) return;
+    const selection = window.getSelection();
+    const text = selection?.toString().trim() || "";
+    if (!selection || selection.isCollapsed || !text) {
+      setTextSelectionAction(null);
+      return;
+    }
+    const container = event.currentTarget;
+    if (!container.contains(selection.anchorNode) || !container.contains(selection.focusNode)) return;
+    const rect = container.getBoundingClientRect();
+    setTextSelectionAction({
+      text,
+      left: Math.min(Math.max(event.clientX - rect.left, 52), rect.width - 52),
+      top: Math.max(event.clientY - rect.top - 42, 8),
+    });
+  }, [fileType, props.onPdfTranslateSelection, props.paragraphSelectionMode, t]);
+
+  const getFileData = useCallback(
+    async (
+      fileInput: string | ArrayBuffer | File | Blob,
+    ): Promise<ArrayBuffer> => {
+      try {
+        if (fileInput instanceof ArrayBuffer) {
+          return Promise.resolve(fileInput);
+        }
+        if (fileInput instanceof File || fileInput instanceof Blob) {
+          return await fileInput.arrayBuffer();
+        }
+        if (typeof fileInput === "string") {
+          const authHeaders = AgentAppsAuth.getAuthHeaders();
+          const headers = new Headers();
+
+          Object.entries(authHeaders).forEach(([key, value]) => {
+            if (value) {
+              headers.set(key, value);
+            }
+          });
+
+          const response = await fetch(fileInput, {
+            headers: headers.keys().next().done ? undefined : headers,
+            signal: FileUtils.timeoutSignal(5 * 60 * 1000),
+          });
+          if (!response.ok) {
+            throw new Error(localizeErrorCode("2000509"));
+          }
+          return await response.arrayBuffer();
+        }
+        throw new Error("Unsupported file input type");
+      } catch (err) {
+        throw new Error(localizeErrorCode("2000509"));
+      }
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (!resolvedFileUrl) {
+      setFileData(null);
+      setPreviewError(null);
+      return;
+    }
+    setLoading(true);
+    setPreviewError(null);
+    getFileData(resolvedFileUrl as string | ArrayBuffer | File | Blob)
+      .then((data) => {
+        setFileData(data);
+        setLoading(false);
+      })
+      .catch(() => {
+        const uiMessage = localizeErrorCode("2000509");
+        message.error(uiMessage);
+        setPreviewError(uiMessage);
+        setLoading(false);
+        setFileData(null);
+      });
+  }, [resolvedFileUrl, getFileData]);
+
+  useEffect(() => {
+    if (!fileData || (fileType !== "image" && fileType !== "video" && fileType !== "audio")) {
+      setMediaObjectUrl("");
+      return;
+    }
+
+    const objectUrl = URL.createObjectURL(
+      new Blob([fileData], {
+        type: MEDIA_MIME_TYPES[fileSuffix] || undefined,
+      }),
+    );
+    setMediaObjectUrl(objectUrl);
+
+    return () => {
+      URL.revokeObjectURL(objectUrl);
+    };
+  }, [fileData, fileSuffix, fileType]);
+
+  const renderLoading = useMemo(() => {
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-2">
+        <Spin spinning={loading} />
+        <p className="text-gray-500">{t("knowledge.dataLoading")}</p>
+      </div>
+    );
+  }, [loading]);
+
+  const renderEmpty = useMemo(() => {
+    return <Empty description={previewError || t("common.noData")} />;
+  }, [previewError]);
+
+  // pdf.js transfers/detaches the buffer it receives; keep a dedicated copy for preview.
+  const pdfPreviewData = useMemo(() => {
+    if (!fileData || fileType !== "pdf") {
+      return null;
+    }
+    try {
+      const copy = new ArrayBuffer(fileData.byteLength);
+      new Uint8Array(copy).set(new Uint8Array(fileData));
+      return copy;
+    } catch {
+      return null;
+    }
+  }, [fileData, fileType]);
+
+  const renderFile = useMemo(() => {
+    if (!fileData) {
+      return null;
+    }
+    switch (fileType) {
+      case "markdown":
+        return <RenderMarkdown fileData={fileData} />;
+      case "text":
+        return <RenderTxt fileData={fileData} content={content} />;
+      case "html":
+        return <RenderHtml fileData={fileData} content={content} />;
+      case "pdf":
+        return pdfPreviewData ? (
+          <RenderPdf
+            className="scroll-container"
+            style={{
+              height: "100%",
+            }}
+            fileData={pdfPreviewData}
+            metadata={meta}
+            content={content}
+            onAskSelection={props.onPdfSelection}
+            askSelectionLabel={t("knowledge.askPdfSelection")}
+            onTranslateSelection={props.onPdfTranslateSelection}
+            onAddVocabularySelection={props.onAddVocabularySelection}
+            addVocabularySelectionLabel={t("learning.addToCollection")}
+            translateSelectionLabel={t("knowledge.translateSelection")}
+            translateSelectionDisabled={!props.translationConfigured}
+            translateSelectionDisabledTip={t("knowledge.translationConfigureTip")}
+            translateSelectionConfigureLabel={t("knowledge.translationConfigureAction")}
+            translateSelectionConfigureUrl="/settings?section=knowledge&tool=translation"
+            learningSelectionActions={props.learningSelectionActions}
+            onLearningSelection={props.onLearningSelection}
+          />
+        ) : null;
+      case "docx":
+        return (
+          <RenderWord
+            fileData={fileData}
+            content={content}
+          />
+        );
+      case "excel":
+        return (
+          <RenderExcel
+            fileData={fileData}
+            fileType={fileType}
+            metadata={meta}
+            content={content}
+          />
+        );
+      case "pptx":
+        return <RenderPpt fileData={fileData} />;
+      case "image":
+        return mediaObjectUrl ? (
+          <div className="file-viewer-media-container">
+            <img
+              alt={props.fileName}
+              className="file-viewer-media file-viewer-image"
+              src={mediaObjectUrl}
+            />
+          </div>
+        ) : null;
+      case "video":
+        return mediaObjectUrl ? (
+          <div className="file-viewer-media-container">
+            <video
+              className="file-viewer-media file-viewer-video"
+              controls
+              preload="metadata"
+              src={mediaObjectUrl}
+              title={props.fileName}
+            />
+          </div>
+        ) : null;
+      case "audio":
+        return mediaObjectUrl ? (
+          <div className="file-viewer-media-container">
+            <audio
+              className="file-viewer-media file-viewer-audio"
+              controls
+              preload="metadata"
+              src={mediaObjectUrl}
+              title={props.fileName}
+            />
+          </div>
+        ) : null;
+      case "unknown":
+      default:
+        return (
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "center",
+              alignItems: "center",
+              height: "200px",
+              color: "#ff4d4f",
+              fontSize: "14px",
+            }}
+          >
+            {t("knowledge.previewUnsupported")}
+          </div>
+        );
+      }
+  }, [
+    content,
+    fileData,
+    fileType,
+    mediaObjectUrl,
+    meta,
+    pdfPreviewData,
+    props.fileName,
+    props.onPdfSelection,
+    props.onPdfTranslateSelection,
+    props.translationConfigured,
+    t,
+  ]);
+
+  const canExportImagePdf =
+    fileType === "pdf" && !!fileData && !loading && !previewError;
+
+  useEffect(() => {
+    onExportReadyChange?.(canExportImagePdf);
+    return () => {
+      onExportReadyChange?.(false);
+    };
+  }, [canExportImagePdf, onExportReadyChange]);
+
+  const exportImagePdf = useCallback(async () => {
+    if (!fileData || fileType !== "pdf") {
+      throw new Error("PDF is not ready for export");
+    }
+    const authHeaders = AgentAppsAuth.getAuthHeaders();
+    const headers = new Headers();
+    Object.entries(authHeaders).forEach(([key, value]) => {
+      if (value) {
+        headers.set(key, value);
+      }
+    });
+    await exportPdfAsImagePdf(fileData, {
+      fileName: props.fileName,
+      fetchUrl: resolvedFileUrl || undefined,
+      fetchHeaders: headers.keys().next().done ? undefined : headers,
+    });
+  }, [fileData, fileType, props.fileName, resolvedFileUrl]);
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      exportImagePdf,
+    }),
+    [exportImagePdf],
+  );
+
+  return (
+    <div className={`file-viewer-container${props.paragraphSelectionMode?" is-paragraph-selecting":""}`}>
+      {props.paragraphSelectionMode?<div className="file-viewer-paragraph-selection-panel"><div className="file-viewer-paragraph-selection-bar"><span>{t("learning.paragraphSelectionInstruction")}</span><strong>{t("learning.paragraphSelectionCount",{count:paragraphSelections.length})}</strong>{paragraphSelections.length?<button type="button" onClick={()=>setParagraphSelections([])}>{t("learning.clearParagraphSelections")}</button>:null}<button type="button" onClick={props.onParagraphSelectionCancel}>{t("learning.exitParagraphSelection")}</button><button type="button" disabled={!paragraphSelections.length} onClick={()=>props.onParagraphSelectionConfirm?.(paragraphSelections)}>{t("common.confirm")}</button></div>{paragraphSelections.length?<div className="file-viewer-paragraph-selection-list">{paragraphSelections.map((item,index)=><div key={`${item.page}-${item.text}-${index}`} title={item.text}><span>{index+1}. {item.text}</span><button type="button" aria-label={t("learning.removeSelectedParagraph",{index:index+1})} onClick={()=>setParagraphSelections(current=>current.filter((_,currentIndex)=>currentIndex!==index))}>×</button></div>)}</div>:null}</div>:null}
+      <div className="file-viewer-content" onMouseUp={handlePreviewSelection}>
+        {textSelectionAction&&!props.paragraphSelectionMode ? (
+          <span
+            className="file-viewer-selection-translate-wrap"
+            style={{ left: textSelectionAction.left, top: textSelectionAction.top }}
+            title={!props.translationConfigured&&!isSingleEnglishWord(textSelectionAction.text) ? t("knowledge.translationConfigureTip") : undefined}
+          >
+            <button
+              type="button"
+              className="file-viewer-selection-translate"
+              disabled={!props.translationConfigured&&!isSingleEnglishWord(textSelectionAction.text)}
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => {
+                props.onPdfTranslateSelection?.({ text: textSelectionAction.text, page: 1 });
+                window.getSelection()?.removeAllRanges();
+                setTextSelectionAction(null);
+              }}
+            >
+              {t("knowledge.translateSelection")}
+            </button>
+            {props.onAddVocabularySelection && isSingleEnglishWord(textSelectionAction.text) ? <button
+              type="button"
+              className="file-viewer-selection-translate"
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={(event) => {
+                props.onAddVocabularySelection?.({
+                  text: textSelectionAction.text,
+                  page: 1,
+                  context: event.currentTarget.closest(".file-viewer")?.textContent?.trim() || textSelectionAction.text,
+                });
+                window.getSelection()?.removeAllRanges();
+                setTextSelectionAction(null);
+              }}
+            >{t("learning.addToCollection")}</button> : null}
+            {props.learningSelectionActions?.filter((action) => isLearningActionCompatible(action, textSelectionAction.text)).map((action) => <button
+              key={action.key}
+              type="button"
+              className="file-viewer-selection-translate"
+              disabled={action.disabled}
+              title={action.disabled ? action.disabledTip : undefined}
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={(event) => {
+                props.onLearningSelection?.(action.key, {
+                  text: textSelectionAction.text,
+                  page: 1,
+                  context: event.currentTarget.closest(".file-viewer")?.textContent?.trim() || textSelectionAction.text,
+                });
+                window.getSelection()?.removeAllRanges();
+                setTextSelectionAction(null);
+              }}
+            >{action.label}</button>)}
+          </span>
+        ) : null}
+        {loading && renderLoading}
+        {!loading && !fileData && renderEmpty}
+        {!loading && fileData && renderFile}
+      </div>
+    </div>
+  );
+});
+
+FileViewer.displayName = "FileViewer";
+
+export default FileViewer;

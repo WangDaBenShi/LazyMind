@@ -1,0 +1,1093 @@
+import { FC, type ReactNode, useRef, useState, useEffect, useCallback, useMemo } from "react";
+import { useTranslation } from "react-i18next";
+import { localizeErrorCode } from "@/components/request";
+import { Alert, Badge, Button, message, Space } from "antd";
+import { useLocation } from "react-router-dom";
+import { AgentAppsAuth } from "@/components/auth";
+import type { ConversationForkCapability } from "@/api/generated/core-client";
+import { CONVERSATION_TITLE_CHANGED_EVENT, type ConversationTitleChangedDetail } from "@/modules/chat/constants/chat";
+import ForkStatus from "@/modules/chat/components/ForkConversation/ForkStatus";
+import { useForkConversation } from "@/modules/chat/components/ForkConversation/useForkConversation";
+import type { ThinkingDepth } from "@/modules/chat/store/chatThink";
+import { MessageOutlined, UnorderedListOutlined } from "@ant-design/icons";
+import { v4 as uuidv4 } from "uuid";
+import {
+  ChatConversationsRequestActionEnum,
+  Query,
+} from "@/api/generated/chatbot-client";
+
+import ChatContainerComponent, {
+  ChatImperativeProps,
+} from "@/modules/chat/components/newChatContainer";
+import "./index.scss";
+import ChatContextPanel, { type SourceRequest } from "@/modules/chat/components/ChatContextPanel";
+import UIUtils from "@/modules/chat/utils/ui";
+import InitialCard from "@/modules/chat/components/InitialCard";
+import { ChatConfig } from "@/modules/chat/components/ChatConfigs";
+import { createChatStream } from "@/modules/chat/utils/chatStream";
+import {
+  CHAT_RESUME_STREAM_URL,
+  CHAT_STREAM_URL,
+  ChatServiceApi,
+  parseConversationRuntimeSettings,
+  resolveConversationThinkingDepth,
+  type ConversationRuntimeSettings,
+} from "@/modules/chat/utils/request";
+import {
+  draftStore,
+  buildWorkflowSearchConfig,
+  filterWorkflowTabs,
+  useWorkflowStore,
+} from "@/modules/chat/store/workflowPanel";
+import { useChatMessageStore } from "@/modules/chat/store/chatMessage";
+import {
+  DEVELOPER_ACTIVE_EVENT,
+  isDeveloperModeActive,
+} from "@/utils/developerMode";
+import { allowedUploadTypes } from "@/modules/chat/components/ImageUpload";
+import {
+  CHAT_CONVERSATION_LIST_REFRESH_EVENT,
+  CHAT_PENDING_CONVERSATION_GROUP_KEY,
+  CHAT_SELECT_CONVERSATION_EVENT,
+  WORKFLOW_PANEL_EXPANDED_EVENT,
+  WORKFLOW_PANEL_EXPANDED_STORAGE_PREFIX,
+} from "@/modules/chat/constants/chat";
+import { buildChatMessageListFromHistory } from "@/modules/chat/utils/message";
+import { buildEnvironmentContext } from "@/modules/chat/utils/environment";
+import TaskCenter from "@/modules/chat/components/TaskCenter";
+import { taskCenterDisplayCount } from "@/modules/chat/components/TaskCenter/taskTimeline";
+import { useTaskCenterStore } from "@/modules/chat/store/taskCenter";
+import type { SubAgentTask } from "@/modules/chat/store/taskCenter";
+import { useChatInputStore } from "@/modules/chat/store/chatInput";
+import { useChatThinkStore } from "@/modules/chat/store/chatThink";
+import ConversationRelationBanner from "@/modules/chat/components/ConversationRelationBanner";
+import {
+  type SideChatConversation,
+  type SideChatSource,
+} from "@/modules/chat/components/SideChatPanel";
+import {
+  CONVERSATION_RELATION_SIDECHAT,
+  getConversationRelation,
+  type ConversationRelation,
+} from "@/modules/chat/utils/conversationRelation";
+import {
+  NEW_CHAT_MODEL_SELECTION_KEY,
+  toChatModelSelectionRequest,
+  useModelSelectionStore,
+  type ChatModelSelectionRequest,
+} from "@/modules/chat/store/modelSelection";
+
+// Stable empty reference to avoid returning a fresh array from the zustand
+// selector on every render, which (with useSyncExternalStore) would trigger an
+// infinite re-render loop (React error #185).
+const EMPTY_TASKS: SubAgentTask[] = [];
+const CONVERSATION_HISTORY_RETRY_DELAYS_MS = [0, 500, 1500];
+
+async function loadConversationHistory(conversationId: string, anchorHistoryId?: string) {
+  let lastError: unknown;
+  for (const delayMs of CONVERSATION_HISTORY_RETRY_DELAYS_MS) {
+    if (delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    try {
+      return await ChatServiceApi()
+        .conversationServiceGetConversationHistory({
+          name: conversationId,
+          anchorHistoryId,
+        });
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError;
+}
+
+interface IChatLayoutProps {
+  conversationId?: string;
+  setIsChatContent: (isChatContent: boolean) => void;
+  initchatConfig: ChatConfig;
+  setChatConfigFn: (val: ChatConfig) => void;
+  canChat: boolean;
+  embeddingReady?: boolean | null;
+  multimodalEmbeddingReady?: boolean | null;
+  rerankReady?: boolean | null;
+  chatDisabledReason?: string;
+  chatDisabledDescription?: ReactNode;
+  chatDisabledAction?: ReactNode;
+  /** Workflow settings selected on the welcome screen before the first message is sent. */
+  initPendingConversationSettings?: ConversationRuntimeSettings | null;
+}
+
+const ChatLayout: FC<IChatLayoutProps> = (props) => {
+  const { t, i18n } = useTranslation();
+  const {
+    conversationId: routeConversationId,
+    setIsChatContent,
+    initchatConfig,
+    setChatConfigFn,
+    canChat,
+    embeddingReady,
+    multimodalEmbeddingReady,
+    rerankReady,
+    chatDisabledReason,
+    chatDisabledDescription,
+    chatDisabledAction,
+    initPendingConversationSettings,
+  } = props;
+  const [sessionId, setSessionId] = useState("");
+  const fork = useForkConversation(routeConversationId || sessionId);
+  const location = useLocation();
+  const anchorHistoryId = new URLSearchParams(location.search).get("anchor_history_id") || undefined;
+  const [forkSupported, setForkSupported] = useState(false);
+  const forkMetadataId = useRef("");
+  const [forkThinkingDepth, setForkThinkingDepth] = useState<ThinkingDepth>();
+  const [loadError, setLoadError] = useState(false);
+  const [historyWindow, setHistoryWindow] = useState({ older: "", newer: "" });
+  const [windowLoading, setWindowLoading] = useState(false);
+  const windowRequestRef = useRef(0);
+
+  const [chatConfig, setChatConfig] = useState<ChatConfig>(
+    initchatConfig || {},
+  );
+  // Pending workflow settings from the chat config popover before a conversation is created.
+  // Initialised from the welcome-screen selection when provided.
+  const pendingConversationSettingsRef = useRef<ConversationRuntimeSettings | null>(
+    initPendingConversationSettings ?? null,
+  );
+  // Workflow settings loaded from conversation detail (for existing conversations).
+  const [conversationSettings, setConversationSettings] = useState<ConversationRuntimeSettings | undefined>(undefined);
+  const [conversationRelation, setConversationRelation] =
+    useState<ConversationRelation | null>(null);
+  useEffect(() => {
+    const renamed = (event: Event) => {
+      const { conversationId, displayName } = (event as CustomEvent<ConversationTitleChangedDetail>).detail;
+      setConversationRelation(current => current?.parentConversationId === conversationId
+        ? { ...current, parentDisplayName: displayName } : current);
+    };
+    window.addEventListener(CONVERSATION_TITLE_CHANGED_EVENT, renamed);
+    return () => window.removeEventListener(CONVERSATION_TITLE_CHANGED_EVENT, renamed);
+  }, []);
+  const [sideChats, setSideChats] = useState<Record<string, SideChatSource>>({});
+  const [sourceRequests, setSourceRequests] = useState<Record<string, SourceRequest>>({});
+  const [contextPanelStates, setContextPanelStates] = useState<Record<string, { collapsed: boolean; unread: boolean }>>({});
+  const [contextResumeRequests, setContextResumeRequests] = useState<Record<string, number>>({});
+  const [knowledgeRefreshKey, setKnowledgeRefreshKey] = useState(0);
+  const [isTaskPanelCollapsed, setIsTaskPanelCollapsed] = useState(false);
+  const [panelWidth, setPanelWidth] = useState<number>(0); // 0 = use CSS default
+  const [workflowPanelExpanded, setWorkflowPanelExpanded] = useState(false);
+  const [expandedRailTab, setExpandedRailTab] = useState<"chat" | "tasks">("chat");
+  const [developerModeActive, setDeveloperModeActiveState] = useState(
+    isDeveloperModeActive,
+  );
+
+  useEffect(() => {
+    const handleDeveloperModeChange = (event: Event) => {
+      const detail = (event as CustomEvent<{ active?: boolean }>).detail;
+      setDeveloperModeActiveState(
+        typeof detail?.active === "boolean"
+          ? detail.active
+          : isDeveloperModeActive(),
+      );
+    };
+    window.addEventListener(DEVELOPER_ACTIVE_EVENT, handleDeveloperModeChange);
+    return () => {
+      window.removeEventListener(DEVELOPER_ACTIVE_EVENT, handleDeveloperModeChange);
+    };
+  }, []);
+
+  useEffect(() => {
+    let restoredExpanded = false;
+    try {
+      restoredExpanded = localStorage.getItem(
+        `${WORKFLOW_PANEL_EXPANDED_STORAGE_PREFIX}${sessionId}`,
+      ) === "true";
+    } catch {
+      // Keep the default compact layout when browser storage is unavailable.
+    }
+    setWorkflowPanelExpanded(restoredExpanded);
+    if (restoredExpanded) setExpandedRailTab("chat");
+
+    const handleExpandedChange = (event: Event) => {
+      const detail = (event as CustomEvent<{ conversationId: string; expanded: boolean }>).detail;
+      if (detail.conversationId === sessionId) {
+        setWorkflowPanelExpanded(detail.expanded);
+        if (detail.expanded) setExpandedRailTab("chat");
+      }
+    };
+    window.addEventListener(WORKFLOW_PANEL_EXPANDED_EVENT, handleExpandedChange);
+    return () => window.removeEventListener(WORKFLOW_PANEL_EXPANDED_EVENT, handleExpandedChange);
+  }, [sessionId]);
+
+  // Keep pending settings in sync with the welcome screen while no conversation is active.
+  useEffect(() => {
+    if (!sessionId) {
+      pendingConversationSettingsRef.current = initPendingConversationSettings ?? null;
+    }
+  }, [initPendingConversationSettings, sessionId]);
+
+  // Load persisted workflow settings once a real conversation id is available.
+  useEffect(() => {
+    if (sessionId && forkMetadataId.current === sessionId) return;
+    setForkSupported(false);
+    if (!sessionId || sessionId.startsWith('temp_')) {
+      setConversationRelation(null);
+      if (!sessionId) {
+        setConversationSettings(undefined);
+      }
+      return;
+    }
+    let cancelled = false;
+    ChatServiceApi()
+      .conversationServiceGetConversationDetail({ conversation: sessionId })
+      .then((detailRes) => {
+        if (cancelled) {
+          return;
+        }
+        setForkSupported(Boolean((detailRes.data.conversation as { fork_capability?: ConversationForkCapability })?.fork_capability?.supported));
+        setConversationSettings(
+          parseConversationRuntimeSettings(detailRes.data.conversation),
+        );
+        setConversationRelation(
+          getConversationRelation(detailRes.data.conversation),
+        );
+        const depth = resolveConversationThinkingDepth(detailRes.data.conversation);
+        if (getConversationRelation(detailRes.data.conversation)?.relationType === "fork") {
+          setForkThinkingDepth(depth);
+        } else {
+          useChatThinkStore.getState().setThinkingDepth(depth);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId]);
+  const panelDragRef = useRef<{ startX: number; startW: number } | null>(null);
+
+  const onPanelResizeStart = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    const panel = (e.currentTarget as HTMLElement).parentElement;
+    if (!panel) return;
+    panelDragRef.current = { startX: e.clientX, startW: panel.offsetWidth };
+    const onMove = (me: MouseEvent) => {
+      if (!panelDragRef.current) return;
+      const delta = panelDragRef.current.startX - me.clientX;
+      const next = Math.max(260, Math.min(700, panelDragRef.current.startW + delta));
+      setPanelWidth(next);
+    };
+    const onUp = () => {
+      panelDragRef.current = null;
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }, []);
+  const [isRestoringConversation, setIsRestoringConversation] = useState(
+    Boolean(routeConversationId),
+  );
+
+  const { pendingMessage, clearPendingMessage } = useChatMessageStore();
+  const pendingInitialModelSelectionRef =
+    useRef<ChatModelSelectionRequest | null>(null);
+  const pendingClientConversationIdRef = useRef("");
+
+  const chatRef = useRef<ChatImperativeProps>(null);
+  const sideChatReturnFocusRef = useRef<HTMLElement | null>(null);
+  const loadConversationRequestRef = useRef(0);
+
+  const autoRunning = useWorkflowStore((s) =>
+    sessionId ? (s.autoRunningByConversation[sessionId] ?? false) : false,
+  );
+  const workflowSession = useWorkflowStore((s) =>
+    sessionId ? s.sessionByConversation[sessionId] ?? null : null,
+  );
+  const workflowLanguage = i18n.language || "";
+  const workflowUI = useWorkflowStore((s) => {
+    const workflowId = workflowSession?.workflow_id;
+    return workflowId
+      ? s.workflowUIByWorkflow[`${workflowId}:${workflowLanguage}`]
+      : undefined;
+  });
+  const fetchWorkflowUI = useWorkflowStore((s) => s.fetchWorkflowUI);
+  useEffect(() => {
+    if (!workflowSession?.workflow_id) return;
+    void fetchWorkflowUI(workflowSession.workflow_id);
+  }, [fetchWorkflowUI, workflowLanguage, workflowSession?.workflow_id]);
+  const workflowMilestoneCount = useMemo(() => {
+    // Completed sessions may legitimately end on an optional earlier branch;
+    // their persisted attempts are then the authoritative final total.
+    if (workflowSession?.status === "completed" || !workflowUI?.tabs?.length) {
+      return undefined;
+    }
+    const count = filterWorkflowTabs(
+      workflowUI.tabs,
+      workflowSession?.slots ?? [],
+      workflowUI.tab_visibility_ready_material,
+    ).length;
+    return count > 0 ? count : undefined;
+  }, [workflowSession?.slots, workflowSession?.status, workflowUI]);
+  const hasWorkflowSession = workflowSession !== null;
+  const workflowDefinitionChanged = useWorkflowStore((s) =>
+    sessionId
+      ? s.sessionByConversation[sessionId]?.runtime_error_code ===
+        "WORKFLOW_DEFINITION_CHANGED"
+      : false,
+  );
+  const chatEnabled = canChat && !workflowDefinitionChanged && !isRestoringConversation;
+
+  // When the user changes KB selection during an active workflow session, persist it on the
+  // conversation so analyze_subject KB prefetch inherits filters.kb_id.
+  const kbSyncInitializedRef = useRef(false);
+  useEffect(() => {
+    kbSyncInitializedRef.current = false;
+  }, [sessionId]);
+  useEffect(() => {
+    if (!sessionId || sessionId.startsWith('temp_')) {
+      return;
+    }
+    if (!kbSyncInitializedRef.current) {
+      kbSyncInitializedRef.current = true;
+      return;
+    }
+    const session = useWorkflowStore.getState().sessionByConversation[sessionId];
+    if (!session?.session_id) {
+      return;
+    }
+    if (session.status !== 'active' && session.status !== 'waiting') {
+      return;
+    }
+    const searchConfig = buildWorkflowSearchConfig(chatConfig);
+    void useWorkflowStore.getState().syncSessionSearchConfig(
+      sessionId,
+      session.session_id,
+      searchConfig,
+    );
+  }, [
+    sessionId,
+    hasWorkflowSession,
+    chatConfig?.knowledgeBaseId,
+    chatConfig?.creators,
+    chatConfig?.tags,
+  ]);
+
+  const tasks = useTaskCenterStore((s) =>
+    sessionId ? s.tasksByConversation[sessionId] ?? EMPTY_TASKS : EMPTY_TASKS,
+  );
+  const taskDataLoading = useTaskCenterStore((s) =>
+    sessionId ? Boolean(s._loadingTasks[sessionId]) : false,
+  );
+  const taskDataLoadError = useTaskCenterStore((s) =>
+    sessionId ? Boolean(s._taskLoadErrors[sessionId]) : false,
+  );
+  const taskDisplayCount = useMemo(
+    () =>
+      taskCenterDisplayCount(
+        tasks,
+        workflowSession?.steps,
+        developerModeActive,
+        workflowMilestoneCount,
+      ),
+    [
+      developerModeActive,
+      tasks,
+      workflowMilestoneCount,
+      workflowSession?.steps,
+    ],
+  );
+  const hasTaskPanelContent =
+    taskDisplayCount > 0 ||
+    taskDataLoadError ||
+    (hasWorkflowSession && taskDataLoading);
+  const refreshConversationExecution = useTaskCenterStore(
+    (s) => s.refreshConversationExecution,
+  );
+  const subscribeConvEvents = useTaskCenterStore((s) => s.subscribeConvEvents);
+  const unsubscribeConvEvents = useTaskCenterStore((s) => s.unsubscribeConvEvents);
+
+  useEffect(() => {
+    if (!sessionId) return;
+    subscribeConvEvents(sessionId);
+    void refreshConversationExecution(sessionId);
+    return () => {
+      unsubscribeConvEvents(sessionId);
+    };
+  }, [sessionId, refreshConversationExecution, subscribeConvEvents, unsubscribeConvEvents]);
+
+  // Auto-expand the task panel the first time visible task execution appears.
+  // The display count also covers hosted workflow attempts that have no SubAgent row.
+  const prevTaskDisplayCountRef = useRef(0);
+  useEffect(() => {
+    const prev = prevTaskDisplayCountRef.current;
+    prevTaskDisplayCountRef.current = taskDisplayCount;
+    if (prev === 0 && taskDisplayCount > 0) {
+      setIsTaskPanelCollapsed(false);
+    }
+  }, [taskDisplayCount]);
+
+  // Also auto-expand when a workflow session first appears (even with no tasks yet).
+  const prevHasWorkflowSessionRef = useRef(false);
+  useEffect(() => {
+    const prev = prevHasWorkflowSessionRef.current;
+    prevHasWorkflowSessionRef.current = hasWorkflowSession;
+    if (!prev && hasWorkflowSession && isDeveloperModeActive()) {
+      setIsTaskPanelCollapsed(false);
+    }
+  }, [hasWorkflowSession]);
+
+  const [isDragging, setIsDragging] = useState(false);
+  const dragCounterRef = useRef(0);
+
+  useEffect(() => {
+    setChatConfigFn(initchatConfig);
+    setChatConfig(initchatConfig);
+  }, [initchatConfig]);
+
+  useEffect(() => {
+    if (pendingMessage && chatEnabled) {
+      pendingInitialModelSelectionRef.current =
+        pendingMessage.initial_model_selection ?? null;
+      const timer = setTimeout(() => {
+        chatRef.current?.sendMessage(pendingMessage);
+        clearPendingMessage();
+      }, 100);
+
+      return () => clearTimeout(timer);
+    }
+    return undefined;
+  }, [pendingMessage, chatEnabled, clearPendingMessage]);
+
+  async function onOpenSSE(
+    input: Query[],
+    action: ChatConversationsRequestActionEnum,
+    callbacks: Record<string, (e: CustomEvent) => void>,
+    extras?: Record<string, unknown>,
+  ) {
+    const requestConversationId =
+      sessionId || pendingClientConversationIdRef.current || uuidv4();
+    const pendingGroupId = !sessionId
+      ? sessionStorage.getItem(CHAT_PENDING_CONVERSATION_GROUP_KEY)?.trim() || ""
+      : "";
+    if (!sessionId) {
+      pendingClientConversationIdRef.current = requestConversationId;
+      const prepareClientConversationId =
+        extras?.__prepareClientConversationId;
+      if (typeof prepareClientConversationId === "function") {
+        prepareClientConversationId(requestConversationId);
+      }
+    }
+    const initialModelSelection = !sessionId
+      ? pendingInitialModelSelectionRef.current ??
+        toChatModelSelectionRequest(
+          useModelSelectionStore.getState().selections[
+            NEW_CHAT_MODEL_SELECTION_KEY
+          ],
+        )
+      : undefined;
+    pendingInitialModelSelectionRef.current = null;
+    // Flush any pending slot drafts before sending so the AI sees the latest content.
+    // Draft keys use the workflow session_id (not the conversation_id), so pass the
+    // workflow session_id when one is active; fall back to conversationId otherwise.
+    const activeWorkflowSession = useWorkflowStore.getState().sessionByConversation[sessionId];
+    const draftSessionId = activeWorkflowSession?.session_id ?? sessionId;
+    await draftStore.flushAllDrafts(draftSessionId);
+
+    const hasUploadedFiles = input?.some(
+      (q: Query) => q.input_type === "image" || q.input_type === "file",
+    );
+    const hasWorkflowMention = Array.isArray(extras?.mentions) &&
+      extras.mentions.some(
+        (mention) => (mention as { type?: unknown })?.type === "workflow",
+      );
+    const configSnapshot = extras?.chat_config_snapshot as ChatConfig | undefined;
+    const effectiveChatConfig = configSnapshot ?? chatConfig;
+    if (configSnapshot) {
+      // Keep the newly mounted chat composer aligned with the exact selection
+      // used for this message; later workflow-session syncs must not overwrite
+      // the persisted request scope with an empty transition-state value.
+      setChatConfig(configSnapshot);
+      setChatConfigFn(configSnapshot);
+    }
+    const datasetList =
+      (hasUploadedFiles && !hasWorkflowMention) ||
+      !effectiveChatConfig?.knowledgeBaseId?.length
+        ? []
+        : effectiveChatConfig.knowledgeBaseId.map((k) => ({ id: k }));
+
+    // Attach active workflow session context so Go/Python can inject advance_step
+    // instead of cold-start trigger tools on follow-up messages.
+    const activeSession = useWorkflowStore.getState().sessionByConversation[sessionId];
+    const workflowContext =
+      activeSession?.status === "active" ||
+      activeSession?.status === "waiting" ||
+      activeSession?.status === "failed" ||
+      activeSession?.status === "completed"
+        ? {
+            session_id: activeSession.session_id,
+            workflow_id: activeSession.workflow_id,
+            current_step: activeSession.current_step_id,
+          }
+        : undefined;
+
+    // Attach focused_tab and focused_sort_order so the AI knows what the user is looking at.
+    const { focusedTabByConversation, focusedSortOrderByConversation } =
+      useWorkflowStore.getState();
+    const focusedTab = focusedTabByConversation[sessionId];
+    const focusedSortOrder = focusedSortOrderByConversation[sessionId];
+    const workflowUIState =
+      focusedTab || focusedSortOrder !== undefined
+        ? {
+            focused_tab: focusedTab,
+            focused_sort_order: focusedSortOrder,
+          }
+        : undefined;
+
+    // Collect pending artifact references from the chat input store.
+    const { getArtifactRefs, clearArtifactRefs } = useChatInputStore.getState();
+    const artifactRefs = getArtifactRefs(sessionId);
+    // Clear after reading so they are not repeated in the next message.
+    if (artifactRefs.length > 0) {
+      clearArtifactRefs(sessionId);
+    }
+
+    return createChatStream(
+      CHAT_STREAM_URL,
+      {
+        action,
+        conversation_id: requestConversationId,
+        conversation: {
+          search_config: {
+            dataset_list: datasetList,
+            database_ids: [effectiveChatConfig?.databaseBaseId]?.filter((id) => !!id),
+            creators: effectiveChatConfig?.creators,
+            tags: effectiveChatConfig?.tags,
+          },
+        },
+        ...(pendingGroupId ? { group_id: pendingGroupId } : {}),
+        models: [t("chat.lazyMindModel")],
+        thinking_depth:
+          extras?.thinking_depth ?? forkThinkingDepth ?? useChatThinkStore.getState().thinkingDepth,
+        // enable_thinking: think ? true : false,
+        stream: true,
+        input,
+        ...(conversationRelation?.relationType === "fork" ? {} : { mode: "auto" }),
+        create_time: new Date().toISOString(),
+        environment_context: buildEnvironmentContext(
+          i18n.resolvedLanguage || i18n.language,
+        ),
+        ...(workflowContext ? { workflow_context: workflowContext } : {}),
+        ...(workflowUIState ? { workflow_ui_state: workflowUIState } : {}),
+        ...(artifactRefs.length > 0 ? { artifact_refs: artifactRefs } : {}),
+        ...(extras?.run_in_background ? { run_in_background: true } : {}),
+        ...(initialModelSelection
+          ? { initial_model_selection: initialModelSelection }
+          : {}),
+        ...(Array.isArray(extras?.mentions) && extras.mentions.length > 0
+          ? { mentions: extras.mentions }
+          : {}),
+        ...(Array.isArray(extras?.cite_history_ids) && extras.cite_history_ids.length > 0
+          ? { cite_history_ids: extras.cite_history_ids }
+          : {}),
+        ...(extras?.ask_answers_structured
+          ? { ask_answers_structured: extras.ask_answers_structured }
+          : {}),
+        ...(typeof extras?.mail_draft_confirm_id === "string" && extras.mail_draft_confirm_id
+          ? { mail_draft_confirm_id: extras.mail_draft_confirm_id }
+          : {}),
+        ...(typeof extras?.mail_draft_confirm_revision === "number" &&
+        Number.isFinite(extras.mail_draft_confirm_revision) &&
+        extras.mail_draft_confirm_revision > 0
+          ? { mail_draft_confirm_revision: extras.mail_draft_confirm_revision }
+          : {}),
+        ...(extras?.mail_draft_patch &&
+        typeof extras.mail_draft_patch === "object" &&
+        !Array.isArray(extras.mail_draft_patch)
+          ? { mail_draft_patch: extras.mail_draft_patch }
+          : {}),
+        ...(typeof extras?.mail_mailbox_confirm === "string" && extras.mail_mailbox_confirm
+          ? { mail_mailbox_confirm: extras.mail_mailbox_confirm }
+          : {}),
+        ...(typeof extras?.mail_mailbox_confirm_draft_id === "string" &&
+        extras.mail_mailbox_confirm_draft_id
+          ? { mail_mailbox_confirm_draft_id: extras.mail_mailbox_confirm_draft_id }
+          : {}),
+        // If the user changed workflow settings before a conversation was created,
+        // carry them in the first request so Go can persist them on ensureConversation.
+        // Only send the three known fields to avoid polluting the payload with API response leftovers.
+        ...(() => {
+          const pending = pendingConversationSettingsRef.current;
+          if (!sessionId && pending) {
+            const clean: Record<string, unknown> = {};
+            if (pending.enable_workflow != null) clean.enable_workflow = pending.enable_workflow;
+            if (pending.enable_subagent != null) clean.enable_subagent = pending.enable_subagent;
+            if (pending.workflow_mode != null) clean.workflow_mode = pending.workflow_mode;
+            if (pending.chat_executor != null) clean.chat_executor = pending.chat_executor;
+            return { initial_conversation_settings: clean };
+          }
+          return {};
+        })(),
+      },
+      callbacks,
+    );
+  }
+
+  function onOpenResumeSSE(
+    conversationId: string,
+    callbacks: Record<string, (e: CustomEvent) => void>,
+    cursor?: { historyId?: string; afterSequence?: number },
+  ) {
+    return createChatStream(
+      CHAT_RESUME_STREAM_URL,
+      {
+        conversation_id: conversationId,
+        history_id: cursor?.historyId,
+        after_sequence: cursor?.afterSequence || undefined,
+      },
+      callbacks,
+    );
+  }
+
+  const sessionIdRef = useRef(sessionId);
+  sessionIdRef.current = sessionId;
+
+  const setConversationId = useCallback((id: string) => {
+    if (id === sessionIdRef.current) return;
+    pendingClientConversationIdRef.current = "";
+    sessionIdRef.current = id;
+    setSessionId(id);
+    sessionStorage.removeItem(CHAT_PENDING_CONVERSATION_GROUP_KEY);
+    window.dispatchEvent(
+      new CustomEvent(CHAT_SELECT_CONVERSATION_EVENT, {
+        detail: { conversationId: id, source: "chat" },
+      }),
+    );
+  }, []);
+
+  const handleOpenSideChat = useCallback((source: SideChatSource = {}) => {
+    if (!sessionIdRef.current) return;
+    sideChatReturnFocusRef.current =
+      document.activeElement instanceof HTMLElement &&
+      document.activeElement !== document.body
+        ? document.activeElement
+        : null;
+    setSideChats((current) => ({ ...current, [sessionIdRef.current]: source }));
+  }, []);
+
+  const handleSideChatRetained = useCallback(
+    (_conversation: SideChatConversation) => {
+      window.dispatchEvent(new Event(CHAT_CONVERSATION_LIST_REFRESH_EVENT));
+    },
+    [],
+  );
+
+  const handleConversationIdChange = useCallback(
+    (id: string) => {
+      const pendingId = pendingClientConversationIdRef.current;
+      if (pendingId && id !== pendingId) {
+        return;
+      }
+      setConversationId(id);
+    },
+    [setConversationId],
+  );
+
+  const loadConversation = useCallback(async (conversationId: string) => {
+    const requestId = ++loadConversationRequestRef.current;
+    setIsRestoringConversation(true);
+    setLoadError(false);
+    setWindowLoading(false);
+    setForkSupported(false);
+    setConversationRelation(null);
+    const owner = AgentAppsAuth.getUserInfo()?.userId;
+    windowRequestRef.current += 1;
+    try {
+      let isGenerating = false;
+      try {
+        const status = await ChatServiceApi().conversationServiceGetChatStatus({ conversationId });
+        isGenerating = !!status.data?.is_generating;
+      } catch {
+        isGenerating = false;
+      }
+      const [detailRes, historyRes] = await Promise.all([
+        ChatServiceApi().conversationServiceGetConversationDetail({ conversation: conversationId }),
+        loadConversationHistory(conversationId, anchorHistoryId),
+      ]);
+      if (requestId !== loadConversationRequestRef.current || owner !== AgentAppsAuth.getUserInfo()?.userId) return;
+      const conversation = detailRes.data.conversation;
+      const relation = getConversationRelation(conversation);
+      const depth = resolveConversationThinkingDepth(conversation);
+      setForkThinkingDepth(relation?.relationType === "fork" ? depth : undefined);
+      if (relation?.relationType !== "fork") useChatThinkStore.getState().setThinkingDepth(depth);
+      forkMetadataId.current = conversationId;
+      setForkSupported(Boolean((conversation as { fork_capability?: ConversationForkCapability })?.fork_capability?.supported));
+      setHistoryWindow({ older: historyRes.data.older_page_token || "", newer: historyRes.data.newer_page_token || "" });
+      const tempData = {
+        knowledgeBaseId: conversation?.search_config?.dataset_list
+          ?.map((dataset: any) => dataset.id)
+          .filter((id: string) => !!id),
+        creators: conversation?.search_config?.creators,
+        tags: conversation?.search_config?.tags,
+        databaseBaseId: conversation?.search_config?.database_ids?.[0],
+      };
+      setChatConfig(tempData);
+      setChatConfigFn(tempData);
+      setKnowledgeRefreshKey((key) => key + 1);
+      setConversationSettings(parseConversationRuntimeSettings(conversation));
+      setConversationRelation(getConversationRelation(conversation));
+      setConversationId(conversationId);
+
+      const list = buildChatMessageListFromHistory(historyRes.data.history, {
+        fallbackCreateTime: "xxx-xxx-xxx",
+        isGenerating,
+      });
+      if (anchorHistoryId) {
+        chatRef.current?.replaceMessageList(conversationId, list, true);
+      } else {
+        chatRef.current?.replaceMessageList(conversationId, list);
+      }
+      if (isGenerating && !anchorHistoryId) {
+        chatRef.current?.openResumeSSE?.(conversationId);
+      }
+    } catch {
+      if (requestId === loadConversationRequestRef.current) {
+        setLoadError(true);
+        message.error(localizeErrorCode("2000509"));
+      }
+    } finally {
+      if (requestId === loadConversationRequestRef.current) {
+        setIsRestoringConversation(false);
+      }
+    }
+  }, [setConversationId, setChatConfigFn, setIsChatContent, anchorHistoryId]);
+
+  // Route changes own conversation loading, including browser reload/back/forward.
+  useEffect(() => {
+    const conversationId = routeConversationId || "";
+    if (!conversationId) {
+      // The layout also mounts before the first conversation receives a real ID.
+      // Nothing needs clearing until a routed/active conversation actually exists.
+      if (!sessionIdRef.current) {
+        setIsRestoringConversation(false);
+        return;
+      }
+      loadConversationRequestRef.current += 1;
+      chatRef.current?.disconnectConversationStream?.(sessionIdRef.current);
+      sessionIdRef.current = "";
+      setSessionId("");
+      setIsRestoringConversation(false);
+      setConversationSettings(undefined);
+      setConversationRelation(null);
+      setForkThinkingDepth(undefined);
+      setHistoryWindow({ older: "", newer: "" });
+      setChatConfig({});
+      setChatConfigFn({});
+      chatRef.current?.createNewChat();
+      return;
+    }
+    if (conversationId === sessionIdRef.current && !anchorHistoryId) {
+      return;
+    }
+    if (sessionIdRef.current) {
+      chatRef.current?.disconnectConversationStream?.(sessionIdRef.current);
+      setConversationId(conversationId);
+      chatRef.current?.replaceMessageList(conversationId, []);
+    }
+    setIsChatContent(true);
+    void loadConversation(conversationId);
+    return () => {
+      loadConversationRequestRef.current += 1;
+      windowRequestRef.current += 1;
+    };
+  }, [loadConversation, routeConversationId, setChatConfigFn, setConversationId, setIsChatContent]);
+
+  useEffect(() => {
+    if (!anchorHistoryId || isRestoringConversation) return;
+    let timer: ReturnType<typeof setTimeout>;
+    const frame = requestAnimationFrame(() => {
+      const target = Array.from(document.querySelectorAll<HTMLElement>('[data-chat-role="assistant"]')).find((node) => node.dataset.chatHistoryId === anchorHistoryId);
+      if (!target) return;
+      target.scrollIntoView({ block: "center" });
+      target.classList.add("chat-fork-source-highlight");
+      timer = setTimeout(() => target.classList.remove("chat-fork-source-highlight"), 1800);
+    });
+    return () => { cancelAnimationFrame(frame); clearTimeout(timer); };
+  }, [anchorHistoryId, isRestoringConversation]);
+
+  async function loadWindowPage(direction: "older" | "newer") {
+    if (windowLoading || !historyWindow[direction]) return;
+    const request = ++windowRequestRef.current; const id = sessionId;
+    const owner = AgentAppsAuth.getUserInfo()?.userId;
+    setWindowLoading(true);
+    try {
+      const response = await ChatServiceApi().conversationServiceGetConversationHistory({ name: id, anchorPageToken: historyWindow[direction] });
+      if (request !== windowRequestRef.current || owner !== AgentAppsAuth.getUserInfo()?.userId) return;
+      setHistoryWindow((current) => ({ ...current, [direction]: response.data[`${direction}_page_token`] || "" }));
+      chatRef.current?.mergeHistoryPage(id, response.data.history || []);
+    } catch { if (request === windowRequestRef.current && owner === AgentAppsAuth.getUserInfo()?.userId) message.error(t("chat.fork.historyLoadFailed")); }
+    finally { if (request === windowRequestRef.current) setWindowLoading(false); }
+  }
+
+  function parseErrorData(data: string) {
+    const dataObject = UIUtils.jsonParser(data) || {};
+    return localizeErrorCode(
+      `${dataObject.error_code || dataObject.code || ""}`,
+      localizeErrorCode("2000509"),
+    );
+  }
+
+  const isFileTypeSupported = (file: File): boolean => {
+    const ext = file.name.substring(file.name.lastIndexOf(".")).toLowerCase();
+    return allowedUploadTypes.includes(ext);
+  };
+
+  const handleDragEnter = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!canChat) {
+      return;
+    }
+    // Ignore internal DOM drag-and-drop (e.g. workflow panel card sorting).
+    if (!Array.from(e.dataTransfer.types).includes('Files')) {
+      return;
+    }
+    dragCounterRef.current++;
+    if (e.dataTransfer.items && e.dataTransfer.items.length > 0) {
+      setIsDragging(true);
+    }
+  };
+
+  const handleDragLeave = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounterRef.current--;
+    if (dragCounterRef.current === 0) {
+      setIsDragging(false);
+    }
+  };
+
+  const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+  };
+
+  const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+    dragCounterRef.current = 0;
+
+    if (!canChat) {
+      if (chatDisabledReason) {
+        message.warning(chatDisabledReason);
+      }
+      return;
+    }
+
+    const files = Array.from(e.dataTransfer.files);
+
+    if (files.length === 0) {
+      return;
+    }
+
+    const unsupportedFiles = files.filter((file) => !isFileTypeSupported(file));
+
+    if (unsupportedFiles.length > 0) {
+      message.error(t("chat.unsupportedFileTypeDrag"));
+      return;
+    }
+
+    (chatRef.current as any)?.uploadFiles?.(files);
+  };
+
+  const isTaskPanelRestoreVisible =
+    !workflowPanelExpanded && hasTaskPanelContent && isTaskPanelCollapsed;
+  const isRetainedSidechat =
+    conversationRelation?.relationType === CONVERSATION_RELATION_SIDECHAT;
+  const canOpenSideChat =
+    canChat &&
+    Boolean(sessionId) &&
+    !isRestoringConversation &&
+    !conversationRelation;
+
+  return (
+    <div
+      className={`detail-container${workflowPanelExpanded ? " detail-container--workflow-expanded" : ""}`}
+      onDragEnter={handleDragEnter}
+      onDragLeave={handleDragLeave}
+      onDragOver={handleDragOver}
+      onDrop={handleDrop}
+    >
+      {}
+      {isDragging && (
+        <div className="drag-overlay">
+          <div className="drag-overlay-content">
+            <div className="drag-icon">📁</div>
+            <div className="drag-text">{t("chat.dragToUpload")}</div>
+            <div className="drag-hint">{t("chat.dragSupportedFormats")}</div>
+          </div>
+        </div>
+      )}
+      {workflowPanelExpanded && (
+        <div className="expanded-rail-tabs" role="tablist">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={expandedRailTab === "chat"}
+            className={expandedRailTab === "chat" ? "active" : ""}
+            onClick={() => setExpandedRailTab("chat")}
+          >
+            <MessageOutlined aria-hidden />
+            <span>{t("chat.workflowRailConversation")}</span>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={expandedRailTab === "tasks"}
+            className={expandedRailTab === "tasks" ? "active" : ""}
+            onClick={() => setExpandedRailTab("tasks")}
+          >
+            <UnorderedListOutlined aria-hidden />
+            <span>{t("taskCenter.panelTitle")}</span>
+            {taskDisplayCount > 0 && <span className="expanded-rail-tabs__count">{taskDisplayCount}</span>}
+          </button>
+        </div>
+      )}
+      <div className={`chat-conversation-pane${workflowPanelExpanded && expandedRailTab !== "chat" ? " chat-conversation-pane--hidden" : ""}${isTaskPanelRestoreVisible ? " chat-conversation-pane--task-restore-visible" : ""}`}>
+        <ForkStatus fork={fork} source={sessionId} />
+        <ConversationRelationBanner relation={conversationRelation} />
+        {loadError && <Alert type="error" message={t("chat.fork.historyLoadFailed")} action={<Button onClick={() => loadConversation(routeConversationId || sessionId)}>{t("chat.fork.retryRead")}</Button>} />}
+        {anchorHistoryId && (historyWindow.older || historyWindow.newer) && <Space style={{ marginBottom: 12 }}>
+          {historyWindow.older && <Button loading={windowLoading} onClick={() => loadWindowPage("older")}>{t("chat.fork.older")}</Button>}
+          {historyWindow.newer && <Button loading={windowLoading} onClick={() => loadWindowPage("newer")}>{t("chat.fork.newer")}</Button>}
+        </Space>}
+        <ChatContainerComponent
+          ref={chatRef}
+          canChat={chatEnabled && !(anchorHistoryId && historyWindow.newer)}
+          onFork={forkSupported ? fork.begin : undefined}
+          forkPending={fork.pending}
+          thinkingDepth={forkThinkingDepth}
+          onThinkingDepthChange={forkThinkingDepth ? setForkThinkingDepth : undefined}
+          initialCard={isRestoringConversation ? null : <InitialCard />}
+          sessionId={sessionId}
+          onOpenSSE={onOpenSSE}
+          onOpenResumeSSE={onOpenResumeSSE}
+          onConversationIdChange={handleConversationIdChange}
+          parseErrorData={parseErrorData}
+          showHistoryButton={false}
+          showConversationConfig={!isRetainedSidechat}
+          showSkillDeposit={!isRetainedSidechat}
+          allowKnowledgeBaseSelection={!isRetainedSidechat}
+          onOpenSideChat={canOpenSideChat ? handleOpenSideChat : undefined}
+          sideChatAction={sideChats[sessionId] && contextPanelStates[sessionId]?.collapsed ? (
+            <Badge dot={contextPanelStates[sessionId]?.unread}>
+              <Button type="text" size="small" icon={<MessageOutlined />}
+                onClick={() => setContextResumeRequests(current => ({ ...current, [sessionId]: (current[sessionId] || 0) + 1 }))}>
+                {t("chat.contextPanel.resumeSideChat")}
+              </Button>
+            </Badge>
+          ) : undefined}
+          onOpenSources={(sources, summary) => setSourceRequests(current => ({ ...current, [sessionId]: { sources, summary, origin: "main" } }))}
+          setIsChatContent={setIsChatContent}
+          chatConfig={chatConfig}
+          setChatConfig={setChatConfig}
+          setChatConfigFn={setChatConfigFn}
+          onConversationSettingsChange={(settings) => {
+            if (!sessionId) {
+              pendingConversationSettingsRef.current = settings;
+            } else {
+              setConversationSettings(settings);
+            }
+          }}
+          initialConversationSettings={conversationSettings}
+          hasWorkflowSession={hasWorkflowSession}
+          knowledgeRefreshKey={knowledgeRefreshKey}
+          embeddingReady={embeddingReady}
+          multimodalEmbeddingReady={multimodalEmbeddingReady}
+          rerankReady={rerankReady}
+          disabledReason={
+            workflowDefinitionChanged
+              ? t("chat.workflowDefinitionChanged")
+              : autoRunning
+                ? t("chat.autoAdvanceRunning")
+                : chatDisabledReason
+          }
+          disabledDescription={
+            autoRunning || workflowDefinitionChanged
+              ? undefined
+              : chatDisabledDescription
+          }
+          disabledAction={
+            autoRunning || workflowDefinitionChanged
+              ? undefined
+              : chatDisabledAction
+          }
+        />
+      </div>
+      {Array.from(new Set([...Object.keys(sideChats), ...Object.keys(sourceRequests)])).map(parentId => (
+        <ChatContextPanel key={parentId}
+          visible={parentId === sessionId && parentId === routeConversationId && !isRestoringConversation}
+          sourceRequest={sourceRequests[parentId]}
+          resumeRequest={contextResumeRequests[parentId]}
+          onStateChange={state => setContextPanelStates(current =>
+            current[parentId]?.collapsed === state.collapsed && current[parentId]?.unread === state.unread
+              ? current : { ...current, [parentId]: state })}
+          sideChat={sideChats[parentId] ? {
+            open: true,
+            visible: parentId === sessionId && parentId === routeConversationId && canOpenSideChat,
+            parentConversationId: parentId,
+            source: sideChats[parentId],
+            onClose: () => {
+              setSideChats((current) => {
+                const next = { ...current };
+                delete next[parentId];
+                return next;
+              });
+              if (!sideChatReturnFocusRef.current) {
+                requestAnimationFrame(() => chatRef.current?.focusInput?.());
+              }
+            },
+            onRetained: handleSideChatRetained,
+            canChat,
+            embeddingReady,
+            multimodalEmbeddingReady,
+            rerankReady,
+            returnFocusRef: sideChatReturnFocusRef,
+        } : undefined} />
+      ))}
+      {isTaskPanelRestoreVisible && (
+        <button
+          type="button"
+          className="task-panel-restore-btn"
+          onClick={() => setIsTaskPanelCollapsed(false)}
+          title={t("taskCenter.panelTitle")}
+          >
+            <span className="task-panel-restore-icon">&#8249;</span>
+            <span className="task-panel-restore-label">
+              {taskDisplayCount > 0
+              ? `${t("taskCenter.panelTitle")} (${taskDisplayCount})`
+              : t("taskCenter.panelTitle")}
+          </span>
+          </button>
+        )}
+        {((hasTaskPanelContent && !workflowPanelExpanded && !isTaskPanelCollapsed) || workflowPanelExpanded) && (
+        <div
+          className={`right-box${!developerModeActive && !workflowPanelExpanded ? " right-box--ordinary" : ""}${workflowPanelExpanded ? " right-box--expanded-tab" : ""}${workflowPanelExpanded && expandedRailTab !== "tasks" ? " right-box--tab-hidden" : ""}`}
+          style={!workflowPanelExpanded && panelWidth ? { width: panelWidth, minWidth: panelWidth } : undefined}
+          aria-hidden={workflowPanelExpanded && expandedRailTab !== "tasks"}
+        >
+          <div className="right-box-resize-handle" onMouseDown={onPanelResizeStart} />
+          <TaskCenter
+            sessionId={sessionId}
+            onClose={workflowPanelExpanded ? undefined : () => setIsTaskPanelCollapsed(true)}
+            showHeader={!workflowPanelExpanded}
+            developerMode={developerModeActive}
+            workflowSteps={workflowSession?.steps}
+            plannedCount={workflowMilestoneCount}
+          />
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default ChatLayout;
