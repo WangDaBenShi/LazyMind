@@ -885,6 +885,7 @@ func run(ctx context.Context) error {
 	// returns. asyncjob.Runner exposes Done() directly; the other Start funcs
 	// now return a done channel too.
 	var backgroundDone []<-chan struct{}
+	chat.RegisterTaskCenterEnvCleanup()
 	startBackgroundJobs := backgroundJobsEnabled()
 	var runner *asyncjob.Runner
 	if !startBackgroundJobs {
@@ -932,7 +933,6 @@ func run(ctx context.Context) error {
 
 	// Register plugin lifecycle hooks into the subagent EventHooks.
 	workflow.RegisterSubAgentHooks()
-	chat.RegisterTaskCenterEnvCleanup()
 	// Wire the conversation SSE hook so plugin events reach the frontend via the
 	// conversation-level events channel (history-independent real-time push).
 	subagent.EventHooks.RegisterConversationEventHook(
