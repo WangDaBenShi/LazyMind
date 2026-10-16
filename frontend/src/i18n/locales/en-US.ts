@@ -3674,6 +3674,7 @@ const enUS = {
   },
 
   taskCenter: {
+    ordinaryInitializing: "Initializing; waiting for subtasks",
     description: "Review items needing attention, task progress, and automation schedules",
     newTask: "New task",
     workbench: "Workbench",
