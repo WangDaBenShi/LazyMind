@@ -69,6 +69,7 @@ import {
   filterPresentCompositeItems,
   findAlignedCompositeRevision,
 } from './compositeArtifactLayout';
+import { WorkflowTrustNotice } from './WorkflowTrustNotice';
 import './WorkflowPanel.scss';
 
 const EMPTY_TASK_CENTER_TASKS: SubAgentTask[] = [];
@@ -2295,10 +2296,7 @@ export function WorkflowPanel({
 
       </div>
 
-      <div className='workflow-panel__trust-notice' role='note'>
-        <InfoCircleOutlined aria-hidden='true' />
-        <span>{t('chat.workflowFullTrustNotice')}</span>
-      </div>
+      <WorkflowTrustNotice />
 
       {!collapsed && externalPresentation && runningTasks.length > 0 && <div className='workflow-external-activity'>
         <div className='workflow-external-activity__text' role='status'>
