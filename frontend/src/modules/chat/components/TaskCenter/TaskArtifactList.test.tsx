@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PublicArtifact } from "@/modules/chat/types/ordinaryTask";
 import { TaskArtifactList } from "./TaskArtifactList";
 import { downloadArtifactFile } from "@/modules/chat/utils/artifactFileActions";
+import { ArtifactPreviewContext } from "../ArtifactPreview/context";
 
 vi.mock("@/modules/knowledge/components/FileViewer", () => ({ default: () => <div>File viewer</div> }));
 vi.mock("@/modules/chat/utils/artifactFileActions", () => ({ downloadArtifactFile: vi.fn() }));
@@ -15,6 +16,36 @@ const file = (overrides: Partial<PublicArtifact> = {}): PublicArtifact => ({
 afterEach(() => { cleanup(); vi.clearAllMocks(); });
 
 describe("ordinary stage artifacts", () => {
+  it("passes the producing workflow step with the exact artifact revision", () => {
+    const preview = { target: null, open: vi.fn(), close: vi.fn(), onVersions: undefined };
+    render(<ArtifactPreviewContext.Provider value={preview}>
+      <TaskArtifactList artifacts={[file({ revision: 2 })]} workflow={{ sessionId: 'session-1', stepId: 'prepare' }} />
+    </ArtifactPreviewContext.Provider>);
+    fireEvent.click(screen.getByRole('button', { name: 'taskCenter.ordinaryPreview Report.md' }));
+    expect(preview.open).toHaveBeenCalledWith(expect.objectContaining({
+      key: 'artifact-1:2', workflow: { sessionId: 'session-1', stepId: 'prepare' },
+    }));
+  });
+
+  it("keeps an explicit preview action when using the shared preview panel", async () => {
+    const preview = { target: null, open: vi.fn(), close: vi.fn(), onVersions: undefined };
+    render(<ArtifactPreviewContext.Provider value={preview}>
+      <TaskArtifactList artifacts={[file({ open_url: "/api/core/artifacts/report/open", download_url: "/api/core/artifacts/report/download", capabilities: { preview: true, open: true, download: true } })]} />
+    </ArtifactPreviewContext.Provider>);
+    fireEvent.click(screen.getByRole("button", { name: "taskCenter.ordinaryPreview Report.md" }));
+    expect(preview.open).toHaveBeenCalledWith(expect.objectContaining({
+      key: "artifact-1:1", filename: "Report.md", content: file().inline_content,
+    }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+    expect(downloadArtifactFile).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Report.md" }));
+    expect(preview.open).toHaveBeenCalledTimes(2);
+    fireEvent.click(screen.getByRole("button", { name: "taskCenter.download Report.md" }));
+    await waitFor(() => expect(downloadArtifactFile).toHaveBeenCalledWith("/api/core/artifacts/report/download", "Report.md"));
+    expect(preview.open).toHaveBeenCalledTimes(2);
+  });
+
   it("hides an empty collection and deduplicates repeated IDs", () => {
     const { rerender } = render(<TaskArtifactList artifacts={[]} />);
     expect(screen.queryByRole("region")).not.toBeInTheDocument();
@@ -42,11 +73,11 @@ describe("ordinary stage artifacts", () => {
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
     expect(screen.queryByRole("link")).not.toBeInTheDocument();
   });
-  it("routes signed static files through Core for opening and downloading", async () => {
+  it("routes signed static files through Core for downloading without an open action", async () => {
     const signed = "/static-files/workflow-artifacts/session/report.md?expires=4102444800&sig=test";
     render(<TaskArtifactList artifacts={[file({ inline_content: undefined, open_url: signed, download_url: signed, capabilities: { preview: false, open: true, download: true } })]} />);
     const expected = `/api/core${signed}`;
-    expect(screen.getByRole("link")).toHaveAttribute("href", expected);
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "taskCenter.download Report.md" }));
     await waitFor(() => expect(downloadArtifactFile).toHaveBeenCalledWith(expected, "Report.md"));
   });
