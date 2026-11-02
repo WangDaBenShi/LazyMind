@@ -2117,6 +2117,7 @@ export function MarkdownArtifactEditor({
                 }],
               }),
               imagePlugin({
+                disableImageSettingsButton: true,
                 imagePreviewHandler: resolveImageUrl ?? resolveMarkdownImageUrlAsync,
               }),
               writerImageDownloadPlugin({ onDownload: onDownloadImage }),

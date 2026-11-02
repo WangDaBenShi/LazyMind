@@ -55,6 +55,24 @@
     margin-bottom: 12px;
   }
 
+  > .ordinary-queue-durations {
+    display: grid;
+    gap: 4px;
+    padding: 8px 10px;
+    border: 1px solid #e6ecf3;
+    border-radius: 8px;
+    background: #f8fafc;
+    color: #657286;
+    font-size: 12px;
+    line-height: 1.5;
+    font-variant-numeric: tabular-nums;
+
+    time {
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+  }
+
   .task-filter-btn {
     display: inline-flex;
     align-items: center;
