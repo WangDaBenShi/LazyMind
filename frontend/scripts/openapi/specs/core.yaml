@@ -31925,6 +31925,13 @@ paths:
                   required: false
                   schema:
                     type: string
+                - in: query
+                  name: page
+                  required: false
+                  schema:
+                    description: One-based page number. Mutually exclusive with page_token.
+                    minimum: 1
+                    type: integer
             responses:
                 "200":
                     content:

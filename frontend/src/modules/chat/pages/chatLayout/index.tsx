@@ -73,6 +73,7 @@ import SideChatPanel, {
 } from "@/modules/chat/components/SideChatPanel";
 import {
   CONVERSATION_RELATION_SIDECHAT,
+  canStartSidechat,
   getConversationRelation,
   type ConversationRelation,
 } from "@/modules/chat/utils/conversationRelation";
@@ -994,7 +995,7 @@ const ChatLayout: FC<IChatLayoutProps> = (props) => {
     canChat &&
     Boolean(sessionId) &&
     !isRestoringConversation &&
-    !conversationRelation;
+    canStartSidechat(conversationRelation);
 
   return (
     <ArtifactPreviewContext.Provider value={artifactPreview}>

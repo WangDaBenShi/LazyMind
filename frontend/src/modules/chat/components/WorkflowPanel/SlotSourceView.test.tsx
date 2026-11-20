@@ -66,9 +66,10 @@ it('displays PPT prompt text literally even with a legacy Markdown descriptor', 
   } as SlotRevision;
   const { container } = render(<SlotRenderer slot={slot} readOnly widget={{ widgetType: 'ppt-prompt' }} />);
   expect(await screen.findByText(prompt)).toBeVisible();
-  expect(container.querySelector('.writer-markdown-editor')).toBeNull();
+  expect(container.querySelector('.writer-markdown-editor')).toBeInTheDocument();
   expect(container.querySelector('i, sub, sup')).toBeNull();
-  fireEvent.click(screen.getByRole('button', { name: '展示源码' }));
+  fireEvent.click(screen.getByText('更多操作'));
+  fireEvent.click(await screen.findByRole('button', { name: '查看源码' }));
   expect(await screen.findByRole('textbox', { name: '查看源码' })).toHaveValue(prompt);
 });
 
@@ -117,15 +118,13 @@ it.each(['academic_brief', 'deck_outline'].flatMap(slotName =>
   },
 );
 
-it('opens the PPT Markdown editor without treating section toggles as edits', async () => {
+it('opens legacy PPT prose directly in the Markdown editor', async () => {
   const text = '**设计风格：** 蓝白\n\n布局：左右双栏\n\n设计要求：保留全部文字 <div>原始示例</div>';
   const slot: SlotRevision = { slot_id: 'slide_outline', slot: 'slide_outline', selected: true,
     revision: 1, created_at: '', content_type: 'text', artifact_value: { text }, list_index: 6 };
   const { container } = render(<SlotRenderer slot={slot} sessionId='ppt-design-edit' widget={{ widgetType: 'ppt-prompt' }} />);
-  fireEvent.click(container.querySelector('summary')!);
-  expect(screen.queryByRole('textbox', { name: '编辑文本' })).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole('button', { name: '编辑文本' }));
   expect(await screen.findByRole('textbox', { name: 'editable markdown' })).toHaveAttribute('contenteditable', 'true');
+  expect(screen.getByText('设计风格：', { exact: true })).toBeVisible();
   expect(container.querySelector('.writer-markdown-editor')).toBeInTheDocument();
   expect(container.querySelector('.workflow-slot__text-editor')).toBeNull();
   expect(screen.queryByRole('alert')).not.toBeInTheDocument();

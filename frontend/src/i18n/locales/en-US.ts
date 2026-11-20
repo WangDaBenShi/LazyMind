@@ -5522,6 +5522,10 @@ const enUS = {
     ordinaryUnknownType: "Unknown type",
     ordinaryPreview: "Preview",
     ordinaryReload: "Reload",
+    expandStageArtifacts: "Show all",
+    showRemainingArtifacts_one: "Show {{count}} more output",
+    showRemainingArtifacts_other: "Show {{count}} more outputs",
+    collapseStageArtifacts: "Show less",
     ordinaryLoadMore: "Load more",
     ordinaryArtifactState_processing: "Processing",
     ordinaryArtifactState_failed: "Artifact processing failed",
@@ -7603,8 +7607,7 @@ const enUS = {
     memoryPreferenceOverLimitTitle: "Character budget exceeded",
     memoryPreferenceOverLimitDescription:
       "Preferences beyond the budget remain fully stored but are not injected into conversations by default. Reorder or organize preferences to adjust them.",
-    memoryPreferencePage:
-      "Page {{page}} · {{count}} on this page / {{total}} total",
+    memoryPageRange: "{{start}}–{{end}} of {{total}}",
     memoryPreferenceReorderHandle:
       "Drag {{name}}, item {{position}} of {{total}}. Press Space, then use arrow keys to reorder.",
     memoryPreferenceReorderFailed: "Failed to reorder preferences",
@@ -7653,8 +7656,6 @@ const enUS = {
     memoryEpisodeHitCount: "Referenced {{count}} times",
     memoryEpisodeShown: "Showing {{count}} of {{total}}",
     memoryEpisodeLoadMore: "Load more",
-    memoryEpisodePage:
-      "Page {{page}} · {{count}} on this page / {{total}} total",
     memoryEpisodeViewDetail: "View episode memory details",
     memoryEpisodeDetailTitle: "Episode details",
     memoryEpisodeDetailLoadFailed: "Failed to load episode details",

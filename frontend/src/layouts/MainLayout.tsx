@@ -951,12 +951,13 @@ export default function MainLayout() {
   if (knowledgeDatasetId && !knowledgeDatasetReady) {
     const error = requestedDatasetId === knowledgeDatasetId ? datasetError : '';
     const deleted = Boolean(error) && datasetErrorStatus === 410;
+    const forbidden = Boolean(error) && datasetErrorStatus === 403;
     return <div className="local-session-gate" role="status">
       <div className="local-session-panel">
         {(datasetLoading || !error) && <Spin />}
-        <div className="local-session-message">{deleted ? t('knowledge.deletedDataset') : error ? t('layout.knowledgeLoadFailed') : t('layout.loadingKnowledge')}</div>
-        {deleted && <Button type="primary" onClick={() => navigate("/lib/knowledge/list")}>{t("knowledge.backToLibrary")}</Button>}
-        {error && !deleted && <Button type="primary" onClick={() => void loadDataset(knowledgeDatasetId, true).catch(() => {})}>{t('common.retry')}</Button>}
+        <div className="local-session-message">{deleted ? t('knowledge.deletedDataset') : forbidden ? t('common.accessDenied') : error ? t('layout.knowledgeLoadFailed') : t('layout.loadingKnowledge')}</div>
+        {(deleted || forbidden) && <Button type="primary" onClick={() => navigate("/lib/knowledge/list")}>{t("knowledge.backToLibrary")}</Button>}
+        {error && !deleted && !forbidden && <Button type="primary" onClick={() => void loadDataset(knowledgeDatasetId, true).catch(() => {})}>{t('common.retry')}</Button>}
       </div>
     </div>;
   }

@@ -1,9 +1,10 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { $getRoot, type LexicalEditor } from 'lexical';
 import i18n from '@/i18n';
 import { useWorkflowStore, type SlotRevision } from '@/modules/chat/store/workflowPanel';
 import { SlotRenderer } from './SlotComponents';
+import { DocumentActionScope } from './DocumentActions';
 import { SlotEditingContext } from './slotEditingContext';
 
 const capture = vi.hoisted(() => ({ editor: null as LexicalEditor | null, importError: '' }));
@@ -23,6 +24,7 @@ vi.mock('@mdxeditor/editor', async (importOriginal) => {
 const prompt = [
   '<!-- ppt-page-prompt:v1 -->', '',
   '## 风格', '浅色背景', '',
+  '### 共享视觉规范', '', '- **底色**：`#070A12`', '',
   '## 布局', 'HTML 示例 <i>/<sub>/<sup>，参数 {"color":"#FFFFFF"}。', '',
   '```html', '<!-- ppt-material-images: ["example"] -->', '<div style="color: red">示例</div>', '```', '',
   '## 页面正文', '**标题**：原始标题', '',
@@ -42,21 +44,28 @@ beforeEach(async () => {
 });
 afterEach(cleanup);
 
-it('edits a PPT design in the real Markdown editor and saves its source metadata and HTML intact', async () => {
+it('renders formatted PPT prompts on open and preserves the source when saving edits', async () => {
   const patchSlotItemValue = vi.fn().mockResolvedValue(3);
   useWorkflowStore.setState({ patchSlotItemValue });
   let flush: (() => Promise<boolean>) | undefined;
   const view = render(<SlotEditingContext.Provider value={{ setEditing: vi.fn(), registerFooterAction: () => () => {},
     registerFlush: (_key, callback) => { flush = callback; return () => {}; },
-  }}><SlotRenderer slot={slot} sessionId='ppt-editor' widget={{ widgetType: 'ppt-prompt', maxHeight: 420 }} /></SlotEditingContext.Provider>);
+  }}><DocumentActionScope inline label='每页设计稿'>
+    <SlotRenderer slot={slot} sessionId='ppt-editor' widget={{ widgetType: 'ppt-prompt', maxHeight: 420 }} />
+  </DocumentActionScope></SlotEditingContext.Provider>);
 
-  fireEvent.click(view.container.querySelector('summary')!);
-  expect(capture.editor).toBeNull();
-  fireEvent.click(screen.getByRole('button', { name: '编辑文本' }));
   expect(capture.importError).toBe('');
-  await waitFor(() => expect(view.container.querySelector('[contenteditable="true"]')).toBeInTheDocument());
+  expect(await screen.findByRole('heading', { level: 2, name: '风格' })).toBeVisible();
+  expect(screen.getByRole('heading', { level: 3, name: '共享视觉规范' })).toBeVisible();
+  expect(screen.getByRole('listitem')).toHaveTextContent('底色');
+  expect(view.container.querySelector('li strong')).toHaveTextContent('底色');
+  expect(view.container.querySelector('[data-writer-color]')).toHaveTextContent('#070A12');
+  expect(screen.getAllByText('每页设计稿')).toHaveLength(1);
+  expect(view.container).not.toHaveTextContent('image-revision-1');
+  expect(view.container.querySelector('[contenteditable="true"]')).toBeInTheDocument();
   expect(view.container.querySelector('.workflow-slot__text-editor')).toBeNull();
   expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  await act(async () => { expect(await flush!()).toBe(true); });
   expect(patchSlotItemValue).not.toHaveBeenCalled();
 
   await act(async () => capture.editor!.update(() => {
@@ -78,21 +87,53 @@ it('edits a PPT design in the real Markdown editor and saves its source metadata
   expect(patchSlotItemValue.mock.calls[1][3].text).toBe(prompt.replace('浅色背景', '渐变背景'));
 });
 
-it('closes editing when the prompt becomes read-only', async () => {
+it('keeps the formatted document when editing permission is removed', async () => {
   const view = render(<SlotRenderer slot={slot} sessionId='ppt-editor' widget={{ widgetType: 'ppt-prompt' }} />);
-  fireEvent.click(screen.getByRole('button', { name: '编辑文本' }));
   expect(await screen.findByRole('textbox', { name: 'editable markdown' })).toBeInTheDocument();
   view.rerender(<SlotRenderer slot={slot} sessionId='ppt-editor' readOnly widget={{ widgetType: 'ppt-prompt' }} />);
   expect(view.container.querySelector('[contenteditable="true"], .workflow-slot__text-editor')).toBeNull();
-  expect(screen.queryByRole('button', { name: '编辑文本' })).not.toBeInTheDocument();
+  expect(screen.getByRole('heading', { name: '共享视觉规范' })).toBeVisible();
 });
 
-it.each(['panel', 'widget', 'unselected', 'descriptor'] as const)('keeps %s read-only PPT prompts out of editing', (reason) => {
+it.each(['panel', 'widget', 'unselected', 'descriptor', 'save-capability'] as const)('formats PPT prompts with %s read-only permissions', (reason) => {
   const current = { ...slot, selected: reason !== 'unselected', ...(reason === 'descriptor' ? {
     artifact_id: 'historical-prompt', document: { representation: 'markdown', editable: false, capabilities: [] },
+  } : reason === 'save-capability' ? {
+    artifact_id: 'historical-prompt', document: { representation: 'markdown', editable: true, capabilities: [] },
   } : {}) } as SlotRevision;
   const { container } = render(<SlotRenderer slot={current} sessionId='ppt-editor' readOnly={reason === 'panel'}
     widget={{ widgetType: 'ppt-prompt', readOnly: reason === 'widget' }} />);
-  expect(screen.queryByRole('button', { name: '编辑文本' })).not.toBeInTheDocument();
+  expect(screen.getByRole('heading', { name: '共享视觉规范' })).toBeVisible();
   expect(container.querySelector('[contenteditable="true"], .workflow-slot__text-editor')).toBeNull();
+});
+
+it('opens the next page in rich text and saves to its own list item', async () => {
+  const patchSlotItemValue = vi.fn().mockResolvedValue(8);
+  useWorkflowStore.setState({ patchSlotItemValue });
+  let flush: (() => Promise<boolean>) | undefined;
+  const nextText = '## 第二页\n\n第二页内容';
+  const viewPage = (page: SlotRevision) => (
+    <SlotEditingContext.Provider value={{ setEditing: vi.fn(), registerFooterAction: () => () => {},
+      registerFlush: (_key, callback) => { flush = callback; return () => {}; },
+    }}><SlotRenderer slot={page} sessionId='ppt-pages' widget={{ widgetType: 'ppt-prompt' }} /></SlotEditingContext.Provider>
+  );
+  const { rerender } = render(viewPage(slot));
+  fireEvent.click(screen.getByText('更多操作'));
+  fireEvent.click(await screen.findByRole('button', { name: '查看源码' }));
+  expect(screen.getByRole('textbox', { name: '查看源码' })).toHaveValue(prompt);
+  rerender(viewPage({ ...slot, list_index: 2, revision: 7, artifact_value: { text: nextText } }));
+  expect(await screen.findByRole('heading', { name: '第二页' })).toBeVisible();
+  expect(screen.queryByText('浅色背景')).not.toBeInTheDocument();
+  expect(patchSlotItemValue).not.toHaveBeenCalled();
+
+  await act(async () => capture.editor!.update(() => {
+    const node = $getRoot().getAllTextNodes().find(node => node.getTextContent() === '第二页内容');
+    if (!node) throw new Error('Second-page paragraph missing');
+    node.setTextContent('第二页更新');
+  }));
+  await act(async () => { expect(await flush!()).toBe(true); });
+  expect(patchSlotItemValue).toHaveBeenCalledTimes(1);
+  expect(patchSlotItemValue).toHaveBeenCalledWith(
+    'ppt-pages', 'slide_outline', 2, { text: nextText.replace('第二页内容', '第二页更新') }, 'text', 'checkpoint', 7, 2,
+  );
 });

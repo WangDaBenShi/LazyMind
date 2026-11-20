@@ -3,12 +3,11 @@ import css from './WorkflowPanel.scss?inline';
 import progressCss from './PaperAnalysisProgress.scss?inline';
 import runCss from '@/modules/chat/pages/workflowRun/index.scss?inline';
 
-import promptCss from './PptPromptDocument.scss?inline';
 import editorCss from './MarkdownArtifactEditor.scss?inline';
 
 beforeAll(() => {
   const style = document.createElement('style');
-  style.textContent = editorCss + promptCss + css + progressCss + runCss;
+  style.textContent = editorCss + css + progressCss + runCss;
   document.head.appendChild(style);
 });
 afterEach(() => {
@@ -135,12 +134,10 @@ describe('workflow material scrolling contract', () => {
     document.body.appendChild(panel);
     const cell = panel.querySelector('.composite-grid__cell')!;
     const surface = renderMarkdownDocument(cell);
-    cell.insertAdjacentHTML('beforeend', '<div class="ppt-prompt-document__body" style="--workflow-ppt-prompt-max-height:420px">长提示词</div>');
     expect(getComputedStyle(panel.querySelector('.composite-main')!).overflow).toBe('hidden');
     expect(getComputedStyle(panel.querySelector('.composite-grid')!).overflow).toBe('auto');
     expect(getComputedStyle(surface).overflowY).toBe('visible');
     expect(getComputedStyle(surface).maxHeight).toBe('none');
-    expect(getComputedStyle(cell.querySelector('.ppt-prompt-document__body')!).maxHeight).toBe('none');
     // Explicitly sized nested frames still own their scrolling.
     panel.querySelector('.composite-grid__row')!.className = 'composite-grid__row composite-grid__row--tree';
     expect(getComputedStyle(surface).overflowY).toBe('auto');
@@ -174,12 +171,6 @@ describe('workflow material scrolling contract', () => {
     text.style.setProperty('--workflow-text-max-height', '420px');
     expect(getComputedStyle(text).maxHeight).toBe('none');
     expect(getComputedStyle(text).overflowY).toBe('visible');
-    const prompt = document.createElement('div');
-    prompt.className = 'ppt-prompt-document__body';
-    prompt.style.setProperty('--workflow-ppt-prompt-max-height', '420px');
-    text.parentElement!.appendChild(prompt);
-    expect(getComputedStyle(prompt).maxHeight).toBe('none');
-    expect(getComputedStyle(prompt).overflowY).toBe('visible');
   });
 
   it('retains height constraints outside ordinary tab slots', () => {

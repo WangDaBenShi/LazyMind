@@ -1,0 +1,76 @@
+.chat-tool-config-list {
+  container-type: inline-size;
+  display: grid;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+}
+
+.chat-tool-config.ant-alert {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 2px 10px;
+  padding: 10px 14px;
+  border: 1px solid #e3e8ef;
+  border-radius: 10px;
+  background: #f8fafc;
+
+  .ant-alert-icon {
+    display: grid;
+    place-items: center;
+    width: 28px;
+    height: 28px;
+    margin: 0;
+    border-radius: 8px;
+    background: #ebf0f7;
+    color: #536986;
+    font-size: 16px;
+  }
+
+  &.ant-alert-success .ant-alert-icon {
+    background: #e6f5ed;
+    color: #28794f;
+  }
+
+  .ant-alert-message {
+    margin: 0;
+    color: #27354a;
+    font-size: 13px;
+    font-weight: 600;
+    line-height: 20px;
+    overflow-wrap: anywhere;
+  }
+
+  .ant-alert-description {
+    color: #5c697b;
+    font-size: 12px;
+    line-height: 18px;
+    overflow-wrap: anywhere;
+  }
+
+  .ant-alert-action {
+    margin: 0;
+
+    .ant-btn {
+      height: auto;
+      min-height: 28px;
+      padding: 3px 6px;
+      white-space: normal;
+      font-size: 13px;
+    }
+  }
+}
+
+@container (max-width: 340px) {
+  .chat-tool-config.ant-alert {
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: start;
+
+    .ant-alert-action {
+      grid-column: 2;
+      justify-self: start;
+      margin-inline-start: -6px;
+    }
+  }
+}

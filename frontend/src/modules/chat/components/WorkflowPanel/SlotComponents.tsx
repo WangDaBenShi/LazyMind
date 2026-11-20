@@ -1,5 +1,4 @@
 import ExternalLink from '@/components/ExternalLink';
-import { PptPromptDocument } from './PptPromptDocument';
 import { ArtifactSourceButton } from './ArtifactSourceButton';
 import { downloadWorkflowFile, getWorkflowDownloadHost } from '@/modules/chat/utils/workflowDownload';
 import { WriterProviderChoice } from "./DocumentProviderChoice";
@@ -1939,8 +1938,10 @@ export function SlotText({ slot, widget, sessionId, slotId, revisionCount, onRef
   }, [isOffloaded, raw?.path, raw?.url]);
 
   const canEdit = Boolean(sessionId && slotId) && !readOnly;
+  const isPptPrompt = widget?.widgetType === 'ppt-prompt';
   const canEditMarkdown = canEdit
-    && (widget?.widgetType === 'text-markdown' || (widget?.widgetType === 'ppt-prompt' && editing));
+    && (widget?.widgetType === 'text-markdown' || isPptPrompt);
+  const showMarkdownEditor = canEditMarkdown || isPptPrompt;
   // For single slots, list_index is undefined from the backend; use 0 as the canonical index
   // for localStorage keys (front-end only convention).
   const effectiveListIndex = slot.list_index ?? 0;
@@ -2034,10 +2035,8 @@ export function SlotText({ slot, widget, sessionId, slotId, revisionCount, onRef
   const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const val = e.target.value;
     const minimumHeight = editViewportRef.current?.height ?? 0;
-    if (widget?.widgetType !== 'ppt-prompt') {
-      e.target.style.height = 'auto';
-      e.target.style.height = `${Math.max(minimumHeight, e.target.scrollHeight)}px`;
-    }
+    e.target.style.height = 'auto';
+    e.target.style.height = `${Math.max(minimumHeight, e.target.scrollHeight)}px`;
     setDraft(val);
     if (sessionId && slotId) {
       const draftPayload: Record<string, unknown> = { text: val };
@@ -2238,7 +2237,7 @@ export function SlotText({ slot, widget, sessionId, slotId, revisionCount, onRef
     if (!editor) return;
 
     const viewport = editViewportRef.current;
-    if (viewport && widget?.widgetType !== 'ppt-prompt') {
+    if (viewport) {
       editor.style.height = 'auto';
       editor.style.height = `${Math.max(viewport.height, editor.scrollHeight)}px`;
     }
@@ -2255,7 +2254,7 @@ export function SlotText({ slot, widget, sessionId, slotId, revisionCount, onRef
         viewport.scrollContainer.scrollTop = viewport.scrollTop;
       }
     }
-  }, [editing, widget?.widgetType]);
+  }, [editing]);
 
   if (showPending) {
     return <SlotPending type='text' />;
@@ -2279,7 +2278,7 @@ export function SlotText({ slot, widget, sessionId, slotId, revisionCount, onRef
 
   const textMeta = (
     <div className='workflow-slot__text-meta'>
-      {!canEditMarkdown && <ArtifactSourceButton value={editing || hasPendingDraft ? displayText : isOffloaded ? offloadedText : currentValue?.text ?? currentValue?.data ?? currentValue} />}
+      {!showMarkdownEditor && <ArtifactSourceButton value={editing || hasPendingDraft ? displayText : isOffloaded ? offloadedText : currentValue?.text ?? currentValue?.data ?? currentValue} />}
       {revisionCount !== undefined && revisionCount > 0 && sessionId && slotId && (
         <SlotVersionPopover
           sessionId={sessionId}
@@ -2333,11 +2332,13 @@ export function SlotText({ slot, widget, sessionId, slotId, revisionCount, onRef
 
   return (
     <div className={`workflow-slot workflow-slot--text${isJsonBlock ? ' workflow-slot--json-block' : ''}`}>
-      {canEditMarkdown ? (
+      {showMarkdownEditor ? (
         <>
           <MarkdownArtifactEditor
+            key={isPptPrompt ? editingKey : undefined}
             markdown={displayText}
-            contentKind={widget?.widgetType === 'ppt-prompt' ? 'prompt' : 'document'}
+            contentKind={isPptPrompt ? 'prompt' : 'document'}
+            readOnly={!canEditMarkdown}
             sourceRevision={localRevision}
             maxHeight={widget?.maxHeight}
             editingKey={`${editingKey}:markdown`}
@@ -2378,10 +2379,7 @@ export function SlotText({ slot, widget, sessionId, slotId, revisionCount, onRef
         />
       ) : (
         <>
-          {widget?.widgetType === 'ppt-prompt' ? (
-            <PptPromptDocument key={editingKey} text={displayText}
-              onEdit={canEdit ? (source) => handleEdit(source) : undefined} maxHeight={widget.maxHeight} />
-          ) : widget?.widgetType === 'text-markdown' ? (
+          {widget?.widgetType === 'text-markdown' ? (
             <div
               className={`workflow-slot__text workflow-slot__text--markdown${canEdit ? ' workflow-slot__text--editable' : ''}`}
               {...textDisplayProps}
@@ -5435,9 +5433,8 @@ export function SlotRenderer({
         || Boolean(slot.document && (!slot.document.editable || !slot.document.capabilities.includes('save')))} />;
   }
 
-  // Keep PPT prompts in their section preview until editing. SlotText uses the
-  // shared Markdown editor, which preserves source comments and HTML examples,
-  // and saves to this list item even when it has a historical document descriptor.
+  // Render PPT prompts with the shared Markdown editor, preserving literal HTML
+  // examples and saving to the original list item for historical documents too.
   if (widget?.widgetType === 'ppt-prompt') {
     return <SlotText slot={slot} widget={widget} sessionId={sessionId} slotId={slotId ?? slot.slot}
       revisionCount={revisionCount} onRefresh={onRefresh}

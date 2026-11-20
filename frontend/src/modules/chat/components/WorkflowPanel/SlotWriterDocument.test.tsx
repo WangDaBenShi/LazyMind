@@ -622,7 +622,7 @@ describe('SlotText editing', () => {
     ));
   });
 
-  it('passes the complete PPT prompt and height limit to the Markdown editor on edit', () => {
+  it('passes the complete PPT prompt and height limit to the initial Markdown editor', () => {
     const text = '<!-- ppt-page-prompt:v1 -->\n## 风格\n浅色背景';
     const { container } = render(<SlotRenderer
       slot={{ slot_id: 'prompt', revision: 1, selected: true, slot: 'prompt',
@@ -630,7 +630,6 @@ describe('SlotText editing', () => {
       widget={{ widgetType: 'ppt-prompt', maxHeight: 400 }}
       sessionId='prompt-session' slotId='prompt'
     />);
-    fireEvent.click(screen.getByRole('button', { name: '编辑文本' }));
     const editor = screen.getByRole('button', { name: 'save markdown draft' });
     expect(editor).toHaveAttribute('data-markdown', text);
     expect(editor).toHaveAttribute('data-max-height', '400');

@@ -104,8 +104,10 @@ var errorCatalog = map[string]*AppError{
 	"invalid avatar upload":             NewAppError(http.StatusBadRequest, 2000619, "Invalid avatar upload"),
 	"unsupported avatar image":          NewAppError(http.StatusBadRequest, 2000620, "Unsupported avatar image"),
 	"avatar file is too large":          NewAppError(http.StatusRequestEntityTooLarge, 2000621, "Avatar file is too large"),
-	"task cannot be canceled":           NewAppError(http.StatusConflict, 2000701, "Task cannot be canceled"),
-	"job cannot be canceled":            NewAppError(http.StatusConflict, 2000702, "Job cannot be canceled"),
+
+	"page must be positive and cannot be combined with page_token": NewAppError(http.StatusBadRequest, 2000622, "Page must be positive and cannot be combined with page_token"),
+	"task cannot be canceled":                                      NewAppError(http.StatusConflict, 2000701, "Task cannot be canceled"),
+	"job cannot be canceled":                                       NewAppError(http.StatusConflict, 2000702, "Job cannot be canceled"),
 
 	"missing dataset or task":                                NewAppError(http.StatusBadRequest, 2000212, "Dataset or task is required"),
 	"invalid request body":                                   NewAppError(http.StatusBadRequest, 2000213, "Invalid request body"),

@@ -1,7 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import { Alert, Button, Space, message } from "antd";
+import { Alert, Button, message } from "antd";
+import { CheckCircleOutlined, GlobalOutlined, SettingOutlined } from "@ant-design/icons";
 import { useTranslation } from "react-i18next";
 import { axiosInstance, BASE_URL } from "@/components/request";
+
+import "./index.scss";
 
 export interface ConfigurationAction {
   id: string;
@@ -149,17 +152,19 @@ export default function ToolConfigurationCard({ conversationId, historyId, activ
     }
   };
 
-  return <Space direction="vertical" style={{ width: "100%" }}>
-    {actions.map((action) => <Alert key={action.id} showIcon
+  if (!actions.length) return null;
+  return <div className="chat-tool-config-list">
+    {actions.map((action) => <Alert key={action.id} className="chat-tool-config" showIcon
+      icon={action.status === "ready" ? <CheckCircleOutlined /> : action.service.split("/")[0] === "web_search" ? <GlobalOutlined /> : <SettingOutlined />}
       type={action.status === "ready" ? "success" : "info"}
       message={action.label}
       description={t(`toolConfiguration.${action.status === "ready" ? "ready" : action.status === "forbidden" ? "forbidden" : action.status === "unavailable" ? "unavailable" : "pending"}`)}
       action={action.status === "ready" && !active && onContinue
-        ? <Button size="small" onClick={onContinue}>{t("toolConfiguration.continue")}</Button>
+        ? <Button type="link" size="small" onClick={onContinue}>{t("toolConfiguration.continue")}</Button>
         : !["ready", "forbidden", "unavailable"].includes(action.status) && <Button
-        size="small" loading={opening === action.id} onClick={() => void open(action)}>
+        type="link" size="small" loading={opening === action.id} onClick={() => void open(action)}>
         {t(`toolConfiguration.${action.service.split("/")[0] === "mail" ? "connectMail" : action.status === "needs_authorization" ? "authorize" : action.status === "needs_tool_selection" ? "selectTools" : "configure"}`)}
       </Button>}
     />)}
-  </Space>;
+  </div>;
 }
