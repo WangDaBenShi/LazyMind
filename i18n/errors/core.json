@@ -249,6 +249,7 @@
   "2000972": { "en-US": "user_preference not found", "zh-CN": "用户偏好不存在" },
   "2000973": { "en-US": "word group conflict not found", "zh-CN": "词组冲突不存在" },
   "2000974": { "en-US": "word group not found", "zh-CN": "词组不存在" },
+  "2000975": { "en-US": "Knowledge base deleted", "zh-CN": "知识库已删除" },
   "2000998": { "en-US": "read agent file content failed", "zh-CN": "读取 Agent 文件内容失败" },
   "2000999": { "en-US": "read analysis report content failed", "zh-CN": "读取分析报告内容失败" },
   "2001000": { "en-US": "read diff result content failed", "zh-CN": "读取差异结果内容失败" },

@@ -6093,6 +6093,7 @@ export interface KnowledgeMarketTaskListItemOpenAPIResponse {
     'can_delete'?: boolean;
     'can_retry'?: boolean;
     'created_at': string;
+    'dataset_deleted'?: boolean;
     'dataset_id': string;
     'display_state'?: string;
     'error_message': string;

@@ -275,6 +275,7 @@ var errorCatalog = map[string]*AppError{
 	"upload session not found":      NewAppError(http.StatusNotFound, 2000970, "upload session not found"),
 	"word group conflict not found": NewAppError(http.StatusNotFound, 2000973, "word group conflict not found"),
 	"word group not found":          NewAppError(http.StatusNotFound, 2000974, "word group not found"),
+	"knowledge base deleted":        NewAppError(http.StatusGone, 2000975, "Knowledge base deleted"),
 
 	// Additional internal errors discovered from handlers.
 	"read agent file content failed":        NewAppError(http.StatusInternalServerError, 2000998, "read agent file content failed"),
