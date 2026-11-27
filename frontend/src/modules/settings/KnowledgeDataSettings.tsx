@@ -1,13 +1,11 @@
 import { getLocalizedErrorMessage } from "@/components/request";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { ReactNode, RefObject } from "react";
+import type { RefObject } from "react";
 import { Alert, Button, Empty, Skeleton, Switch, Tag, message } from "antd";
 import {
-  DatabaseOutlined,
   FileSearchOutlined,
   FolderOpenOutlined,
   GlobalOutlined,
-  ReadOutlined,
   ReloadOutlined,
   RightOutlined,
 } from "@ant-design/icons";
@@ -20,6 +18,8 @@ import {
   notifyToolAvailabilityChanged,
 } from "@/modules/memory/toolApi";
 import type { StructuredAsset } from "@/modules/memory/shared";
+import { revealModelSetting } from "@/modules/modelProvider/utils/revealModelSetting";
+import { knowledgeGroupCounts, overviewKnowledgeGroups, type ToolGroupDefinition } from "./knowledgeGroups";
 
 interface KnowledgeDataSettingsProps {
   routeParams?: URLSearchParams;
@@ -28,22 +28,6 @@ interface KnowledgeDataSettingsProps {
   onDocumentDirectoriesChange: (enabled: boolean) => void;
   controlsDisabled: boolean;
   headingRef: RefObject<HTMLHeadingElement>;
-}
-
-interface ToolDefinition {
-  id: string;
-  name: string;
-  description: string;
-  destination?: string;
-}
-
-interface ToolGroupDefinition {
-  id: string;
-  title: string;
-  description: string;
-  icon: ReactNode;
-  tools: ToolDefinition[];
-  destination?: string;
 }
 
 export default function KnowledgeDataSettings({
@@ -60,6 +44,14 @@ export default function KnowledgeDataSettings({
   const [toolsError, setToolsError] = useState(false);
   const [pendingTools, setPendingTools] = useState<Set<string>>(new Set());
   const requestSequence = useRef(0);
+  const targetGroup = routeParams?.get("group");
+  const targetHeading = useRef<HTMLHeadingElement>(null);
+  useEffect(() => {
+    if (!toolsLoading && targetHeading.current) {
+      targetHeading.current.focus({ preventScroll: true });
+      revealModelSetting(targetHeading.current);
+    }
+  }, [targetGroup, toolsLoading]);
 
   const withReturnContext = (destination: string) => {
     const [path, query] = destination.split("?");
@@ -70,35 +62,7 @@ export default function KnowledgeDataSettings({
   };
 
   const toolGroups = useMemo<ToolGroupDefinition[]>(() => [
-    {
-      id: "retrieval",
-      title: t("settingsPage.knowledge.groups.retrieval.title"),
-      description: t("settingsPage.knowledge.groups.retrieval.description"),
-      icon: <ReadOutlined />,
-      tools: [
-        { id: "kb", name: t("settingsPage.knowledge.groups.retrieval.kb.name"), description: t("settingsPage.knowledge.groups.retrieval.kb.description") },
-      ],
-    },
-    {
-      id: "data",
-      title: t("settingsPage.knowledge.groups.data.title"),
-      description: t("settingsPage.knowledge.groups.data.description"),
-      icon: <DatabaseOutlined />,
-      tools: [
-        { id: "data_sources", name: t("settingsPage.knowledge.groups.data.dataSources.name"), description: t("settingsPage.knowledge.groups.data.dataSources.description") },
-        { id: "external_db", name: t("settingsPage.knowledge.groups.data.externalDb.name"), description: t("settingsPage.knowledge.groups.data.externalDb.description") },
-      ],
-    },
-    {
-      id: "file-access",
-      title: t("settingsPage.knowledge.groups.fileAccess.title"),
-      description: t("settingsPage.knowledge.groups.fileAccess.description"),
-      icon: <FolderOpenOutlined />,
-      tools: [
-        { id: "local_fs", name: t("settingsPage.knowledge.groups.fileAccess.localFs.name"), description: t("settingsPage.knowledge.groups.fileAccess.localFs.description") },
-        { id: "cloud_files", name: t("settingsPage.knowledge.groups.fileAccess.cloudFiles.name"), description: t("settingsPage.knowledge.groups.fileAccess.cloudFiles.description") },
-      ],
-    },
+    ...overviewKnowledgeGroups(t),
     {
       id: "search",
       title: t("settingsPage.knowledge.groups.search.title"),
@@ -177,7 +141,7 @@ export default function KnowledgeDataSettings({
     }
   };
 
-  const renderTool = (definition: ToolDefinition, group: ToolGroupDefinition) => {
+  const renderTool = (definition: ToolGroupDefinition["tools"][number], group: ToolGroupDefinition) => {
     const destination = definition.destination || group.destination;
     const tool = toolsByID.get(definition.id);
     const pending = pendingTools.has(definition.id);
@@ -226,13 +190,11 @@ export default function KnowledgeDataSettings({
       <div className="settings-knowledge-capability-flow">
         {visibleGroups.map((group) => {
           const includesDirectories = group.id === "retrieval";
-          const registered = group.tools.filter((tool) => toolsByID.has(tool.id)).length + Number(includesDirectories);
-          const enabled = group.tools.filter((tool) => toolsByID.get(tool.id)?.isEnabled).length
-            + Number(includesDirectories && documentDirectoriesEnabled);
+          const { registered, enabled } = knowledgeGroupCounts(group, toolsByID, documentDirectoriesEnabled);
           return <section className={`settings-knowledge-group is-${group.id}`} key={group.id}>
             <header className="settings-knowledge-group-head">
               <span>{group.icon}</span>
-              <div><h2>{group.title}</h2><p>{group.description}</p></div>
+              <div><h2 ref={group.id === targetGroup ? targetHeading : undefined} tabIndex={-1}>{group.title}</h2><p>{group.description}</p></div>
               <Tag>{t("settingsPage.knowledge.enabledCount", { enabled, registered })}</Tag>
             </header>
             <div className="settings-knowledge-tool-list">

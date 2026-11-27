@@ -75,6 +75,20 @@ describe("KnowledgeDataSettings", () => {
     });
   });
 
+  it("focuses the requested overview group after its tools load", async () => {
+    render(<KnowledgeDataSettings
+      controlsDisabled={false}
+      documentDirectoriesEnabled={false}
+      documentDirectoriesSaving={false}
+      onDocumentDirectoriesChange={vi.fn()}
+      headingRef={createRef<HTMLHeadingElement>()}
+      routeParams={new URLSearchParams({ section: "knowledge", group: "file-access" })}
+    />);
+    await waitFor(() => expect(screen.getByRole("heading", {
+      name: "settingsPage.knowledge.groups.fileAccess.title",
+    })).toHaveFocus());
+  });
+
   it("opens multimodal recognition in default model settings", async () => {
     render(<KnowledgeDataSettings
       controlsDisabled={false}

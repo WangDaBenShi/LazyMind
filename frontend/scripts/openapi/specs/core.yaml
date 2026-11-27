@@ -3673,6 +3673,20 @@ components:
                 - attempt_status
                 - execution_id
             type: object
+        ConfiguredModelSupplier:
+            properties:
+                brand_key:
+                    type: string
+                id:
+                    type: string
+                is_custom:
+                    type: boolean
+                name:
+                    type: string
+            required:
+                - id
+                - name
+            type: object
         Control:
             properties:
                 next_step:
@@ -17850,6 +17864,12 @@ components:
                 enabled:
                     format: int64
                     type: integer
+                external_services:
+                    format: int64
+                    type: integer
+                model_providers:
+                    format: int64
+                    type: integer
                 runnable:
                     format: int64
                     type: integer
@@ -17862,6 +17882,8 @@ components:
             required:
                 - configured
                 - enabled
+                - external_services
+                - model_providers
                 - runnable
                 - total
                 - verified
@@ -17910,6 +17932,10 @@ components:
                     type: boolean
                 id:
                     type: string
+                model_supplier_preview:
+                    items:
+                        $ref: '#/components/schemas/ConfiguredModelSupplier'
+                    type: array
                 raw_enabled:
                     type: boolean
                 route:

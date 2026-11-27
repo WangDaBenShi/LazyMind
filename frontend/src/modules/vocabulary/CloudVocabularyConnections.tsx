@@ -7,6 +7,7 @@ import { createCloudWordbook, disconnectCloudConnection, listCloudConnections, l
 import "./CloudVocabularyConnections.scss";
 import VocabularyConnectionGuide, { CloudTokenSource } from "./VocabularyConnectionGuide";
 import { cloudActionErrorMessage, cloudErrorMessage } from "./cloudErrorMessage";
+import { cloudConnectionStatus } from "./connectionStatus";
 const providers: CloudVocabularyProvider[] = ["eudic", "maimemo"];
 const emptyConnection = (provider: CloudVocabularyProvider): CloudConnection => ({provider, configured:false, enabled:false, target_id:"", target_name:"", add_to_study:false, pending:0, failed:0, succeeded:0, last_error:""});
 
@@ -156,14 +157,14 @@ export default function CloudVocabularyConnections() {
   return <>
     {providers.map(provider=>{
       const connection=connections.find(item=>item.provider===provider);
-      const status=error ? "unavailable" : !loaded ? "loading" : connection?.target_id ? connection.enabled ? "connectedEnabled" : "connectedPaused" : "incomplete";
+      const status=error ? "unavailable" : !loaded ? "loading" : cloudConnectionStatus(connection);
       return <article key={provider} className="external-app-card">
         <span className="external-app-icon"><img src={provider === "eudic" ? eudicLogo : maimemoLogo} alt="" aria-hidden="true" /></span>
         <div className="external-app-copy">
           <h3>{t(`vocabularyCloud.${provider}`)}</h3>
           <p>{t("vocabularyCloud.providerDescription")}</p>
         </div>
-        <Tag className="external-app-status" color={error ? "warning" : connection?.enabled ? "success" : "default"}>{t(`vocabularyCloud.${status}`)}</Tag>
+        <Tag className="external-app-status" color={error ? "warning" : status === "connectedEnabled" ? "success" : "default"}>{t(`vocabularyCloud.${status}`)}</Tag>
         <Button aria-label={`${t(`vocabularyCloud.${provider}`)} ${t("vocabularyCloud.manage")}`} onClick={()=>setSelected(provider)}>
           {t("vocabularyCloud.manage")}
         </Button>

@@ -1,4 +1,4 @@
-import type { UserUIPreferencesOpenAPIResponse } from "@/api/generated/core-client";
+import type { ConfiguredModelSupplier, UserUIPreferencesOpenAPIResponse } from "@/api/generated/core-client";
 import { patchUserUiPreferences } from "@/modules/user/uiPreferencesApi";
 import { setAllMcpServersEnabled, type BulkUpdateMcpServersResult } from "@/modules/memory/toolApi";
 import { axiosInstance, BASE_URL } from "@/components/request";
@@ -30,6 +30,7 @@ export interface SettingsOverviewCounts {
 }
 
 export interface SettingsOverviewSection {
+  model_supplier_preview?: ConfiguredModelSupplier[];
   id: string;
   title: string;
   route: string;

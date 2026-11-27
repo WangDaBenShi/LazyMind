@@ -29,6 +29,7 @@ import {
 } from "./api";
 import "@/modules/agentIntegration/index.scss";
 import CloudVocabularyConnections from "./CloudVocabularyConnections";
+import { ankiConnectionStatus } from "./connectionStatus";
 import VocabularyConnectionGuide from "./VocabularyConnectionGuide";
 import ankiLogo from "./assets/anki.png";
 
@@ -89,13 +90,7 @@ export default function VocabularySettings() {
   const connectInstalled = Boolean(desktop?.connect_installed);
   const connectReady = Boolean(status?.connected);
   const enabled = available && status?.enabled === true;
-  const connectionStatus = !available
-    ? "unavailable"
-    : !connectReady
-      ? "incomplete"
-      : enabled
-        ? "connectedEnabled"
-        : "connectedPaused";
+  const connectionStatus = ankiConnectionStatus(status);
 
   return (
     <div className="external-apps-settings">

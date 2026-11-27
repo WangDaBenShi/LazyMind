@@ -18,7 +18,6 @@ import {
   KeyOutlined,
   LinkOutlined,
   RobotOutlined,
-  RightOutlined,
   SearchOutlined,
   SettingOutlined,
   TeamOutlined,
@@ -55,7 +54,11 @@ import { isDesktopRuntime, isLocalRuntime, isVocabularyEnabled } from "@/runtime
 import { setDeveloperModeActive } from "@/utils/developerMode";
 import { setSensitiveWordFilterEnabled } from "@/utils/sensitiveWordFilter";
 import { setPerformanceStatsEnabled as cachePerformanceStatsEnabled } from "@/utils/performanceStatsPreference";
-import MemoryCapabilitySettings from "./MemoryCapabilitySettings";
+import MemoryCapabilitySettings, { MemoryCapabilityOverview } from "./MemoryCapabilitySettings";
+import { useMemoryCapabilities } from "./useMemoryCapabilities";
+import { SettingsOverviewCard, SettingsOverviewRow } from "./SettingsOverviewCard";
+import { SettingsOverviewModuleRows } from "./SettingsOverviewModules";
+import { OverviewEnvironmentRow, OverviewKnowledgeRows, OverviewModelServiceRows } from "./OverviewServiceRows";
 import CloudUsageSettings from "./CloudUsageSettings";
 import KnowledgeDataSettings from "./KnowledgeDataSettings";
 import KnowledgeToolSettings, { isKnowledgeToolView } from "./KnowledgeToolSettings";
@@ -254,6 +257,7 @@ function SettingsPageContent() {
     : navigationItems.some((item) => item.id === candidate)
       ? candidate as SectionID
       : "overview";
+  const memory = useMemoryCapabilities(section === "overview" || section === "memory");
   const focusedServiceCategory = defaultServiceCategory(searchParams.get("service")) || legacyServiceCategory || undefined;
   const knowledgeToolCandidate = searchParams.get("tool");
   const knowledgeToolView = section === "knowledge" && isKnowledgeToolView(knowledgeToolCandidate)
@@ -480,32 +484,126 @@ function SettingsPageContent() {
     );
   };
 
-  const dashboardRow = (module: string, title: string, description: string, control: ReactNode) => (
-    <div className="settings-dashboard-config-row" key={`${module}-${title}`}>
-      <div className="settings-dashboard-copy"><span>{module}</span><strong>{title}</strong><p>{description}</p></div>
-      <div className="settings-dashboard-control">{control}</div>
-    </div>
-  );
-
-  const dashboardCard = (target: SectionID, icon: ReactNode, title: string, description: string, rows: ReactNode[]) => (
-    <section className="settings-dashboard-card" key={target}>
-      <div className="settings-dashboard-card-head"><span className="settings-section-icon">{icon}</span><div><h2>{title}</h2><p>{description}</p></div></div>
-      <div className="settings-dashboard-card-body">{rows}</div>
-      <div className="settings-dashboard-card-foot">
-        <button type="button" onClick={() => selectSection(target)} aria-label={t("settingsPage.goToDetailAria", { title })}>
-          {t("settingsPage.goToDetail")} <RightOutlined />
-        </button>
-      </div>
-    </section>
+  const dashboardRow = (title: string, description: string, control: ReactNode) => (
+    <SettingsOverviewRow key={title} title={title} description={description} control={control} />
   );
 
   const renderDashboard = () => {
     const sections = overview?.sections || [];
     const get = (id: string) => sections.find((item) => item.id === id) || sectionFallback(id as SectionID, t);
-    const models = get("models");
+    const models = sections.find((item) => item.id === "models");
     const tasks = get("tasks");
     const skills = get("skills");
     const mcp = get("mcp");
+    const cards = {
+      models: {
+        description: models?.counts.model_providers != null && models.counts.external_services != null
+          ? t("settingsPage.counts.providerBreakdown", { models: models.counts.model_providers, services: models.counts.external_services })
+          : t("settingsPage.overview.modelServicesDesc"),
+        rows: <OverviewModelServiceRows
+          section={models}
+          onConfigure={(providerId) => {
+            const params = settingsRouteParams(searchParams, { section: "models", view: "providers" });
+            if (providerId) params.set("provider_id", providerId);
+            setSearchParams(params);
+          }}
+          onConfigureService={(service, item) => setSearchParams(settingsRouteParams(searchParams, {
+            section: "model_defaults", service, editor: "service", item,
+          }))}
+        />,
+      },
+      model_defaults: {
+        description: t("settingsPage.overview.modelsDesc"),
+        rows: [
+          <QuickModelSettings canConfigureEmbedding={isAdmin} key="quick-models" onSaved={syncOverview} />,
+          dashboardRow(t("settingsPage.controls.documentParsing.title"), t("settingsPage.overview.documentParsingDesc"), <Button className="settings-dashboard-quick-action" size="small" onClick={() => setSearchParams(settingsRouteParams(searchParams, { section: "model_defaults", service: "parsing" }))}>{t("settingsPage.quickConfig")}</Button>),
+        ],
+      },
+      tasks: {
+        description: t("settingsPage.overview.tasksDesc"),
+        rows: [
+          dashboardRow(t("settingsPage.tasks.enableSubtasks"), t("settingsPage.tasks.enableSubtasksDesc"), switchControl("task_center_enabled", t("settingsPage.tasks.enableSubtasks"))),
+          dashboardRow(t("settingsPage.tasks.enableWorkflows"), t("settingsPage.tasks.enableWorkflowsDesc"), switchControl("workflows_enabled", t("settingsPage.tasks.enableWorkflows"))),
+          dashboardRow(t("settingsPage.tasks.enableSchedules"), t("settingsPage.tasks.enableSchedulesDesc", { count: tasks.counts.enabled }), switchControl("schedules_enabled", t("settingsPage.tasks.enableSchedules"))),
+        ],
+      },
+      knowledge: {
+        description: t("settingsPage.overview.knowledgeDesc"),
+        rows: <OverviewKnowledgeRows documentDirectoriesEnabled={overview?.controls.document_directories_enabled}
+          onConfigure={(group) => setSearchParams(settingsRouteParams(searchParams, { section: "knowledge", group }))} />,
+      },
+      memory: {
+        description: t("settingsPage.overview.memoryDesc"),
+        rows: <MemoryCapabilityOverview memory={memory} />,
+      },
+      skills: {
+        description: t("settingsPage.overview.skillsDesc"),
+        rows: [
+          dashboardRow(t("settingsPage.controls.skills.title"), t("settingsPage.overview.mySkillsDesc"), switchControl("skills_enabled")),
+          dashboardRow(t("settingsPage.controls.workflows.title"), t("settingsPage.overview.myWorkflowsDesc"), switchControl("workflows_enabled")),
+          dashboardRow(t("settingsPage.overview.enabledResources"), t("settingsPage.overview.enabledResourcesDesc", { count: skills.counts.enabled }), <Tag className="settings-status-tag">{t("settingsPage.separatelyControlled")}</Tag>),
+        ],
+      },
+      system_tools: {
+        description: t("settingsPage.overview.systemToolsDesc"),
+        rows: [
+          dashboardRow(t("settingsPage.overview.builtinTools"), t("settingsPage.overview.builtinToolsDesc"), <Button className="settings-dashboard-quick-action" size="small" onClick={() => selectSection("system_tools")}>{t("settingsPage.manageTools")}</Button>),
+          dashboardRow(t("settingsPage.overview.localDeps"), t("settingsPage.overview.localDepsDesc"), <Button className="settings-dashboard-quick-action" size="small" onClick={() => selectSection("system_tools")}>{hasLocalDependencies ? t("settingsPage.checkDeps") : t("settingsPage.cloudHosted")}</Button>),
+        ],
+      },
+      mcp: {
+        description: t("settingsPage.overview.mcpDesc"),
+        rows: [
+          dashboardRow(t("settingsPage.overview.mcpMaster"), t("settingsPage.overview.mcpMasterDesc"), switchControl("mcp_enabled")),
+          dashboardRow(t("settingsPage.overview.verifiedServices"), t("settingsPage.overview.verifiedServicesDesc", { verified: mcp.counts.verified, runnable: mcp.counts.runnable }), <Tag className="settings-status-tag">{formatCount(mcp, t)}</Tag>),
+        ],
+      },
+      env_vars: {
+        description: t("settingsPage.envVars.description"),
+        rows: <OverviewEnvironmentRow />,
+      },
+      assistants: {
+        description: t("settingsPage.overview.assistantsDesc"),
+        rows: [
+          dashboardRow(t("settingsPage.overview.assistantMcp"), t("settingsPage.overview.assistantMcpDesc"), <Tag className="settings-status-tag">MCP</Tag>),
+          dashboardRow(t("settingsPage.overview.assistantExecutors"), t("settingsPage.overview.assistantExecutorsDesc"), <Button className="settings-dashboard-quick-action" size="small" onClick={() => selectSection("assistants")}>{t("settingsPage.manageAssistants")}</Button>),
+        ],
+      },
+      external_apps: { description: t("ankiSettings.externalAppsDescription"), rows: <SettingsOverviewModuleRows section="external_apps" /> },
+      channels: { description: t("notifications.connectHint"), rows: <SettingsOverviewModuleRows section="channels" /> },
+      notifications: { description: t("notifications.subtitle"), rows: <SettingsOverviewModuleRows section="notifications" /> },
+      organization: {
+        description: t("settingsPage.organization.description"),
+        rows: (["users", "groups"] as const).map(view => {
+          const title = t(view === "users" ? "admin.userManagement" : "admin.groupManagement");
+          return <SettingsOverviewRow key={view} title={title} control={
+            <Button className="settings-dashboard-quick-action" size="small" onClick={() => setOrganizationView(view)}
+              aria-label={t("settingsPage.goToDetailAria", { title })}>{t("settingsPage.view")}</Button>
+          } />;
+        }),
+      },
+      "cloud-usage": {
+        description: t("settingsPage.cloudUsage.currentPeriodDescription"),
+        rows: <SettingsOverviewRow title={t("settingsPage.cloudUsage.currentPeriod")}
+          description={["quota", "used", "remaining"].map(key => t(`settingsPage.cloudUsage.${key}`)).join(" · ")} />,
+      },
+      recovery: { description: t("settingsPage.recovery.description"), rows: <SettingsOverviewModuleRows section="recovery" /> },
+      diagnostics: {
+        description: t("settingsPage.overview.diagnosticsDesc"),
+        rows: [
+          dashboardRow(t("settingsPage.checkAll"), t("settingsPage.overview.checkAllDesc"), <Button className="settings-dashboard-quick-action" size="small" loading={checking} onClick={() => { selectSection("diagnostics"); void handleCheckAll(); }}>{t("settingsPage.check")}</Button>),
+          dashboardRow(t("settingsPage.overview.recentResults"), checks ? t("settingsPage.overview.recentResultsReady", { count: checks.length }) : t("settingsPage.overview.recentResultsEmpty"), <Button className="settings-dashboard-quick-action" size="small" onClick={() => selectSection("diagnostics")}>{t("settingsPage.viewResults")}</Button>),
+        ],
+      },
+      developer: {
+        description: t("settingsPage.overview.developerDesc"),
+        rows: [
+          dashboardRow(t("settingsPage.overview.enableDeveloper"), t("settingsPage.overview.enableDeveloperDesc"), <Switch className="settings-ref-switch" checked={developerActive} loading={saving === "developer"} disabled={saving !== null} onChange={requestDeveloperChange} aria-label={t("settingsPage.overview.enableDeveloper")} />),
+          dashboardRow(t("settingsPage.overview.internalDebug"), t("settingsPage.overview.internalDebugDesc"), <Tag className="settings-status-tag">{developerActive ? t("settingsPage.sectionStatus.activated") : t("settingsPage.sectionStatus.notActivated")}</Tag>),
+        ],
+      },
+    } satisfies Record<Exclude<SectionID, "overview">, { description: string; rows: ReactNode }>;
+
     return <section className="settings-dashboard">
       <div className="settings-page-heading">
         <div>
@@ -515,58 +613,20 @@ function SettingsPageContent() {
         <Tag className="settings-sync-tag">{t("settingsPage.syncRealtime")}</Tag>
       </div>
       {overview?.issues.length ? <div className="settings-ref-issues" role="status" aria-live="polite">{overview.issues.map((issue) => <Alert key={issue.id} type={issue.severity === "warning" ? "warning" : "info"} showIcon message={issue.message} action={<Button type="link" size="small" onClick={() => selectSection(issue.section as SectionID)}>{t("settingsPage.view")}</Button>} />)}</div> : null}
-      <div className="settings-dashboard-grid">
-        {dashboardCard("models", <ApiOutlined />, t("settingsPage.sections.models"), t("settingsPage.overview.modelServicesDesc"), [
-          dashboardRow(t("settingsPage.sections.models"), models.counts.model_providers !== undefined && models.counts.external_services !== undefined
-            ? t("settingsPage.counts.providerBreakdown", { models: models.counts.model_providers, services: models.counts.external_services })
-            : t("modelProvider.workspace.suppliers"), formatCount(models, t), <Button className="settings-dashboard-quick-action" size="small" onClick={() => selectSection("models")}>{t("settingsPage.quickConfig")}</Button>),
-        ])}
-        {dashboardCard("model_defaults", <RobotOutlined />, t("settingsPage.sections.defaultModels"), t("settingsPage.overview.modelsDesc"), [
-          <QuickModelSettings canConfigureEmbedding={isAdmin} key="quick-models" onSaved={syncOverview} />,
-          dashboardRow(t("settingsPage.sections.defaultModels"), t("settingsPage.controls.documentParsing.title"), t("settingsPage.overview.documentParsingDesc"), <Button className="settings-dashboard-quick-action" size="small" onClick={() => setSearchParams(settingsRouteParams(searchParams, { section: "model_defaults", service: "parsing" }))}>{t("settingsPage.quickConfig")}</Button>),
-        ])}
-        {dashboardCard("knowledge", <DatabaseOutlined />, t("settingsPage.sections.knowledge"), t("settingsPage.overview.knowledgeDesc"), [
-          dashboardRow(t("settingsPage.sections.knowledge"), t("settingsPage.overview.knowledgeRetrieval"), t("settingsPage.overview.knowledgeRetrievalDesc"), <Button className="settings-dashboard-quick-action" size="small" aria-label={t("settingsPage.goToDetailAria", { title: t("settingsPage.overview.knowledgeRetrieval") })} onClick={() => selectSection("knowledge")}>{t("settingsPage.quickConfig")}</Button>),
-        ])}
-        {dashboardCard("memory", <ExperimentOutlined />, t("settingsPage.sections.memory"), t("settingsPage.overview.memoryDesc"),
-          ["vocabulary", "read", "edit"].map((capability) => dashboardRow(
-            t("settingsPage.sections.memory"),
-            t(`settingsPage.memory.${capability}.title`),
-            t(`settingsPage.memory.${capability}.description`),
-            <Button className="settings-dashboard-quick-action" size="small" aria-label={t("settingsPage.goToDetailAria", { title: t(`settingsPage.memory.${capability}.title`) })} onClick={() => selectSection("memory")}>{t("settingsPage.quickConfig")}</Button>,
-          )),
-        )}
-        {dashboardCard("system_tools", <ToolOutlined />, t("settingsPage.sections.systemTools"), t("settingsPage.overview.systemToolsDesc"), [
-          dashboardRow(t("settingsPage.sections.systemTools"), t("settingsPage.overview.builtinTools"), t("settingsPage.overview.builtinToolsDesc"), <Button className="settings-dashboard-quick-action" size="small" onClick={() => selectSection("system_tools")}>{t("settingsPage.manageTools")}</Button>),
-          dashboardRow(t("settingsPage.sections.systemTools"), t("settingsPage.overview.localDeps"), t("settingsPage.overview.localDepsDesc"), <Button className="settings-dashboard-quick-action" size="small" onClick={() => selectSection("system_tools")}>{hasLocalDependencies ? t("settingsPage.checkDeps") : t("settingsPage.cloudHosted")}</Button>),
-        ])}
-        {dashboardCard("mcp", <ApartmentOutlined />, t("settingsPage.sections.mcp"), t("settingsPage.overview.mcpDesc"), [
-          dashboardRow(t("settingsPage.sections.mcp"), t("settingsPage.overview.mcpMaster"), t("settingsPage.overview.mcpMasterDesc"), switchControl("mcp_enabled")),
-          dashboardRow(t("settingsPage.sections.mcp"), t("settingsPage.overview.verifiedServices"), t("settingsPage.overview.verifiedServicesDesc", { verified: mcp.counts.verified, runnable: mcp.counts.runnable }), <Tag className="settings-status-tag">{formatCount(mcp, t)}</Tag>),
-        ])}
-        {dashboardCard("assistants", <RobotOutlined />, t("settingsPage.sections.assistants"), t("settingsPage.overview.assistantsDesc"), [
-          dashboardRow(t("settingsPage.sections.assistants"), t("settingsPage.overview.assistantMcp"), t("settingsPage.overview.assistantMcpDesc"), <Tag className="settings-status-tag">MCP</Tag>),
-          dashboardRow(t("settingsPage.sections.assistants"), t("settingsPage.overview.assistantExecutors"), t("settingsPage.overview.assistantExecutorsDesc"), <Button className="settings-dashboard-quick-action" size="small" onClick={() => selectSection("assistants")}>{t("settingsPage.manageAssistants")}</Button>),
-        ])}
-        {dashboardCard("skills", <RobotOutlined />, t("settingsPage.sections.skills"), t("settingsPage.overview.skillsDesc"), [
-          dashboardRow(t("settingsPage.sections.skills"), t("settingsPage.controls.skills.title"), t("settingsPage.overview.mySkillsDesc"), switchControl("skills_enabled")),
-          dashboardRow(t("settingsPage.sections.skills"), t("settingsPage.controls.workflows.title"), t("settingsPage.overview.myWorkflowsDesc"), switchControl("workflows_enabled")),
-          dashboardRow(t("settingsPage.sections.skills"), t("settingsPage.overview.enabledResources"), t("settingsPage.overview.enabledResourcesDesc", { count: skills.counts.enabled }), <Tag className="settings-status-tag">{t("settingsPage.separatelyControlled")}</Tag>),
-        ])}
-        {dashboardCard("tasks", <UnorderedListOutlined />, t("settingsPage.sections.tasks"), t("settingsPage.overview.tasksDesc"), [
-          dashboardRow(t("settingsPage.sections.tasks"), t("settingsPage.tasks.enableSubtasks"), t("settingsPage.tasks.enableSubtasksDesc"), switchControl("task_center_enabled", t("settingsPage.tasks.enableSubtasks"))),
-          dashboardRow(t("settingsPage.sections.tasks"), t("settingsPage.tasks.enableWorkflows"), t("settingsPage.tasks.enableWorkflowsDesc"), switchControl("workflows_enabled", t("settingsPage.tasks.enableWorkflows"))),
-          dashboardRow(t("settingsPage.sections.tasks"), t("settingsPage.tasks.enableSchedules"), t("settingsPage.tasks.enableSchedulesDesc", { count: tasks.counts.enabled }), switchControl("schedules_enabled", t("settingsPage.tasks.enableSchedules"))),
-        ])}
-        {dashboardCard("diagnostics", <CheckCircleFilled />, t("settingsPage.sections.diagnostics"), t("settingsPage.overview.diagnosticsDesc"), [
-          dashboardRow(t("settingsPage.sections.diagnostics"), t("settingsPage.checkAll"), t("settingsPage.overview.checkAllDesc"), <Button className="settings-dashboard-quick-action" size="small" loading={checking} onClick={() => { selectSection("diagnostics"); void handleCheckAll(); }}>{t("settingsPage.check")}</Button>),
-          dashboardRow(t("settingsPage.sections.diagnostics"), t("settingsPage.overview.recentResults"), checks ? t("settingsPage.overview.recentResultsReady", { count: checks.length }) : t("settingsPage.overview.recentResultsEmpty"), <Button className="settings-dashboard-quick-action" size="small" onClick={() => selectSection("diagnostics")}>{t("settingsPage.viewable")}</Button>),
-        ])}
-        {isSettingsSectionVisible("developer", isAdmin) ? dashboardCard("developer", <CodeOutlined />, t("settingsPage.sections.developer"), t("settingsPage.overview.developerDesc"), [
-          dashboardRow(t("settingsPage.sections.developer"), t("settingsPage.overview.enableDeveloper"), t("settingsPage.overview.enableDeveloperDesc"), <Switch className="settings-ref-switch" checked={developerActive} loading={saving === "developer"} disabled={saving !== null} onChange={requestDeveloperChange} aria-label={t("settingsPage.overview.enableDeveloper")} />),
-          dashboardRow(t("settingsPage.sections.developer"), t("settingsPage.overview.internalDebug"), t("settingsPage.overview.internalDebugDesc"), <Tag className="settings-status-tag">{developerActive ? t("settingsPage.sectionStatus.activated") : t("settingsPage.sectionStatus.notActivated")}</Tag>),
-        ]) : null}
-      </div>
+      {navigationGroups.map(group => (
+        <section key={group.title} className="settings-dashboard-group" aria-label={group.title}>
+          <h2>{group.title}</h2>
+          <div className="settings-dashboard-grid">
+            {group.items.map(({ id, label, icon }) => {
+              if (id === "overview") return null;
+              const card = cards[id];
+              return <SettingsOverviewCard key={id} icon={icon} title={label} description={card.description} onDetail={() => selectSection(id)}>
+                {card.rows}
+              </SettingsOverviewCard>;
+            })}
+          </div>
+        </section>
+      ))}
       {checks ? <CheckResults checks={checks} onLocate={selectSection} /> : null}
     </section>;
   };
@@ -825,7 +885,7 @@ function SettingsPageContent() {
         />
       );
     } else if (section === "memory") {
-      content = <MemoryCapabilitySettings headingRef={headingRef} />;
+      content = <MemoryCapabilitySettings headingRef={headingRef} memory={memory} />;
     } else if (section === "env_vars") {
       content = <UserEnvironmentVariablesSettings headingRef={headingRef} />;
     } else if (section === "external_apps" && isVocabularyEnabled()) {

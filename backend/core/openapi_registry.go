@@ -2920,22 +2920,25 @@ type settingsFeatureControlsOpenAPIResponse struct {
 }
 
 type settingsOverviewCountsOpenAPIResponse struct {
-	Total      int64 `json:"total"`
-	Enabled    int64 `json:"enabled"`
-	Verified   int64 `json:"verified"`
-	Runnable   int64 `json:"runnable"`
-	Configured int64 `json:"configured"`
+	ModelProviders   int64 `json:"model_providers"`
+	ExternalServices int64 `json:"external_services"`
+	Total            int64 `json:"total"`
+	Enabled          int64 `json:"enabled"`
+	Verified         int64 `json:"verified"`
+	Runnable         int64 `json:"runnable"`
+	Configured       int64 `json:"configured"`
 }
 
 type settingsOverviewSectionOpenAPIResponse struct {
-	ID               string                                `json:"id"`
-	Title            string                                `json:"title"`
-	Route            string                                `json:"route"`
-	RawEnabled       *bool                                 `json:"raw_enabled,omitempty"`
-	EffectiveEnabled *bool                                 `json:"effective_enabled,omitempty"`
-	Counts           settingsOverviewCountsOpenAPIResponse `json:"counts"`
-	Status           string                                `json:"status"`
-	Detail           string                                `json:"detail"`
+	ModelSupplierPreview []modelprovider.ConfiguredModelSupplier `json:"model_supplier_preview,omitempty"`
+	ID                   string                                  `json:"id"`
+	Title                string                                  `json:"title"`
+	Route                string                                  `json:"route"`
+	RawEnabled           *bool                                   `json:"raw_enabled,omitempty"`
+	EffectiveEnabled     *bool                                   `json:"effective_enabled,omitempty"`
+	Counts               settingsOverviewCountsOpenAPIResponse   `json:"counts"`
+	Status               string                                  `json:"status"`
+	Detail               string                                  `json:"detail"`
 }
 
 type settingsOverviewIssueOpenAPIResponse struct {

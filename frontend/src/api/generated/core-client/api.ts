@@ -2929,6 +2929,12 @@ export interface CompletionResult {
     'execution_id': string;
     'receipt'?: CompletionReceipt;
 }
+export interface ConfiguredModelSupplier {
+    'brand_key'?: string;
+    'id': string;
+    'is_custom'?: boolean;
+    'name': string;
+}
 export interface Control {
     'next_step'?: string;
 }
@@ -8788,6 +8794,8 @@ export interface SettingsFeatureControlsOpenAPIResponse {
 export interface SettingsOverviewCountsOpenAPIResponse {
     'configured': number;
     'enabled': number;
+    'external_services': number;
+    'model_providers': number;
     'runnable': number;
     'total': number;
     'verified': number;
@@ -8809,6 +8817,7 @@ export interface SettingsOverviewSectionOpenAPIResponse {
     'detail': string;
     'effective_enabled'?: boolean;
     'id': string;
+    'model_supplier_preview'?: Array<ConfiguredModelSupplier>;
     'raw_enabled'?: boolean;
     'route': string;
     'status': string;

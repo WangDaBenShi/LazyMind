@@ -1,3 +1,4 @@
+import type { RawAxiosRequestConfig } from "axios";
 import { axiosInstance, BASE_URL } from "@/components/request";
 
 const root = `${BASE_URL}/api/core/user/env-vars`;
@@ -27,8 +28,8 @@ export interface UserEnvironmentVariablePayload {
   expected_updated_at?: string;
 }
 
-export async function listUserEnvironmentVariables(): Promise<UserEnvironmentVariable[]> {
-  const response = await axiosInstance.get<ApiEnvelope<{ items: UserEnvironmentVariable[] }>>(root);
+export async function listUserEnvironmentVariables(options?: { silentError?: boolean }): Promise<UserEnvironmentVariable[]> {
+  const response = await axiosInstance.get<ApiEnvelope<{ items: UserEnvironmentVariable[] }>>(root, options as RawAxiosRequestConfig);
   return response.data.data?.items ?? [];
 }
 

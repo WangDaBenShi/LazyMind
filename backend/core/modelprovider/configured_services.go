@@ -9,10 +9,19 @@ import (
 	"lazymind/core/common/orm"
 )
 
+// ConfiguredModelSupplier identifies a configured supplier without exposing its endpoint or credentials.
+type ConfiguredModelSupplier struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	BrandKey string `json:"brand_key,omitempty"`
+	IsCustom bool   `json:"is_custom,omitempty"`
+}
+
 // ConfiguredProviderCounts distinguishes supplier inventory from external service readiness.
 type ConfiguredProviderCounts struct {
-	ModelProviders   int64
-	ExternalServices int64
+	ModelProviders       int64
+	ExternalServices     int64
+	ModelSupplierPreview []ConfiguredModelSupplier
 }
 
 // CountConfiguredProviders matches the unfiltered provider workspace navigation
@@ -20,7 +29,7 @@ type ConfiguredProviderCounts struct {
 // model roles, browser-local hiding and search do not alter this inventory.
 func CountConfiguredProviders(ctx context.Context, db *gorm.DB, userID string) (ConfiguredProviderCounts, error) {
 	var rows []orm.UserModelProvider
-	if err := db.WithContext(ctx).Where("create_user_id = ? AND deleted_at IS NULL", userID).Find(&rows).Error; err != nil {
+	if err := db.WithContext(ctx).Where("create_user_id = ? AND deleted_at IS NULL", userID).Order("name ASC, id ASC").Find(&rows).Error; err != nil {
 		return ConfiguredProviderCounts{}, err
 	}
 	var services []orm.UserModelProvider
@@ -57,17 +66,22 @@ func CountConfiguredProviders(ctx context.Context, db *gorm.DB, userID string) (
 		configuredModels[id] = true
 	}
 	navigationNodes := make(map[string]bool)
+	preview := make([]ConfiguredModelSupplier, 0, 3)
 	for _, row := range rows {
 		if !configuredModels[row.ID] {
 			continue
 		}
 		key := row.ID
-		if brand, service := ProviderServiceIdentity(row); brand != "" && service != "" {
+		brand, service := ProviderServiceIdentity(row)
+		if brand != "" && service != "" {
 			key = "brand:" + brand
+		}
+		if !navigationNodes[key] && len(preview) < 3 {
+			preview = append(preview, ConfiguredModelSupplier{ID: row.ID, Name: row.Name, BrandKey: brand, IsCustom: row.IsCustom})
 		}
 		navigationNodes[key] = true
 	}
-	return ConfiguredProviderCounts{ModelProviders: int64(len(navigationNodes)), ExternalServices: int64(len(configuredServices))}, nil
+	return ConfiguredProviderCounts{ModelProviders: int64(len(navigationNodes)), ExternalServices: int64(len(configuredServices)), ModelSupplierPreview: preview}, nil
 }
 
 func isProviderListed(row orm.UserModelProvider) bool {

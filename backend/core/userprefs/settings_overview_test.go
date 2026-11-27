@@ -234,3 +234,33 @@ func TestSettingsOverviewModelInventoryUsesWorkspaceConfigurationAndBrands(t *te
 		t.Fatalf("configured navigation nodes = %d, want 3 (Qwen brand, custom Qwen, model-only Claude)", got)
 	}
 }
+
+func TestOverviewModelSupplierPreviewUsesConfiguredBrandsAndCapsAtThree(t *testing.T) {
+	db := newUIPreferencesTestDB(t)
+	now := time.Now().UTC()
+	base := orm.BaseModel{CreateUserID: "u1", CreatedAt: now, UpdatedAt: now}
+	for _, name := range []string{"Charlie", "Alpha", "Doubao", "DoubaoCodingPlan", "Zulu", "AAA-empty"} {
+		provider := orm.UserModelProvider{ID: name, DefaultModelProviderID: name, Name: name, Category: "model", BaseModel: base}
+		if err := db.Create(&provider).Error; err != nil {
+			t.Fatal(err)
+		}
+		if name != "AAA-empty" {
+			if err := db.Create(&orm.UserModelProviderGroup{ID: name + "-g", UserModelProviderID: name, Name: name, APIKey: "fixture", BaseModel: base}).Error; err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	overview, err := buildSettingsOverview(httptest.NewRequest(http.MethodGet, "/settings/overview", nil), db.DB, "u1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	models := sectionByID(overview.Sections, "models")
+	if models.Counts.ModelProviders != 4 || len(models.ModelSupplierPreview) != 3 {
+		t.Fatalf("model supplier preview does not match configured inventory: %#v", models)
+	}
+	for i, expected := range []string{"Alpha", "Charlie", "Doubao"} {
+		if got := models.ModelSupplierPreview[i]; got.Name != expected || got.ID != expected {
+			t.Errorf("preview[%d] = %#v, want %q", i, got, expected)
+		}
+	}
+}
